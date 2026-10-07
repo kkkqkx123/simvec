@@ -16,16 +16,16 @@ use std::time::Instant;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim_vec::{CollectionConfig, DistanceMetric, HnswConfig, IndexType, LocalVectorEngine};
+use simvec::{CollectionConfig, DistanceMetric, HnswConfig, IndexType, LocalVectorEngine};
 
 const DIM: usize = 128;
 const SEED: u64 = 0xC0FFEE;
 
-fn random_points(count: usize) -> Vec<sim_vec::VectorPoint> {
+fn random_points(count: usize) -> Vec<simvec::VectorPoint> {
     let mut rng = StdRng::seed_from_u64(SEED);
     (0..count)
         .map(|i| {
-            sim_vec::VectorPoint::new(
+            simvec::VectorPoint::new(
                 i as u64,
                 (0..DIM).map(|_| rng.gen_range(-1.0..1.0)).collect(),
             )

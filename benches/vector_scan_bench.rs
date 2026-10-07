@@ -12,8 +12,8 @@ use std::sync::Arc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim_vec::distance::kernel::{selected, Kernel};
-use sim_vec::{
+use simvec::distance::kernel::{selected, Kernel};
+use simvec::{
     CollectionConfig, DistanceMetric, FilterCondition, LocalVectorEngine, SearchQuery, TxnOp,
     VectorFilter, VectorPoint,
 };

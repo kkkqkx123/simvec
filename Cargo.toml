@@ -6,7 +6,7 @@ description = "Local vector search engine: exact scan, mmap storage, WAL"
 license = "Apache-2.0"
 
 [lib]
-name = "sim_vec"
+name = "simvec"
 path = "src/lib.rs"
 
 [features]

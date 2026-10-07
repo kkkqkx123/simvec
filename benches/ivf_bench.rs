@@ -13,7 +13,7 @@ use std::time::Instant;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim_vec::{
+use simvec::{
     CollectionConfig, DistanceMetric, IvfConfig, LocalVectorEngine, SearchQuery, VectorPoint,
 };
 

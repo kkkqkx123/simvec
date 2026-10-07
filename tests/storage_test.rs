@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use sim_vec::storage::CollectionStore;
-use sim_vec::storage::{Wal, WalRecord, WalTxn};
-use sim_vec::types::{CollectionConfig, DistanceMetric, PointId, VectorPoint};
+use simvec::storage::CollectionStore;
+use simvec::storage::{Wal, WalRecord, WalTxn};
+use simvec::types::{CollectionConfig, DistanceMetric, PointId, VectorPoint};
 
 fn config(dim: usize) -> CollectionConfig {
     CollectionConfig::new(dim, DistanceMetric::Cosine)
@@ -26,7 +26,7 @@ fn upsert_batch(store: &CollectionStore, ids: impl IntoIterator<Item = u64>, dim
     let ops: Vec<WalRecord> = ids
         .into_iter()
         .map(|id| WalRecord::Upsert {
-            point: sim_vec::storage::WalPoint::from_point(&point(id, dim)).unwrap(),
+            point: simvec::storage::WalPoint::from_point(&point(id, dim)).unwrap(),
         })
         .collect();
     store.apply_ops(&ops).unwrap();
@@ -43,10 +43,10 @@ fn test_apply_txn_roundtrip_and_replay() {
             txn_id: 1,
             ops: vec![
                 WalRecord::Upsert {
-                    point: sim_vec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
+                    point: simvec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
                 },
                 WalRecord::Upsert {
-                    point: sim_vec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
+                    point: simvec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
                 },
             ],
         })
@@ -90,7 +90,7 @@ fn test_wal_written_memory_not_applied_recovers() {
     wal.append(&WalTxn {
         txn_id: 1,
         ops: vec![WalRecord::Upsert {
-            point: sim_vec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
+            point: simvec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
         }],
     })
     .unwrap();
@@ -118,7 +118,7 @@ fn test_replay_is_idempotent_for_duplicate_txns() {
     let txn = WalTxn {
         txn_id: 1,
         ops: vec![WalRecord::Upsert {
-            point: sim_vec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
+            point: simvec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
         }],
     };
     // Same txn applied twice (crash + coordinator retry semantics).
@@ -148,13 +148,13 @@ fn test_apply_txn_rejects_invalid_before_wal_append() {
         .apply_txn(&WalTxn {
             txn_id: 1,
             ops: vec![WalRecord::Upsert {
-                point: sim_vec::storage::WalPoint::from_point(&bad).unwrap(),
+                point: simvec::storage::WalPoint::from_point(&bad).unwrap(),
             }],
         })
         .unwrap_err();
     assert!(matches!(
         err,
-        sim_vec::VectorSearchError::InvalidVectorDimension {
+        simvec::VectorSearchError::InvalidVectorDimension {
             expected: 4,
             actual: 2
         }

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use sim_vec::{
+use simvec::{
     CollectionConfig, DistanceMetric, FilterCondition, HnswConfig, LocalVectorEngine, SearchMode,
     SearchQuery, VectorFilter, VectorPoint, VectorSearchError,
 };
@@ -50,7 +50,7 @@ fn engine_with_hnsw(path: &std::path::Path, n_per_blob: usize) -> LocalVectorEng
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -214,7 +214,7 @@ fn promotion_after_full_scan_threshold() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(cfg),
         )
         .unwrap();
@@ -313,7 +313,7 @@ fn rejects_ef_construct_below_two_m() {
         .unwrap();
 
     // Runtime config updates are validated too.
-    let store = sim_vec::storage::CollectionStore::create(
+    let store = simvec::storage::CollectionStore::create(
         dir.path().join("store"),
         "store",
         &CollectionConfig::new(DIM, DistanceMetric::Euclid),
@@ -344,7 +344,7 @@ fn stale_ratio_triggers_background_rebuild() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(cfg),
         )
         .unwrap();
@@ -409,7 +409,7 @@ fn scan_limit_config_controls_iterative_expansion() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(HnswConfig {
                     iterative_max_rounds: Some(1),
                     max_scan_tuples: Some(64),
@@ -439,7 +439,7 @@ fn scan_limit_config_controls_iterative_expansion() {
         .create_collection(
             "bad",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(HnswConfig {
                     max_scan_tuples: Some(0),
                     ..hnsw_config()

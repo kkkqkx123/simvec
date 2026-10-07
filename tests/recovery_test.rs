@@ -1,8 +1,8 @@
 //! WAL replay idempotency integration tests.
 
-use sim_vec::storage::CollectionStore;
-use sim_vec::storage::{Wal, WalPoint, WalRecord, WalTxn};
-use sim_vec::types::{CollectionConfig, DistanceMetric, PointId, SearchQuery, VectorPoint};
+use simvec::storage::CollectionStore;
+use simvec::storage::{Wal, WalPoint, WalRecord, WalTxn};
+use simvec::types::{CollectionConfig, DistanceMetric, PointId, SearchQuery, VectorPoint};
 
 fn config() -> CollectionConfig {
     CollectionConfig::new(4, DistanceMetric::Cosine)
@@ -282,8 +282,8 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_ivf");
     let cfg = CollectionConfig::new(4, DistanceMetric::Cosine)
-        .with_index_type(sim_vec::types::IndexType::IVF)
-        .with_ivf(sim_vec::types::IvfConfig {
+        .with_index_type(simvec::types::IndexType::IVF)
+        .with_ivf(simvec::types::IvfConfig {
             lists: Some(2),
             min_build_points: 1,
             sample_limit: 64,

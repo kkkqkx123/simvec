@@ -14,7 +14,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use sim_vec::{
+use simvec::{
     CollectionConfig, DistanceMetric, IndexType, LocalVectorEngine, SearchQuery, VectorPoint,
 };
 

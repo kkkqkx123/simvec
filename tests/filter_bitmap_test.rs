@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use sim_vec::storage::CollectionStore;
-use sim_vec::types::{
+use simvec::storage::CollectionStore;
+use simvec::types::{
     CollectionConfig, DistanceMetric, FilterCondition, HnswConfig, PointId, SearchQuery,
     VectorFilter, VectorPoint,
 };
@@ -64,10 +64,10 @@ fn publish_hnsw(store: &CollectionStore) {
 /// Batch upsert through the WAL-backed apply path: one WAL append and one
 /// meta.bin save per batch instead of per-point saves.
 fn upsert_batch(store: &CollectionStore, points: &[VectorPoint]) {
-    let ops: Vec<sim_vec::storage::WalRecord> = points
+    let ops: Vec<simvec::storage::WalRecord> = points
         .iter()
-        .map(|p| sim_vec::storage::WalRecord::Upsert {
-            point: sim_vec::storage::WalPoint::from_point(p).unwrap(),
+        .map(|p| simvec::storage::WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(p).unwrap(),
         })
         .collect();
     store.apply_ops(&ops).unwrap();
@@ -81,9 +81,9 @@ fn oracle(query_vector: &[f32], ids: &[u64]) -> Vec<u64> {
         .copied()
         .map(|id| {
             let dist =
-                sim_vec::distance::naive::distance_cosine(query_vector, &unit(id, DIM));
+                simvec::distance::naive::distance_cosine(query_vector, &unit(id, DIM));
             (
-                sim_vec::distance::to_score(DistanceMetric::Cosine, dist),
+                simvec::distance::to_score(DistanceMetric::Cosine, dist),
                 id,
             )
         })
@@ -99,7 +99,7 @@ fn test_prefilter_bitmap_high_selectivity_recall() {
         dir.path().join("col"),
         "col",
         &config(DistanceMetric::Cosine, DIM)
-            .with_index_type(sim_vec::types::IndexType::HNSW)
+            .with_index_type(simvec::types::IndexType::HNSW)
             .with_hnsw(hnsw_config()),
     )
     .unwrap();
@@ -164,7 +164,7 @@ fn test_filter_bitmap_survives_reopen() {
             &store_dir,
             "col",
             &config(DistanceMetric::Cosine, DIM)
-                .with_index_type(sim_vec::types::IndexType::FLAT),
+                .with_index_type(simvec::types::IndexType::FLAT),
         )
         .unwrap();
         for i in 0..10u64 {
@@ -200,7 +200,7 @@ fn test_filter_bitmap_after_compaction() {
             &store_dir,
             "col",
             &config(DistanceMetric::Cosine, DIM)
-                .with_index_type(sim_vec::types::IndexType::FLAT),
+                .with_index_type(simvec::types::IndexType::FLAT),
         )
         .unwrap();
         for i in 0..20u64 {
@@ -234,7 +234,7 @@ fn test_overwrite_changes_bitmap_membership() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM).with_index_type(sim_vec::types::IndexType::FLAT),
+        &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
     store.upsert(&blob_point(0, &unit(0, DIM), "red")).unwrap();
@@ -265,7 +265,7 @@ fn test_filter_bitmap_with_non_indexed_conditions() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM).with_index_type(sim_vec::types::IndexType::FLAT),
+        &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
     for i in 0..10u64 {
@@ -280,7 +280,7 @@ fn test_filter_bitmap_with_non_indexed_conditions() {
 
     let filter = VectorFilter::new().must(FilterCondition::range(
         "price",
-        sim_vec::types::RangeCondition::new().gte(5.0),
+        simvec::types::RangeCondition::new().gte(5.0),
     ));
     let results = store
         .search(&SearchQuery::new(unit(0, DIM), 10).with_filter(filter))
@@ -303,7 +303,7 @@ fn test_streaming_topk_matches_collect_all() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM).with_index_type(sim_vec::types::IndexType::FLAT),
+        &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
     let points: Vec<VectorPoint> = (0..50u64)
@@ -339,7 +339,7 @@ fn test_streaming_topk_with_filter() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM).with_index_type(sim_vec::types::IndexType::FLAT),
+        &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
     let points: Vec<VectorPoint> = (0..50u64)
@@ -377,7 +377,7 @@ fn test_prefilter_bitmap_falls_back_for_complex_filter() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM).with_index_type(sim_vec::types::IndexType::FLAT),
+        &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
     for i in 0..10u64 {

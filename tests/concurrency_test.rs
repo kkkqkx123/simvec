@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use sim_vec::{
+use simvec::{
     CollectionConfig, DistanceMetric, HnswConfig, IvfConfig, LocalVectorEngine, SearchQuery,
     VectorPoint,
 };
@@ -88,7 +88,7 @@ fn metrics_record_ann_path_and_build() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -123,7 +123,7 @@ fn concurrent_hnsw_search() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -166,7 +166,7 @@ fn concurrent_hnsw_insert_and_search() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -223,7 +223,7 @@ fn concurrent_write_read_covers_version_double_read() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -333,7 +333,7 @@ fn collection_info_reports_build_progress() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -363,7 +363,7 @@ fn concurrent_ivf_search() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_index_type(sim_vec::IndexType::IVF)
+                .with_index_type(simvec::IndexType::IVF)
                 .with_ivf(ivf_config()),
         )
         .unwrap();
@@ -403,7 +403,7 @@ fn hnsw_concurrent_build() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_index_type(sim_vec::IndexType::HNSW)
+                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(HnswConfig {
                     m: 8,
                     ef_construct: 16,

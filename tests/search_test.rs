@@ -1,9 +1,9 @@
 //! Exact scan search integration tests: distance, filtering, score threshold,
 //! pagination, and payload/vector trimming.
 
-use sim_vec::distance::naive;
-use sim_vec::storage::CollectionStore;
-use sim_vec::types::{
+use simvec::distance::naive;
+use simvec::storage::CollectionStore;
+use simvec::types::{
     CollectionConfig, ConditionType, DistanceMetric, FilterCondition, PointId, SearchQuery,
     VectorFilter, VectorPoint,
 };
@@ -40,10 +40,10 @@ fn seed(store: &CollectionStore, n: u64, dim: usize, with_color: bool) {
             }
         })
         .collect();
-    let ops: Vec<sim_vec::storage::WalRecord> = points
+    let ops: Vec<simvec::storage::WalRecord> = points
         .iter()
-        .map(|p| sim_vec::storage::WalRecord::Upsert {
-            point: sim_vec::storage::WalPoint::from_point(p).unwrap(),
+        .map(|p| simvec::storage::WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(p).unwrap(),
         })
         .collect();
     store.apply_ops(&ops).unwrap();
@@ -385,7 +385,7 @@ fn test_search_rejects_wrong_dimension() {
         .unwrap_err();
     assert!(matches!(
         err,
-        sim_vec::VectorSearchError::InvalidVectorDimension {
+        simvec::VectorSearchError::InvalidVectorDimension {
             expected: 8,
             actual: 2
         }
@@ -445,8 +445,8 @@ fn test_nested_filter_and_geo() {
 
     let geo = VectorFilter::new().must(FilterCondition::new(
         "location",
-        ConditionType::GeoRadius(sim_vec::types::GeoRadius::new(
-            sim_vec::types::GeoPoint::new(48.8566, 2.3522),
+        ConditionType::GeoRadius(simvec::types::GeoRadius::new(
+            simvec::types::GeoPoint::new(48.8566, 2.3522),
             1000.0,
         )),
     ));

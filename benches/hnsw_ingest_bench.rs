@@ -12,7 +12,7 @@ use std::time::Instant;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim_vec::{CollectionConfig, DistanceMetric, IndexType, LocalVectorEngine, VectorPoint};
+use simvec::{CollectionConfig, DistanceMetric, IndexType, LocalVectorEngine, VectorPoint};
 
 const DIM: usize = 128;
 const BATCH: usize = 256;

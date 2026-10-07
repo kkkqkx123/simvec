@@ -78,12 +78,12 @@ fn main() {
     let t_started = std::time::Instant::now();
     // Warm-up: engine open + first-touch pages, excluded from every phase.
     let dir = tempfile::tempdir().unwrap();
-    let engine = sim_vec::LocalVectorEngine::open(dir.path().join("vec")).unwrap();
+    let engine = simvec::LocalVectorEngine::open(dir.path().join("vec")).unwrap();
     engine
         .create_collection(
             "col",
-            &sim_vec::CollectionConfig::new(DIM, sim_vec::DistanceMetric::Euclid)
-                .with_index_type(sim_vec::IndexType::HNSW),
+            &simvec::CollectionConfig::new(DIM, simvec::DistanceMetric::Euclid)
+                .with_index_type(simvec::IndexType::HNSW),
         )
         .unwrap();
     eprintln!("[phase] setup: {:?}", t_started.elapsed());
@@ -94,9 +94,9 @@ fn main() {
     let base = snapshot();
     let t_phase = std::time::Instant::now();
     for chunk in (0..POINTS).step_by(1_000) {
-        let points: Vec<sim_vec::VectorPoint> = (chunk..(chunk + 1_000).min(POINTS))
+        let points: Vec<simvec::VectorPoint> = (chunk..(chunk + 1_000).min(POINTS))
             .map(|i| {
-                sim_vec::VectorPoint::new(
+                simvec::VectorPoint::new(
                     i as u64,
                     (0..DIM).map(|_| rng.gen_range(-1.0..1.0)).collect(),
                 )
@@ -125,7 +125,7 @@ fn main() {
         let _ = engine
             .search(
                 "col",
-                &sim_vec::SearchQuery::new(q.clone(), 10).with_knn(10, Some(40)),
+                &simvec::SearchQuery::new(q.clone(), 10).with_knn(10, Some(40)),
             )
             .unwrap();
     }
@@ -135,14 +135,14 @@ fn main() {
     // Phase 4: highly-selective filtered queries (worst case: retry chain).
     let base = snapshot();
     let t_phase = std::time::Instant::now();
-    let filter = sim_vec::VectorFilter::new().must(
-        sim_vec::FilterCondition::match_value("tag", "missing"),
+    let filter = simvec::VectorFilter::new().must(
+        simvec::FilterCondition::match_value("tag", "missing"),
     );
     for (i, q) in queries.iter().enumerate() {
         let _ = engine
             .search(
                 "col",
-                &sim_vec::SearchQuery::new(q.clone(), 10)
+                &simvec::SearchQuery::new(q.clone(), 10)
                     .with_filter(filter.clone())
                     .with_knn(10, Some(40)),
             )

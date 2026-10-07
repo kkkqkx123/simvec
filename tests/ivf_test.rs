@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
-use sim_vec::{
+use simvec::{
     CollectionConfig, DistanceMetric, FilterCondition, IvfConfig, LocalVectorEngine, SearchQuery,
     VectorFilter, VectorPoint,
 };
