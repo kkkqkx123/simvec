@@ -135,9 +135,8 @@ fn main() {
     // Phase 4: highly-selective filtered queries (worst case: retry chain).
     let base = snapshot();
     let t_phase = std::time::Instant::now();
-    let filter = simvec::VectorFilter::new().must(
-        simvec::FilterCondition::match_value("tag", "missing"),
-    );
+    let filter =
+        simvec::VectorFilter::new().must(simvec::FilterCondition::match_value("tag", "missing"));
     for (i, q) in queries.iter().enumerate() {
         let _ = engine
             .search(

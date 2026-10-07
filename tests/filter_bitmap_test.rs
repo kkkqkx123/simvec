@@ -80,12 +80,8 @@ fn oracle(query_vector: &[f32], ids: &[u64]) -> Vec<u64> {
         .iter()
         .copied()
         .map(|id| {
-            let dist =
-                simvec::distance::naive::distance_cosine(query_vector, &unit(id, DIM));
-            (
-                simvec::distance::to_score(DistanceMetric::Cosine, dist),
-                id,
-            )
+            let dist = simvec::distance::naive::distance_cosine(query_vector, &unit(id, DIM));
+            (simvec::distance::to_score(DistanceMetric::Cosine, dist), id)
         })
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -163,8 +159,7 @@ fn test_filter_bitmap_survives_reopen() {
         let store = CollectionStore::create(
             &store_dir,
             "col",
-            &config(DistanceMetric::Cosine, DIM)
-                .with_index_type(simvec::types::IndexType::FLAT),
+            &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
         )
         .unwrap();
         for i in 0..10u64 {
@@ -199,8 +194,7 @@ fn test_filter_bitmap_after_compaction() {
         let store = CollectionStore::create(
             &store_dir,
             "col",
-            &config(DistanceMetric::Cosine, DIM)
-                .with_index_type(simvec::types::IndexType::FLAT),
+            &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
         )
         .unwrap();
         for i in 0..20u64 {
