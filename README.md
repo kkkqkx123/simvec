@@ -6,12 +6,6 @@
 and search with optional ANN indexes, WAL-backed durability, and mmap-based
 vector storage — all in a single process, with no external services.
 
-It is a leaf crate: it does not depend on any graphdb crate and does not pull
-in the Qdrant networking stack. The type surface (`VectorPoint`,
-`SearchQuery`, `VectorFilter`, …) is shared with the Qdrant client used
-elsewhere in the workspace, so a collection created locally can be served by
-either backend without changing query code.
-
 ## Features
 
 - **Exact scan by default, ANN when it pays off.** Collections start as

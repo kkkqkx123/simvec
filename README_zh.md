@@ -6,10 +6,6 @@
 检索、可选的 ANN 索引、WAL 持久化以及基于 mmap 的向量存储——全部运行在
 单进程内，不依赖任何外部服务。
 
-它是一个叶子 crate：不依赖任何 graphdb crate，也不引入 Qdrant 的网络栈。
-其类型层（`VectorPoint`、`SearchQuery`、`VectorFilter` 等）与工作区中的
-Qdrant 客户端共享，因此本地创建的集合无需修改查询代码即可切换到远程后端。
-
 ## 特性
 
 - **默认精确扫描，数据量大时自动升级 ANN。** 集合初始为暴力扫描，当存活

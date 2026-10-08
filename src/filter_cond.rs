@@ -1,7 +1,7 @@
 //! Foundational vector types owned by this crate: point ids, payloads and
 //! the payload filter DSL.
 //!
-//! These definitions are deliberately duplicated from `graphdb-core`: the
+//! These definitions are deliberately duplicated from the host core crate: the
 //! index-semantics copy lives here, the transport-semantics copy stays in
 //! the main repository's core crate for the wire and query layers. The two
 //! type families are converted mechanically at the sync-side backend

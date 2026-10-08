@@ -992,8 +992,8 @@ impl From<Vec<SearchQuery>> for BatchSearchQuery {
 
 /// Validate that a distance metric is supported by all backends.
 ///
-/// This is the canonical validation used by both `graphdb-api` and
-/// `graphdb-sync` to reject unsupported metrics at index-creation time.
+/// This is the canonical validation used by both the API layer and
+/// sync layer to reject unsupported metrics at index-creation time.
 pub fn validate_distance_metric(distance: DistanceMetric) -> std::result::Result<(), String> {
     if matches!(
         distance,

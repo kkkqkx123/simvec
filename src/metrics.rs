@@ -3,7 +3,7 @@
 //! Self-contained and wait-free: counters and latency histograms are plain
 //! atomics, so recording never blocks the search or write paths. The crate
 //! intentionally does not depend on a monitoring stack; [`MetricsSnapshot`]
-//! is serializable so an embedder (graphdb-sync / graphdb-server) can
+//! is serializable so an embedder (sync / server layer) can
 //! forward values into its own observability layer.
 //!
 //! Instrumented paths, per collection:

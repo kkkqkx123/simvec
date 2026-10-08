@@ -1,7 +1,7 @@
 //! Local vector search engine.
 //!
 //! Exact-scan storage and search. Leaf crate: does not depend on any
-//! graphdb crate and does not pull in the qdrant networking stack.
+//! host project crate and does not pull in the qdrant networking stack.
 
 pub mod distance;
 pub mod engine;

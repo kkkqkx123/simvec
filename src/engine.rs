@@ -2,7 +2,7 @@
 //!
 //! Owns one collection directory per collection under a root directory and
 //! keeps an in-memory registry of opened [`CollectionStore`]s. This is the
-//! transport-independent engine surface; the graphdb-sync coordinator wraps it
+//! transport-independent engine surface; the sync coordinator wraps it
 //! in an async shell (`VectorBackend::Local`).
 //!
 //! Every mutation is WAL-backed (see [`CollectionStore::apply_txn`]):
@@ -69,7 +69,7 @@ const PENDING_DRAIN_GUARDRAIL: usize = 65_536;
 
 /// The built-in (local) vector engine.
 ///
-/// All operations are synchronous; the graphdb-sync coordinator serializes
+/// All operations are synchronous; the sync coordinator serializes
 /// access through an async shell. Collection names must be valid path segments
 /// (enforced by [`CollectionStore::create`]).
 ///
@@ -1107,7 +1107,7 @@ fn sweep_hnsw(
 // ---------------------------------------------------------------------------
 //
 // Both the local (in-process) engine and the remote Qdrant client implement
-// this trait. Callers in `graphdb-sync` talk exclusively through this
+// this trait. Callers in the sync layer talk exclusively through this
 // interface via a trait object (`Arc<dyn VectorEngine>`), eliminating the
 // previous enum-dispatch boilerplate.
 //
