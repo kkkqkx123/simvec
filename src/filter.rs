@@ -189,22 +189,22 @@ fn eval_uint_range(
     lte: Option<u64>,
 ) -> bool {
     if let Some(gt) = gt {
-        if !(n > gt) {
+        if n <= gt {
             return false;
         }
     }
     if let Some(gte) = gte {
-        if !(n >= gte) {
+        if n < gte {
             return false;
         }
     }
     if let Some(lt) = lt {
-        if !(n < lt) {
+        if n >= lt {
             return false;
         }
     }
     if let Some(lte) = lte {
-        if !(n <= lte) {
+        if n > lte {
             return false;
         }
     }
