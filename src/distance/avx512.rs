@@ -6,11 +6,9 @@
 //! variants are accepted as supersets but not required for correctness.
 //! Fallback remains the same scalar tail as AVX2.
 //!
-//! Main loops use a single ZMM accumulator (16 f32 per iteration) unlike the
-//! dual-accumulator AVX2 kernels: the FMA dependency chain on AVX-512 has
-//! 4-cycle latency too, but the wider register amply saturates the load
-//! ports, and a bench comparison is required before adding a second
-//! accumulator. The 8-wide tail reduces via YMM as in `avx2.rs`.
+//! Main loops use dual ZMM accumulators (32 f32 per iteration) matching the
+//! dual-accumulator AVX2 kernels to avoid a serial add dependency chain.
+//! The 8-wide tail reduces via YMM as in `avx2.rs`.
 
 use crate::types::DistanceMetric;
 
@@ -200,29 +198,49 @@ pub unsafe fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Manhattan distance (ZMM).
+/// Manhattan distance (dual-accumulator, 32-wide main loop).
 ///
 /// # Safety
 /// Same preconditions as `distance_l2`.
 #[target_feature(enable = "avx512f,avx2")]
 pub unsafe fn distance_l1(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
-        let sign = _mm512_set1_ps(-0.0f32);
-        let mut acc = _mm512_setzero_ps();
+        // Absolute value via integer logic: the float `_mm512_andnot_ps`
+        // needs a wider target feature than this module enables, so it would
+        // not inline and instead become a call with full register spill and
+        // fill on every iteration. The integer form needs only the base
+        // feature set and inlines; the casts reinterpret registers for free.
+        let abs_mask = _mm512_set1_epi32(0x7FFF_FFFFu32 as i32);
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
         let mut i = 0;
         let len = a.len();
-        while i + 16 <= len {
+        while i + 32 <= len {
             if i + 64 < len {
                 _mm_prefetch(a.as_ptr().add(i + 64) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(b.as_ptr().add(i + 64) as *const i8, _MM_HINT_T0);
             }
+            let av0 = _mm512_loadu_ps(a.as_ptr().add(i));
+            let bv0 = _mm512_loadu_ps(b.as_ptr().add(i));
+            let av1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
+            let bv1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
+            let d0 = _mm512_sub_ps(av0, bv0);
+            let d1 = _mm512_sub_ps(av1, bv1);
+            let abs0 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(d0), abs_mask));
+            let abs1 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(d1), abs_mask));
+            acc0 = _mm512_add_ps(acc0, abs0);
+            acc1 = _mm512_add_ps(acc1, abs1);
+            i += 32;
+        }
+        while i + 16 <= len {
             let av = _mm512_loadu_ps(a.as_ptr().add(i));
             let bv = _mm512_loadu_ps(b.as_ptr().add(i));
             let d = _mm512_sub_ps(av, bv);
-            let abs = _mm512_andnot_ps(sign, d);
-            acc = _mm512_add_ps(acc, abs);
+            let abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(d), abs_mask));
+            acc0 = _mm512_add_ps(acc0, abs);
             i += 16;
         }
+        let acc = _mm512_add_ps(acc0, acc1);
         if i + 8 <= len {
             let sign256 = _mm256_set1_ps(-0.0f32);
             let av8 = _mm256_loadu_ps(a.as_ptr().add(i));
