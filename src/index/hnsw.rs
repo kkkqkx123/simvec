@@ -21,7 +21,6 @@
 //!   rebuild policy (`HnswConfig::stale_rebuild_ratio`) can observe and
 //!   react to staleness instead of waiting for a compaction.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -46,6 +45,71 @@ pub(crate) struct HnswSearchContext<'a> {
     pub vectors: &'a [Arc<memmap2::Mmap>],
     pub segment_slots: u32,
     pub filter_mask: Option<&'a BitVec>,
+}
+
+/// Per-thread reusable working sets for the search hot path.
+///
+/// The visited set is a generation array sized to the node table: marking
+/// compares the slot generation instead of clearing, so successive queries
+/// pay no reset pass. Heaps and the discard buffer are cleared but keep
+/// their capacity across queries on the same thread.
+#[derive(Default)]
+struct HnswQueryScratch {
+    visited_gen: Vec<u32>,
+    current_gen: u32,
+    candidates: std::collections::BinaryHeap<std::cmp::Reverse<Cand>>,
+    results: std::collections::BinaryHeap<Cand>,
+    discarded: Vec<Cand>,
+}
+
+impl HnswQueryScratch {
+    fn prepare(&mut self, node_count: usize) {
+        if self.visited_gen.len() < node_count {
+            self.visited_gen.resize(node_count, 0);
+        }
+        self.current_gen = self.current_gen.wrapping_add(1);
+        if self.current_gen == 0 {
+            self.visited_gen.fill(0);
+            self.current_gen = 1;
+        }
+        self.candidates.clear();
+        self.results.clear();
+        self.discarded.clear();
+    }
+
+    #[inline]
+    fn mark_visited(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= self.visited_gen.len() {
+            self.visited_gen.resize(idx + 1, 0);
+        }
+        if self.visited_gen[idx] == self.current_gen {
+            return false;
+        }
+        self.visited_gen[idx] = self.current_gen;
+        true
+    }
+}
+
+thread_local! {
+    static QUERY_SCRATCH: std::cell::RefCell<HnswQueryScratch> =
+        std::cell::RefCell::new(HnswQueryScratch::default());
+}
+
+/// Per-thread reusable buffers for neighbor selection.
+///
+/// The sorted pool and the pruned spill keep capacity across inserts on the
+/// same thread; only the returned selection (at most one layer cap) is
+/// freshly allocated.
+#[derive(Default)]
+struct HnswSelectScratch {
+    sorted: Vec<Cand>,
+    pruned: Vec<Cand>,
+}
+
+thread_local! {
+    static SELECT_SCRATCH: std::cell::RefCell<HnswSelectScratch> =
+        std::cell::RefCell::new(HnswSelectScratch::default());
 }
 
 /// Hard cap for generated levels. `ml = 1/ln(m)` makes higher levels
@@ -745,6 +809,21 @@ impl HnswIndex {
         layer: u8,
         ctx: &HnswSearchContext<'_>,
     ) -> SearchLayerResult {
+        QUERY_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            self.search_layer_with_scratch(query, entries, ef, layer, ctx, &mut scratch)
+        })
+    }
+
+    fn search_layer_with_scratch(
+        &self,
+        query: &[f32],
+        entries: &[Cand],
+        ef: usize,
+        layer: u8,
+        ctx: &HnswSearchContext<'_>,
+        scratch: &mut HnswQueryScratch,
+    ) -> SearchLayerResult {
         let live = |slot: u32| -> bool {
             match ctx.tombstones {
                 Some(t) => !t.bit(slot as usize),
@@ -756,37 +835,38 @@ impl HnswIndex {
                 .is_none_or(|m| (slot as usize) < m.len() && m[slot as usize])
         };
 
-        // Pre-allocate with reasonable capacities to avoid frequent resizing
-        // during the hot search loop. The visited set grows as we explore
-        // neighbors; the heaps are bounded by ef.
+        // Working sets reuse the per-thread capacity: the generation array
+        // compares generations instead of clearing, and the heaps keep
+        // their allocations across queries on this thread.
+        let node_count = self.nodes.read().len();
+        scratch.prepare(node_count.max(entries.len() + ef));
         let initial_cap = (entries.len() + ef).max(16);
-        let mut visited: HashSet<u32> = HashSet::with_capacity(initial_cap);
-        // Candidate min-heap (closest pop) and result max-heap (furthest pop).
-        //
-        // The frontier navigates through every live node so a pre-filter
-        // cannot disconnect the traversal; `results` collects only
-        // filter-matching nodes and `live_results` budgets those matches.
-        let mut candidates: std::collections::BinaryHeap<std::cmp::Reverse<Cand>> =
-            std::collections::BinaryHeap::with_capacity(initial_cap);
-        let mut results: std::collections::BinaryHeap<Cand> =
-            std::collections::BinaryHeap::with_capacity(ef);
-        let mut discarded: Vec<Cand> = Vec::new();
+        if scratch.candidates.capacity() < initial_cap {
+            scratch
+                .candidates
+                .reserve(initial_cap - scratch.candidates.capacity());
+        }
+        if scratch.results.capacity() < ef {
+            scratch.results.reserve(ef - scratch.results.capacity());
+        }
+        let mut visited_count = 0usize;
         let mut live_results = 0usize;
 
         for &cand in entries {
-            if !live(cand.slot) || !visited.insert(cand.slot) {
+            if !live(cand.slot) || !scratch.mark_visited(cand.slot) {
                 continue;
             }
-            candidates.push(std::cmp::Reverse(cand));
+            visited_count += 1;
+            scratch.candidates.push(std::cmp::Reverse(cand));
             if matches_filter(cand.slot) {
-                results.push(cand);
+                scratch.results.push(cand);
                 live_results += 1;
             }
         }
 
-        while let Some(std::cmp::Reverse(c)) = candidates.pop() {
+        while let Some(std::cmp::Reverse(c)) = scratch.candidates.pop() {
             if live_results >= ef {
-                match results.peek() {
+                match scratch.results.peek() {
                     // Enough matches collected and this frontier node is
                     // farther than the worst match: the rest of the frontier
                     // cannot improve the output.
@@ -814,9 +894,10 @@ impl HnswIndex {
                 neighbors
             };
             for slot in neighbors {
-                if !visited.insert(slot) || !live(slot) {
+                if !scratch.mark_visited(slot) || !live(slot) {
                     continue;
                 }
+                visited_count += 1;
                 let Some(v) =
                     Vectors::read_slot(ctx.vectors, slot as u64, ctx.segment_slots, self.dim)
                 else {
@@ -824,31 +905,33 @@ impl HnswIndex {
                 };
                 let dist = self.distance(query, v);
                 let cand = Cand { dist, slot };
-                candidates.push(std::cmp::Reverse(cand));
+                scratch.candidates.push(std::cmp::Reverse(cand));
                 if !matches_filter(slot) {
                     continue;
                 }
-                results.push(cand);
+                scratch.results.push(cand);
                 live_results += 1;
                 // Trim back to the `ef` budget. Evicted live candidates
                 // are recorded in `discarded` for iterative scan resume.
-                while results.len() > ef {
-                    let Some(evicted) = results.pop() else {
+                while scratch.results.len() > ef {
+                    let Some(evicted) = scratch.results.pop() else {
                         break;
                     };
                     live_results -= 1;
-                    discarded.push(evicted);
+                    scratch.discarded.push(evicted);
                 }
             }
         }
 
-        // Emit only live elements, closest first.
-        let mut live_out: Vec<Cand> = results.into_iter().filter(|c| live(c.slot)).collect();
+        // Emit only live elements, closest first. The working heaps stay in
+        // the scratch for the next query; only the compact outputs allocate.
+        let mut live_out: Vec<Cand> = scratch.results.drain().filter(|c| live(c.slot)).collect();
         live_out.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
+        let discarded_out = std::mem::take(&mut scratch.discarded);
         SearchLayerResult {
             live: live_out,
-            discarded,
-            visited: visited.len(),
+            discarded: discarded_out,
+            visited: visited_count,
         }
     }
 
@@ -865,55 +948,68 @@ impl HnswIndex {
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
     ) -> Vec<Cand> {
-        let mut sorted: Vec<Cand> = candidates.to_vec();
-        sorted.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-        if sorted.len() <= lm {
-            return sorted;
-        }
-
-        let mut selected: Vec<Cand> = Vec::with_capacity(lm);
-        let mut pruned: Vec<Cand> = Vec::new();
-        for cand in sorted {
-            if selected.len() == lm {
-                break;
+        SELECT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let mut sorted = std::mem::take(&mut scratch.sorted);
+            let mut pruned = std::mem::take(&mut scratch.pruned);
+            sorted.clear();
+            pruned.clear();
+            sorted.extend_from_slice(candidates);
+            sorted.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
+            if sorted.len() <= lm {
+                let out = sorted.clone();
+                scratch.sorted = sorted;
+                scratch.pruned = pruned;
+                return out;
             }
-            let Some(cv) = Vectors::read_slot(vectors, cand.slot as u64, segment_slots, self.dim)
-            else {
-                continue;
-            };
-            // Pairwise checks stay sequential: the fan-out is at most `lm`
-            // distances (~microseconds), far below rayon task-routing cost.
-            // Routing each check through the global pool made builds orders
-            // of magnitude slower (every join wakes the worker threads) with
-            // no compute to amortize it. Slot-level parallelism belongs to
-            // the multi-worker build path, not this inner loop.
-            let mut closer = true;
-            for s in &selected {
-                let Some(rv) = Vectors::read_slot(vectors, s.slot as u64, segment_slots, self.dim)
-                else {
-                    closer = false;
-                    break;
-                };
-                // Strictly-farther-from-every-selected means diverse enough
-                // to keep (pgvector CheckElementCloser).
-                if self.distance(cv, rv) <= cand.dist {
-                    closer = false;
+
+            let mut selected: Vec<Cand> = Vec::with_capacity(lm);
+            for cand in sorted.drain(..) {
+                if selected.len() == lm {
                     break;
                 }
+                let Some(cv) =
+                    Vectors::read_slot(vectors, cand.slot as u64, segment_slots, self.dim)
+                else {
+                    continue;
+                };
+                // Pairwise checks stay sequential: the fan-out is at most `lm`
+                // distances (~microseconds), far below rayon task-routing cost.
+                // Routing each check through the global pool made builds orders
+                // of magnitude slower (every join wakes the worker threads) with
+                // no compute to amortize it. Slot-level parallelism belongs to
+                // the multi-worker build path, not this inner loop.
+                let mut closer = true;
+                for s in &selected {
+                    let Some(rv) =
+                        Vectors::read_slot(vectors, s.slot as u64, segment_slots, self.dim)
+                    else {
+                        closer = false;
+                        break;
+                    };
+                    // Strictly-farther-from-every-selected means diverse enough
+                    // to keep (pgvector CheckElementCloser).
+                    if self.distance(cv, rv) <= cand.dist {
+                        closer = false;
+                        break;
+                    }
+                }
+                if closer {
+                    selected.push(cand);
+                } else {
+                    pruned.push(cand);
+                }
             }
-            if closer {
+            for cand in pruned.drain(..) {
+                if selected.len() == lm {
+                    break;
+                }
                 selected.push(cand);
-            } else {
-                pruned.push(cand);
             }
-        }
-        for cand in pruned {
-            if selected.len() == lm {
-                break;
-            }
-            selected.push(cand);
-        }
-        selected
+            scratch.sorted = sorted;
+            scratch.pruned = pruned;
+            selected
+        })
     }
 
     /// Add the reverse edge `neighbor -> slot`, shrinking the neighbor's
@@ -1042,8 +1138,8 @@ impl HnswIndex {
             lc -= 1;
         }
 
-        let mut all_results: Vec<Cand> = Vec::new();
-        let mut all_discarded: Vec<Cand> = Vec::new();
+        let mut all_results: Vec<Cand> = Vec::with_capacity(k + ef * max_iterations.max(1));
+        let mut all_discarded: Vec<Cand> = Vec::with_capacity(ef * max_iterations.max(1));
         let mut current_entries = vec![best];
         let mut visited_total: u64 = 0;
 
@@ -1129,8 +1225,10 @@ impl HnswIndex {
 
                     // Collect candidates: all live neighbors of this node's
                     // neighbors (2-hop) that are not already in the list.
-                    let existing: HashSet<u32> = adj.iter().copied().collect();
-                    let mut candidates: Vec<Cand> = Vec::new();
+                    // The adjacency is at most one layer cap (a few dozen),
+                    // so a linear scan avoids hashing for the membership
+                    // check on this offline path.
+                    let mut candidates: Vec<Cand> = Vec::with_capacity(adj.len().max(4));
 
                     // Start with direct neighbors that survived.
                     for &neighbor_slot in adj.iter() {
@@ -1139,7 +1237,7 @@ impl HnswIndex {
                             for &candidate_slot in neighbor_adj.iter() {
                                 if candidate_slot == slot
                                     || tombstones.bit(candidate_slot as usize)
-                                    || existing.contains(&candidate_slot)
+                                    || adj.contains(&candidate_slot)
                                 {
                                     continue;
                                 }
@@ -1184,6 +1282,7 @@ impl HnswIndex {
 mod tests {
     use super::*;
     use crate::types::DistanceMetric;
+    use std::collections::HashSet;
 
     const DIM: usize = 8;
 
