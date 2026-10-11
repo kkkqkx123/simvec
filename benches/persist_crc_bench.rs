@@ -7,13 +7,13 @@
 //! on a tmp+rename path.
 //!
 //! Payload shapes for the benchmark:
-//! - `index.bin` (IVF): lists=256, dim=128, live=100K, ~500KB payload
-//! - `hnsw.bin`: dim=128, m=16, live=100K, ~12–15MB payload (`m*2*live` edges)
+//! - `index.bin` (IVF): lists=64, dim=128, live=10K
+//! - `hnsw.bin`: dim=128, m=16, live=10K
 //!
 //! Run: `cargo bench -p simvec --bench persist_crc_bench -- --warm-up-time 1 --measurement-time 3`
 //!
-//! Run convention: default builds 100k-point fixtures; `QUICK=1` drops to
-//! 10k points for a seconds-long smoke run.
+//! Run convention: default builds 10k-point fixtures; `QUICK=1` drops to
+//! 2k points. Authoritative persist baselines will come from public datasets.
 
 use std::fs::File;
 use std::io::Write;
@@ -149,10 +149,10 @@ fn bench_persist_crc(c: &mut Criterion) {
     // One-time fixtures; keep outside `b.iter` so criterion measures only the
     // CRC / save kernels. Construction is reported once via eprintln for the
     // baseline report.
-    let live = quick::scale(100_000, 10_000);
-    let size_tag = if quick::quick_mode() { "10k" } else { "100k" };
+    let live = quick::scale(10_000, 2_000);
+    let size_tag = if quick::quick_mode() { "2k" } else { "10k" };
     let t0 = Instant::now();
-    let ivf = make_ivf(256, 128, live);
+    let ivf = make_ivf(64, 128, live);
     let ivf_gen = t0.elapsed();
     let t0 = Instant::now();
     let ivf_bytes = postcard::to_stdvec(&ivf).expect("ivf postcard");
@@ -238,7 +238,7 @@ fn bench_persist_crc(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         let ivf_tmp = dir.path().join("ratio_ivf.bin");
         let hnsw_tmp = dir.path().join("ratio_hnsw.bin");
-        const FULL_ITERS: usize = 20;
+        const FULL_ITERS: usize = 10;
         let iters = quick::scale(FULL_ITERS, 5);
         let ivf_t_crc = {
             let t0 = Instant::now();

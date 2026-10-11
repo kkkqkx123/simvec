@@ -77,11 +77,13 @@ fn size_label(n: usize) -> &'static str {
 fn scan_latency(c: &mut Criterion) {
     let query = unit_vector(SEED);
     let kernel = selected();
-    // Full run keeps the 1M-point ceiling; the smoke gear stops at 10k.
+    // Default keeps the 100k-point ceiling so the suite finishes on
+    // constrained machines; the smoke gear stops at 10k. Authoritative scan
+    // baselines will come from public datasets.
     let sizes: &[usize] = if quick::quick_mode() {
         &[1_000, 10_000]
     } else {
-        &[10_000, 100_000, 1_000_000]
+        &[2_000, 10_000, 100_000]
     };
     for &n in sizes {
         let data = unit_vectors(n);
@@ -135,7 +137,7 @@ fn simd_vs_naive(c: &mut Criterion) {
         return;
     }
     let query = unit_vector(SEED);
-    let n = quick::scale(100_000, 10_000);
+    let n = quick::scale(10_000, 2_000);
     let data = unit_vectors(n);
     let mut group = quick::benchmark_group(c, "simd_vs_naive");
     for kernel in kernels {
@@ -229,8 +231,8 @@ fn filter_selectivity(c: &mut Criterion) {
         )
         .unwrap();
 
-    // Full run tags 100k points; the smoke gear tags 10k.
-    let count = quick::scale(100_000, 10_000);
+    // Default tags 10k points; the smoke gear tags 2k.
+    let count = quick::scale(10_000, 2_000);
     let mut rng = StdRng::seed_from_u64(SEED + 1);
     let points: Vec<VectorPoint> = (0..count)
         .map(|i| {

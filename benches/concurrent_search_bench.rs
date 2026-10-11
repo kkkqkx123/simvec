@@ -8,8 +8,9 @@
 //!
 //! Run: `cargo bench -p simvec -- concurrent_search`
 //!
-//! Run convention: default searches 20k points with 256 queries;
-//! `QUICK=1` drops to 2k points / 32 queries for a seconds-long smoke run.
+//! Run convention: default searches 5k points with 64 queries so the suite
+//! finishes on constrained machines; `QUICK=1` drops to 2k points / 32
+//! queries. Authoritative scaling baselines will come from public datasets.
 
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ use simvec::{
 mod quick;
 
 const DIM: usize = 128;
-const FULL_POINTS: usize = 20_000;
-const FULL_QUERIES: usize = 256;
+const FULL_POINTS: usize = 5_000;
+const FULL_QUERIES: usize = 64;
 const SEED: usize = 42;
 
 fn engine_with_index(path: &std::path::Path, points: usize) -> LocalVectorEngine {

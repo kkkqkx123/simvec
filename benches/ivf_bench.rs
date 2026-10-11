@@ -7,8 +7,10 @@
 //!
 //! Run: `cargo bench -p simvec -- ivf`
 //!
-//! Run convention: default is the full 100k-point promotion scale;
-//! `QUICK=1` shrinks to 5k points for a seconds-long smoke run.
+//! Run convention: default is the 10k-point smoke scale so the suite
+//! finishes on constrained machines; `QUICK=1` shrinks to 2k points.
+//! Authoritative IVF baselines will come from public datasets after formal
+//! large-scale benchmarking.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -84,8 +86,8 @@ fn ground_truth(engine: &LocalVectorEngine, query: &[f32], k: usize) -> Vec<Stri
 
 fn build_time(c: &mut Criterion) {
     let mut group = quick::benchmark_group(c, "ivf_build_time");
-    let n = quick::scale(100_000, 5_000);
-    let lists = quick::scale(512, 64) as u32;
+    let n = quick::scale(10_000, 2_000);
+    let lists = quick::scale(128, 32) as u32;
     group.bench_function(BenchmarkId::new("build", n), |b| {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
@@ -104,8 +106,8 @@ fn build_time(c: &mut Criterion) {
 
 fn latency_and_recall(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let n = quick::scale(100_000, 5_000);
-    let lists = quick::scale(256, 32) as u32;
+    let n = quick::scale(10_000, 2_000);
+    let lists = quick::scale(64, 16) as u32;
     let engine = engine_with(dir.path(), n, lists);
 
     // Ground truth must come from the exact-scan path, so compute it before
@@ -154,8 +156,8 @@ fn latency_and_recall(c: &mut Criterion) {
 
 fn exact_vs_index_crossover(_c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let n = quick::scale(100_000, 5_000);
-    let lists = quick::scale(256, 32) as u32;
+    let n = quick::scale(10_000, 2_000);
+    let lists = quick::scale(64, 16) as u32;
     let engine = engine_with(dir.path(), n, lists);
     let query = unit_vectors(1).pop().unwrap();
     let samples = quick::scale(50, 5);
@@ -193,7 +195,7 @@ fn exact_vs_index_crossover(_c: &mut Criterion) {
 
 fn ivf_upsert_overhead(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(engine_with(dir.path(), quick::scale(50_000, 5_000), 256));
+    let engine = Arc::new(engine_with(dir.path(), quick::scale(10_000, 2_000), 64));
 
     let data = unit_vectors(100);
     let mut txn_id = 1u64;
@@ -236,7 +238,8 @@ criterion_group!(
 );
 criterion_main!(benches);
 
-// Promotion rule:
+// Promotion rule (evaluated on public datasets at formal baselining time,
+// not at this smoke scale):
 // Flip `IvfConfig::default()`'s `auto_promotion` to true iff, at 1M points:
 //   - IVF (default_nprobe) latency < exact scan latency / 3, and
 //   - recall@10 >= 0.98 in `ivf_latency_vs_nprobe`.

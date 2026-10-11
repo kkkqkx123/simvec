@@ -11,8 +11,9 @@
 //!
 //! Run: `cargo bench -p simvec -- hnsw_build`
 //!
-//! Run convention: default builds 2k/10k-point graphs; `QUICK=1` drops to
-//! 500/2k points for a seconds-long smoke run.
+//! Run convention: default builds 1k/2k-point graphs so the suite finishes
+//! on constrained machines; `QUICK=1` drops to 500/1k points.
+//! Authoritative build baselines will come from public datasets.
 
 use std::time::Instant;
 
@@ -64,8 +65,8 @@ fn build_once(threads: Option<usize>, n: usize) -> std::time::Duration {
 
 fn bench_hnsw_build(c: &mut Criterion) {
     let mut group = quick::benchmark_group(c, "hnsw_build");
-    // Full run keeps the 10k promotion scale; the smoke gear stays small.
-    let sizes = [quick::scale(2_000, 500), quick::scale(10_000, 2_000)];
+    // Default keeps the 2k scale; the smoke gear stays small.
+    let sizes = [quick::scale(1_000, 500), quick::scale(2_000, 1_000)];
     for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_function(BenchmarkId::new("sequential", n), |b| {
