@@ -51,8 +51,9 @@ pub(crate) struct HnswSearchContext<'a> {
 ///
 /// The visited set is a generation array sized to the node table: marking
 /// compares the slot generation instead of clearing, so successive queries
-/// pay no reset pass. Heaps and the discard buffer are cleared but keep
-/// their capacity across queries on the same thread.
+/// pay no reset pass. Heaps, the discard buffer, and the neighbor copy
+/// buffer are cleared but keep their capacity across queries on the same
+/// thread.
 #[derive(Default)]
 struct HnswQueryScratch {
     visited_gen: Vec<u32>,
@@ -60,6 +61,7 @@ struct HnswQueryScratch {
     candidates: std::collections::BinaryHeap<std::cmp::Reverse<Cand>>,
     results: std::collections::BinaryHeap<Cand>,
     discarded: Vec<Cand>,
+    neighbors: Vec<u32>,
 }
 
 impl HnswQueryScratch {
@@ -110,6 +112,22 @@ struct HnswSelectScratch {
 thread_local! {
     static SELECT_SCRATCH: std::cell::RefCell<HnswSelectScratch> =
         std::cell::RefCell::new(HnswSelectScratch::default());
+}
+
+/// Per-thread buffers for the reverse-link overflow path. The pool and the
+/// selection output are both bounded by the layer cap plus one, so these two
+/// buffers cover every call on this thread. They stay separate from
+/// `SELECT_SCRATCH` because the pool is still borrowed while the selection
+/// runs, which borrows the select scratch in turn.
+#[derive(Default)]
+struct HnswLinkScratch {
+    pool: Vec<Cand>,
+    selected: Vec<Cand>,
+}
+
+thread_local! {
+    static LINK_SCRATCH: std::cell::RefCell<HnswLinkScratch> =
+        std::cell::RefCell::new(HnswLinkScratch::default());
 }
 
 /// Hard cap for generated levels. `ml = 1/ln(m)` makes higher levels
@@ -877,23 +895,32 @@ impl HnswIndex {
             let Some(node) = self.node(c.slot) else {
                 continue;
             };
-            // Snapshot the version before loading the adjacency list.
-            // If it changes during the read, the list may be torn; reload once.
+            // Snapshot the version before loading the adjacency list. The
+            // list is copied into the per-thread neighbor buffer so the hot
+            // loop performs no per-node allocation; the read guard is dropped
+            // before distance math so writers are never held across it. If
+            // the version changed during the copy, the list may be torn, so
+            // it is copied once more.
             let v1 = node.version();
-            let neighbors = node.layer(layer).read().clone();
+            scratch.neighbors.clear();
+            scratch
+                .neighbors
+                .extend_from_slice(&node.layer(layer).read());
             let v2 = node.version();
-            let neighbors = if v1 != v2 {
-                // Version changed during the read; reload once. Counted so
+            if v1 != v2 {
+                // Version changed during the read; copy once more. Counted so
                 // concurrency regression tests can assert this recovery path
                 // is actually exercised under write/read contention.
                 if let Some(metrics) = &self.lock_metrics {
                     metrics.record_version_reload();
                 }
-                node.layer(layer).read().clone()
-            } else {
-                neighbors
-            };
-            for slot in neighbors {
+                scratch.neighbors.clear();
+                scratch
+                    .neighbors
+                    .extend_from_slice(&node.layer(layer).read());
+            }
+            for idx in 0..scratch.neighbors.len() {
+                let slot = scratch.neighbors[idx];
                 if !scratch.mark_visited(slot) || !live(slot) {
                     continue;
                 }
@@ -924,10 +951,11 @@ impl HnswIndex {
         }
 
         // Emit only live elements, closest first. The working heaps stay in
-        // the scratch for the next query; only the compact outputs allocate.
+        // the scratch for the next query and the discard buffer is split off
+        // so it keeps its capacity too; only the compact outputs allocate.
         let mut live_out: Vec<Cand> = scratch.results.drain().filter(|c| live(c.slot)).collect();
         live_out.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
-        let discarded_out = std::mem::take(&mut scratch.discarded);
+        let discarded_out = scratch.discarded.split_off(0);
         SearchLayerResult {
             live: live_out,
             discarded: discarded_out,
@@ -948,6 +976,23 @@ impl HnswIndex {
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
     ) -> Vec<Cand> {
+        let mut out = Vec::with_capacity(lm);
+        self.select_neighbors_into(candidates, lm, vectors, segment_slots, &mut out);
+        out
+    }
+
+    /// Heuristic selection writing into a caller-provided buffer so hot paths
+    /// (reverse-link overflow) select without a per-call allocation. The
+    /// sorted pool and pruned spill still reuse the per-thread capacity; only
+    /// `out` grows, once per thread, to the layer cap.
+    fn select_neighbors_into(
+        &self,
+        candidates: &[Cand],
+        lm: usize,
+        vectors: &[Arc<memmap2::Mmap>],
+        segment_slots: u32,
+        out: &mut Vec<Cand>,
+    ) {
         SELECT_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             let mut sorted = std::mem::take(&mut scratch.sorted);
@@ -956,16 +1001,16 @@ impl HnswIndex {
             pruned.clear();
             sorted.extend_from_slice(candidates);
             sorted.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
+            out.clear();
             if sorted.len() <= lm {
-                let out = sorted.clone();
+                out.extend_from_slice(&sorted);
                 scratch.sorted = sorted;
                 scratch.pruned = pruned;
-                return out;
+                return;
             }
 
-            let mut selected: Vec<Cand> = Vec::with_capacity(lm);
             for cand in sorted.drain(..) {
-                if selected.len() == lm {
+                if out.len() == lm {
                     break;
                 }
                 let Some(cv) =
@@ -980,7 +1025,7 @@ impl HnswIndex {
                 // no compute to amortize it. Slot-level parallelism belongs to
                 // the multi-worker build path, not this inner loop.
                 let mut closer = true;
-                for s in &selected {
+                for s in out.iter() {
                     let Some(rv) =
                         Vectors::read_slot(vectors, s.slot as u64, segment_slots, self.dim)
                     else {
@@ -995,20 +1040,19 @@ impl HnswIndex {
                     }
                 }
                 if closer {
-                    selected.push(cand);
+                    out.push(cand);
                 } else {
                     pruned.push(cand);
                 }
             }
             for cand in pruned.drain(..) {
-                if selected.len() == lm {
+                if out.len() == lm {
                     break;
                 }
-                selected.push(cand);
+                out.push(cand);
             }
             scratch.sorted = sorted;
             scratch.pruned = pruned;
-            selected
         })
     }
 
@@ -1041,25 +1085,32 @@ impl HnswIndex {
         // Overflow: reselect around the neighbor's own vector. The pool is
         // bounded by the layer cap (a few dozen entries), so the distance
         // fan-out stays sequential — rayon routing would dominate the work.
+        // The pool and the selection output reuse the per-thread link buffers
+        // and the adjacency list is rewritten in place (it was full, so the
+        // reselected set fits), which removes every per-overflow allocation
+        // from this hot path.
         let Some(nv) = Vectors::read_slot(vectors, neighbor as u64, segment_slots, self.dim) else {
             return;
         };
-        let mut pool: Vec<Cand> = adj
-            .iter()
-            .filter_map(|&s| {
+        LINK_SCRATCH.with(|link_cell| {
+            let mut link = link_cell.borrow_mut();
+            let HnswLinkScratch { pool, selected } = &mut *link;
+            pool.clear();
+            pool.extend(adj.iter().filter_map(|&s| {
                 let v = Vectors::read_slot(vectors, s as u64, segment_slots, self.dim)?;
                 Some(Cand {
                     dist: self.distance(nv, v),
                     slot: s,
                 })
-            })
-            .collect();
-        pool.push(Cand {
-            dist: dist_to_neighbor,
-            slot,
+            }));
+            pool.push(Cand {
+                dist: dist_to_neighbor,
+                slot,
+            });
+            self.select_neighbors_into(pool.as_slice(), lm, vectors, segment_slots, selected);
+            adj.clear();
+            adj.extend(selected.iter().map(|c| c.slot));
         });
-        let selected = self.select_neighbors(&pool, lm, vectors, segment_slots);
-        *adj = selected.into_iter().map(|c| c.slot).collect();
         node.bump_version();
     }
 
@@ -1162,7 +1213,10 @@ impl HnswIndex {
                 break;
             }
             // Use discarded candidates as entry points for the next iteration.
-            current_entries = std::mem::take(&mut all_discarded);
+            // Swap the buffers instead of taking the accumulator so both keep
+            // their capacity across rounds instead of reallocating each pass.
+            current_entries.clear();
+            std::mem::swap(&mut current_entries, &mut all_discarded);
         }
 
         // Deduplicate by slot (keep closest), sort, and take top-k.

@@ -8,6 +8,9 @@
 //! effect on library builds because the allocator lives in this binary.
 //!
 //! Run: `cargo bench -p simvec --bench alloc_stats_bench`
+//!
+//! Run convention: default is the full 10k-point run; `QUICK=1` shrinks to
+//! 1k points / 20 queries for a seconds-long smoke run.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,11 +93,19 @@ fn main() {
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
+    // Fast smoke gears: full run keeps the issue's 10k-point scale, QUICK=1
+    // drops to 1k points so the report finishes in seconds.
+    let (points, n_queries) = if std::env::var("QUICK").is_ok() {
+        (1_000, 20)
+    } else {
+        (POINTS, QUERIES)
+    };
+
     // Phase 1: batched ingest.
     let base = snapshot();
     let t_phase = std::time::Instant::now();
-    for chunk in (0..POINTS).step_by(1_000) {
-        let points: Vec<simvec::VectorPoint> = (chunk..(chunk + 1_000).min(POINTS))
+    for chunk in (0..points).step_by(1_000) {
+        let batch: Vec<simvec::VectorPoint> = (chunk..(chunk + 1_000).min(points))
             .map(|i| {
                 simvec::VectorPoint::new(
                     i as u64,
@@ -102,7 +113,7 @@ fn main() {
                 )
             })
             .collect();
-        engine.upsert_batch("col", &points).unwrap();
+        engine.upsert_batch("col", &batch).unwrap();
     }
     eprintln!("[phase] ingest: {:?}", t_phase.elapsed());
     let ingest = delta_since(base);
@@ -114,7 +125,7 @@ fn main() {
     eprintln!("[phase] build: {:?}", t_phase.elapsed());
     let build = delta_since(base);
 
-    let queries: Vec<Vec<f32>> = (0..QUERIES)
+    let queries: Vec<Vec<f32>> = (0..n_queries)
         .map(|_| (0..DIM).map(|_| rng.gen_range(-1.0..1.0)).collect())
         .collect();
 
@@ -159,8 +170,8 @@ fn main() {
     let filtered = delta_since(base);
 
     println!(
-        "\n=== allocation stats ({} points, dim {}) ===",
-        POINTS, DIM
+        "\n=== allocation stats ({} points, dim {}, {} queries) ===",
+        points, DIM, n_queries
     );
     println!(
         "{:<28}{:>14}{:>16}{:>14}{:>16}",
