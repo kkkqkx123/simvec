@@ -13,7 +13,10 @@
 //! - Baseline compile is `x86-64` / `aarch64` generic (`.cargo/config.toml`
 //!   no longer forces `x86-64-v3`). Every kernel's `is_available` is checked
 //!   at startup and `best_available` picks the highest-ranked available one.
-//! - `x86_64` ranking: `Avx512 (avx512f) > Avx2+FMA > Portable? > Naive`.
+//! - `x86_64` ranking: `Avx2+FMA > Avx512 (avx512f) > Portable? > Naive`.
+//!   AVX-512 only wins past ~1024 dims (<5% at 1536, slower at 384/768 from
+//!   masking and frequency costs), so AVX2 is the default and AVX-512 stays
+//!   available for explicit selection and kernel-vs-kernel benchmarks.
 //! - `aarch64` ranking: `Neon > Portable? > Naive`.
 //! - `Portable` is `std::simd` (8-wide) behind the `simd_portable` feature
 //!   and is always available when enabled (it degrades to scalar autovec if
@@ -123,13 +126,13 @@ impl fmt::Display for Kernel {
 
 #[cfg(all(target_arch = "x86_64", feature = "simd_portable"))]
 const IMPLS: [Kernel; 4] = [
-    Kernel::Avx512,
     Kernel::Avx2,
+    Kernel::Avx512,
     Kernel::Portable,
     Kernel::Naive,
 ];
 #[cfg(all(target_arch = "x86_64", not(feature = "simd_portable")))]
-const IMPLS: [Kernel; 3] = [Kernel::Avx512, Kernel::Avx2, Kernel::Naive];
+const IMPLS: [Kernel; 3] = [Kernel::Avx2, Kernel::Avx512, Kernel::Naive];
 
 #[cfg(all(target_arch = "aarch64", feature = "simd_portable"))]
 const IMPLS: [Kernel; 3] = [Kernel::Neon, Kernel::Portable, Kernel::Naive];

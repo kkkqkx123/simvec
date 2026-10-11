@@ -161,7 +161,10 @@ impl CollectionStore {
 
         // 1. Parallel exact scan with streaming top-K. The parallel heap
         //    avoids materializing the full (score, slot) set when the
-        //    collection is large, cutting peak memory to O(k).
+        //    collection is large, cutting peak memory to O(k). The heap only
+        //    ever holds slots that already passed the full payload filter
+        //    (bitmap pre-check plus `matches`), so the shared post-processing
+        //    below must not filter a second time.
         let k = query.offset.unwrap_or(0).saturating_add(query.limit);
         let heap: BinaryHeap<std::cmp::Reverse<ScoredSlot>> = (0..next_slot as u32)
             .into_par_iter()
@@ -181,7 +184,7 @@ impl CollectionStore {
                             tombstones: &tombstones,
                             vsnap: &vsnap,
                             keysnap: &keysnap,
-                            filter_mask: None,
+                            filter_mask: snap.filter_mask,
                             payload_view,
                         },
                     );
@@ -213,7 +216,7 @@ impl CollectionStore {
 
         self.metrics
             .record_search(SearchPath::Exact, filtered, started.elapsed());
-        self.finish_candidates(
+        self.finish_scored(
             candidates,
             query,
             &SearchSnapshot {
@@ -320,7 +323,7 @@ impl CollectionStore {
         if quant_candidates.is_empty() {
             self.metrics
                 .record_search(SearchPath::Quantized, filtered, started.elapsed());
-            return self.finish_candidates(
+            return self.finish_scored(
                 Vec::new(),
                 query,
                 &SearchSnapshot {
@@ -351,7 +354,10 @@ impl CollectionStore {
 
         self.metrics
             .record_search(SearchPath::Quantized, filtered, started.elapsed());
-        self.finish_candidates(
+        // Candidates already passed the full payload filter inside
+        // `quant_scan_step`; re-filtering here would repeat every
+        // key/payload read.
+        self.finish_scored(
             reranked,
             query,
             &SearchSnapshot {
@@ -460,8 +466,18 @@ impl CollectionStore {
         let SearchSnapshot {
             keysnap,
             payload_view,
+            filter_mask,
             ..
         } = snap;
+        // Fast bitmap pre-filter for equality payload conditions: skipped
+        // slots never pay the key/payload reads below. Slots without filter
+        // coverage fall through to the full check, so the mask can only
+        // remove work, never results.
+        if let Some(mask) = filter_mask {
+            if (slot as usize) >= mask.len() || !mask[slot as usize] {
+                return;
+            }
+        }
         if let Some(filter) = &query.filter {
             let Some(id) = Keys::read_key(keysnap, slot as usize)
                 .ok()
@@ -632,8 +648,12 @@ impl CollectionStore {
         candidates
     }
 
-    /// Shared post-processing for both search paths: payload post-filter,
-    /// score threshold, top-K heap selection and result assembly.
+    /// Shared post-processing for the ANN paths: payload post-filter, score
+    /// threshold, top-K heap selection and result assembly. Index probes
+    /// only pre-filter (bitmap plus traversal), so the full payload check
+    /// here is load-bearing. Exact and quantized scans filter inline during
+    /// the scan and must use [`Self::finish_scored`] instead to avoid paying
+    /// the key/payload reads a second time.
     fn finish_candidates(
         &self,
         mut candidates: Vec<(f32, u32)>,
@@ -641,16 +661,10 @@ impl CollectionStore {
         snap: &SearchSnapshot,
     ) -> Result<Vec<SearchResult>> {
         let SearchSnapshot {
-            dim,
-            segment_slots,
-            tombstones,
-            vsnap,
             keysnap,
-            filter_mask,
             payload_view,
+            ..
         } = snap;
-        let _ = tombstones;
-        let _ = filter_mask;
         // 2. Post-filter on payload, against the snapshots taken by the
         // caller (one compaction generation).
         if let Some(filter) = &query.filter {
@@ -671,6 +685,30 @@ impl CollectionStore {
             candidates = kept;
         }
 
+        self.finish_scored(candidates, query, snap)
+    }
+
+    /// Post-filter-free tail of [`Self::finish_candidates`]: score
+    /// threshold, top-K heap selection and result assembly, for candidate
+    /// sets whose payload filter already ran inline during the scan (exact
+    /// and quantized paths).
+    fn finish_scored(
+        &self,
+        candidates: Vec<(f32, u32)>,
+        query: &SearchQuery,
+        snap: &SearchSnapshot,
+    ) -> Result<Vec<SearchResult>> {
+        let SearchSnapshot {
+            dim,
+            segment_slots,
+            tombstones,
+            vsnap,
+            keysnap,
+            payload_view,
+            ..
+        } = snap;
+        let _ = tombstones;
+        let mut candidates = candidates;
         // 3. Score threshold (lower bound on the output score).
         if let Some(threshold) = query.score_threshold {
             candidates.retain(|(score, _)| *score >= threshold);

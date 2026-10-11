@@ -330,17 +330,26 @@ fn upsert_wal(c: &mut Criterion) {
         })
     });
 
-    // Batch of 100 points per txn (unique ids per batch).
+    // Batch of 100 points per txn over a stable id pool. The ids are
+    // reused every iteration (steady-state overwrites, mirroring `single`),
+    // so the comparison isolates WAL batching (one fsync per 100 ops vs one
+    // per op) instead of measuring unbounded collection growth: unique ids
+    // per iteration benchmark insert-plus-file-growth, not batching.
+    let batch_points: Vec<VectorPoint> = data
+        .iter()
+        .take(100)
+        .enumerate()
+        .map(|(i, v)| VectorPoint::new(format!("b{i}"), v.clone()))
+        .collect();
     let mut batch_txn = 0u64;
     group.bench_function("batch_100", |b| {
         b.iter(|| {
             batch_txn += 1;
-            let ops: Vec<TxnOp> = data
+            let ops: Vec<TxnOp> = batch_points
                 .iter()
-                .enumerate()
-                .map(|(i, v)| TxnOp::Upsert {
+                .map(|p| TxnOp::Upsert {
                     collection: collection.to_string(),
-                    point: VectorPoint::new(format!("b{batch_txn}_{i}"), v.clone()),
+                    point: p.clone(),
                 })
                 .collect();
             engine.apply_txn(batch_txn, ops).unwrap();
