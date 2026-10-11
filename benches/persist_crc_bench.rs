@@ -11,6 +11,9 @@
 //! - `hnsw.bin`: dim=128, m=16, live=100K, ~12–15MB payload (`m*2*live` edges)
 //!
 //! Run: `cargo bench -p simvec --bench persist_crc_bench -- --warm-up-time 1 --measurement-time 3`
+//!
+//! Run convention: default builds 100k-point fixtures; `QUICK=1` drops to
+//! 10k points for a seconds-long smoke run.
 
 use std::fs::File;
 use std::io::Write;
@@ -21,6 +24,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+
+#[path = "quick.rs"]
+mod quick;
 
 const IVF_MAGIC: [u8; 4] = *b"VIVF";
 const HNSW_MAGIC: [u8; 4] = *b"VHSW";
@@ -143,14 +149,16 @@ fn bench_persist_crc(c: &mut Criterion) {
     // One-time fixtures; keep outside `b.iter` so criterion measures only the
     // CRC / save kernels. Construction is reported once via eprintln for the
     // baseline report.
+    let live = quick::scale(100_000, 10_000);
+    let size_tag = if quick::quick_mode() { "10k" } else { "100k" };
     let t0 = Instant::now();
-    let ivf = make_ivf(256, 128, 100_000);
+    let ivf = make_ivf(256, 128, live);
     let ivf_gen = t0.elapsed();
     let t0 = Instant::now();
     let ivf_bytes = postcard::to_stdvec(&ivf).expect("ivf postcard");
     let ivf_ser = t0.elapsed();
     let t0 = Instant::now();
-    let hnsw = make_hnsw(100_000, 128, 16);
+    let hnsw = make_hnsw(live, 128, 16);
     let hnsw_gen = t0.elapsed();
     let t0 = Instant::now();
     let hnsw_bytes = postcard::to_stdvec(&hnsw).expect("hnsw postcard");
@@ -168,10 +176,10 @@ fn bench_persist_crc(c: &mut Criterion) {
 
     // CRC vs save_total for each tier. `save_total` re-serializes each iter to
     // include postcard cost (the real write_tagged does so).
-    let mut group = c.benchmark_group("persist_crc");
+    let mut group = quick::benchmark_group(c, "persist_crc");
 
     // IVF CRC only (hash of already-serialized payload) — pure memory scan.
-    group.bench_function(BenchmarkId::new("ivf_crc", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("ivf_crc", size_tag), |b| {
         b.iter(|| {
             let crc = crc32fast::hash(black_box(&ivf_bytes));
             black_box(crc)
@@ -179,7 +187,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     });
 
     // IVF postcard+CRC only (without file I/O) — isolates hash fraction of the in-memory part.
-    group.bench_function(BenchmarkId::new("ivf_serialize_plus_crc", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("ivf_serialize_plus_crc", size_tag), |b| {
         b.iter(|| {
             let bytes = postcard::to_stdvec(black_box(&ivf)).unwrap();
             let crc = crc32fast::hash(&bytes);
@@ -190,7 +198,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     // IVF full save (serialize + CRC + File::create/write/sync). Use a fresh tmp
     // path per iter to emulate persist::save's tmp+rename (rename elided to keep
     // the tmp file path stable across iters; the dominating cost is the write+fsync).
-    group.bench_function(BenchmarkId::new("ivf_save_total", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("ivf_save_total", size_tag), |b| {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("ivf_tmp.bin");
         b.iter(|| {
@@ -200,14 +208,14 @@ fn bench_persist_crc(c: &mut Criterion) {
     });
 
     // HNSW CRC only.
-    group.bench_function(BenchmarkId::new("hnsw_crc", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("hnsw_crc", size_tag), |b| {
         b.iter(|| {
             let crc = crc32fast::hash(black_box(&hnsw_bytes));
             black_box(crc)
         })
     });
 
-    group.bench_function(BenchmarkId::new("hnsw_serialize_plus_crc", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("hnsw_serialize_plus_crc", size_tag), |b| {
         b.iter(|| {
             let bytes = postcard::to_stdvec(black_box(&hnsw)).unwrap();
             let crc = crc32fast::hash(&bytes);
@@ -215,7 +223,7 @@ fn bench_persist_crc(c: &mut Criterion) {
         })
     });
 
-    group.bench_function(BenchmarkId::new("hnsw_save_total", "100k"), |b| {
+    group.bench_function(BenchmarkId::new("hnsw_save_total", size_tag), |b| {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("hnsw_tmp.bin");
         b.iter(|| {
@@ -230,17 +238,18 @@ fn bench_persist_crc(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         let ivf_tmp = dir.path().join("ratio_ivf.bin");
         let hnsw_tmp = dir.path().join("ratio_hnsw.bin");
-        const ITERS: usize = 20;
+        const FULL_ITERS: usize = 20;
+        let iters = quick::scale(FULL_ITERS, 5);
         let ivf_t_crc = {
             let t0 = Instant::now();
-            for _ in 0..ITERS {
+            for _ in 0..iters {
                 black_box(crc32fast::hash(&ivf_bytes));
             }
             t0.elapsed()
         };
         let ivf_t_save = {
             let t0 = Instant::now();
-            for _ in 0..ITERS {
+            for _ in 0..iters {
                 write_tagged(&ivf_tmp, &IVF_MAGIC, VERSION, &ivf).unwrap();
             }
             t0.elapsed()
@@ -248,14 +257,14 @@ fn bench_persist_crc(c: &mut Criterion) {
         let ivf_ratio = ivf_t_crc.as_secs_f64() / ivf_t_save.as_secs_f64().max(1e-9);
         let hnsw_t_crc = {
             let t0 = Instant::now();
-            for _ in 0..ITERS {
+            for _ in 0..iters {
                 black_box(crc32fast::hash(&hnsw_bytes));
             }
             t0.elapsed()
         };
         let hnsw_t_save = {
             let t0 = Instant::now();
-            for _ in 0..ITERS {
+            for _ in 0..iters {
                 write_tagged(&hnsw_tmp, &HNSW_MAGIC, VERSION, &hnsw).unwrap();
             }
             t0.elapsed()
@@ -263,13 +272,13 @@ fn bench_persist_crc(c: &mut Criterion) {
         let hnsw_ratio = hnsw_t_crc.as_secs_f64() / hnsw_t_save.as_secs_f64().max(1e-9);
         eprintln!(
             "[persist_crc] manual ratio ({} iters): ivf_crc_ratio={:.4} (crc {:?} / save {:?}), hnsw_crc_ratio={:.4} (crc {:?} / save {:?})",
-            ITERS,
+            iters,
             ivf_ratio,
-            ivf_t_crc / ITERS as u32,
-            ivf_t_save / ITERS as u32,
+            ivf_t_crc / iters as u32,
+            ivf_t_save / iters as u32,
             hnsw_ratio,
-            hnsw_t_crc / ITERS as u32,
-            hnsw_t_save / ITERS as u32
+            hnsw_t_crc / iters as u32,
+            hnsw_t_save / iters as u32
         );
         if ivf_ratio >= 0.10 || hnsw_ratio >= 0.10 {
             eprintln!("[persist_crc] WARNING: crc ratio >= 10% (threshold for observation item)");

@@ -5,6 +5,9 @@
 //! selectivity impact, and WAL-backed upsert throughput.
 //!
 //! Run: `cargo bench -p simvec`
+//!
+//! Run convention: default is the full scale (up to 1M points);
+//! `QUICK=1` caps at 10k points for a seconds-long smoke run.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +20,9 @@ use simvec::{
     CollectionConfig, DistanceMetric, FilterCondition, LocalVectorEngine, SearchQuery, TxnOp,
     VectorFilter, VectorPoint,
 };
+
+#[path = "quick.rs"]
+mod quick;
 
 const DIM: usize = 128;
 const SEED: u64 = 0xC0FFEE;
@@ -58,56 +64,42 @@ fn scan_best(kernel: Kernel, metric: DistanceMetric, query: &[f32], data: &[Vec<
     best
 }
 
+fn size_label(n: usize) -> &'static str {
+    match n {
+        1_000 => "1k",
+        10_000 => "10k",
+        100_000 => "100k",
+        1_000_000 => "1M",
+        _ => "n",
+    }
+}
+
 fn scan_latency(c: &mut Criterion) {
     let query = unit_vector(SEED);
-    let data = unit_vectors(10_000);
     let kernel = selected();
-    let mut group = c.benchmark_group("scan_latency");
-    group.throughput(Throughput::Elements(10_000));
-    for metric in [
-        DistanceMetric::Cosine,
-        DistanceMetric::Euclid,
-        DistanceMetric::Dot,
-    ] {
-        group.bench_with_input(
-            BenchmarkId::new("10k", format!("{metric:?}")),
-            &(),
-            |b, _| b.iter(|| black_box(scan_best(kernel, metric, &query, &data))),
-        );
+    // Full run keeps the 1M-point ceiling; the smoke gear stops at 10k.
+    let sizes: &[usize] = if quick::quick_mode() {
+        &[1_000, 10_000]
+    } else {
+        &[10_000, 100_000, 1_000_000]
+    };
+    for &n in sizes {
+        let data = unit_vectors(n);
+        let mut group = quick::benchmark_group(c, "scan_latency");
+        group.throughput(Throughput::Elements(n as u64));
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclid,
+            DistanceMetric::Dot,
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(size_label(n), format!("{metric:?}")),
+                &(),
+                |b, _| b.iter(|| black_box(scan_best(kernel, metric, &query, &data))),
+            );
+        }
+        group.finish();
     }
-    group.finish();
-
-    let data = unit_vectors(100_000);
-    let mut group = c.benchmark_group("scan_latency");
-    group.throughput(Throughput::Elements(100_000));
-    for metric in [
-        DistanceMetric::Cosine,
-        DistanceMetric::Euclid,
-        DistanceMetric::Dot,
-    ] {
-        group.bench_with_input(
-            BenchmarkId::new("100k", format!("{metric:?}")),
-            &(),
-            |b, _| b.iter(|| black_box(scan_best(kernel, metric, &query, &data))),
-        );
-    }
-    group.finish();
-
-    let data = unit_vectors(1_000_000);
-    let mut group = c.benchmark_group("scan_latency");
-    group.throughput(Throughput::Elements(1_000_000));
-    for metric in [
-        DistanceMetric::Cosine,
-        DistanceMetric::Euclid,
-        DistanceMetric::Dot,
-    ] {
-        group.bench_with_input(
-            BenchmarkId::new("1M", format!("{metric:?}")),
-            &(),
-            |b, _| b.iter(|| black_box(scan_best(kernel, metric, &query, &data))),
-        );
-    }
-    group.finish();
 }
 
 /// SIMD vs naive ratio on the same input (multi-kernel).
@@ -143,11 +135,12 @@ fn simd_vs_naive(c: &mut Criterion) {
         return;
     }
     let query = unit_vector(SEED);
-    let data = unit_vectors(100_000);
-    let mut group = c.benchmark_group("simd_vs_naive");
+    let n = quick::scale(100_000, 10_000);
+    let data = unit_vectors(n);
+    let mut group = quick::benchmark_group(c, "simd_vs_naive");
     for kernel in kernels {
         group.bench_with_input(
-            BenchmarkId::new("100k_cosine", kernel.to_string()),
+            BenchmarkId::new(format!("{}_cosine", size_label(n)), kernel.to_string()),
             &(),
             |b, _| b.iter(|| black_box(scan_best(kernel, DistanceMetric::Cosine, &query, &data))),
         );
@@ -189,7 +182,8 @@ fn simd_dim_scaling(c: &mut Criterion) {
     for dim in [384usize, 768, 1536] {
         // Generate dim-specific data (still unit vectors for cosine).
         let mut rng = StdRng::seed_from_u64(SEED + dim as u64);
-        let data: Vec<Vec<f32>> = (0..10_000)
+        let rows = quick::scale(10_000, 2_000);
+        let data: Vec<Vec<f32>> = (0..rows)
             .map(|_| {
                 let mut v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
                 let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -204,8 +198,8 @@ fn simd_dim_scaling(c: &mut Criterion) {
         for x in &mut q {
             *x /= norm.max(1e-6);
         }
-        let mut group = c.benchmark_group(format!("simd_dim_{dim}"));
-        group.throughput(Throughput::Elements(10_000));
+        let mut group = quick::benchmark_group(c, &format!("simd_dim_{dim}"));
+        group.throughput(Throughput::Elements(rows as u64));
         for kernel in &kernels {
             for metric in [DistanceMetric::Cosine, DistanceMetric::Dot] {
                 group.bench_with_input(
@@ -235,8 +229,8 @@ fn filter_selectivity(c: &mut Criterion) {
         )
         .unwrap();
 
-    // 100k points, each tagged with a `bucket` string in [0, 100).
-    let count = 100_000;
+    // Full run tags 100k points; the smoke gear tags 10k.
+    let count = quick::scale(100_000, 10_000);
     let mut rng = StdRng::seed_from_u64(SEED + 1);
     let points: Vec<VectorPoint> = (0..count)
         .map(|i| {
@@ -263,7 +257,7 @@ fn filter_selectivity(c: &mut Criterion) {
         .unwrap();
 
     let query = unit_vector(SEED + 2);
-    let mut group = c.benchmark_group("filter_selectivity");
+    let mut group = quick::benchmark_group(c, "filter_selectivity");
     for (name, buckets) in [
         ("100%", None),
         ("50%", Some((0..50).collect::<Vec<i64>>())),
@@ -282,7 +276,7 @@ fn filter_selectivity(c: &mut Criterion) {
             Some(f) => SearchQuery::new(query.clone(), 10).with_filter(f.clone()),
             None => SearchQuery::new(query.clone(), 10),
         };
-        group.bench_with_input(BenchmarkId::new("100k", name), &(), |b, _| {
+        group.bench_with_input(BenchmarkId::new(size_label(count), name), &(), |b, _| {
             b.iter(|| {
                 let r = engine.search(collection, &search_query).unwrap();
                 black_box(r.len())
@@ -309,7 +303,7 @@ fn upsert_wal(c: &mut Criterion) {
         .unwrap();
 
     let data = unit_vectors(1_000);
-    let mut group = c.benchmark_group("upsert_wal");
+    let mut group = quick::benchmark_group(c, "upsert_wal");
 
     // Single point per txn.
     let mut rng = StdRng::seed_from_u64(SEED + 3);

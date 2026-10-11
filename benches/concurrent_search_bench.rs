@@ -7,6 +7,9 @@
 //! the expectation until contention says otherwise).
 //!
 //! Run: `cargo bench -p simvec -- concurrent_search`
+//!
+//! Run convention: default searches 20k points with 256 queries;
+//! `QUICK=1` drops to 2k points / 32 queries for a seconds-long smoke run.
 
 use std::sync::Arc;
 
@@ -18,12 +21,15 @@ use simvec::{
     CollectionConfig, DistanceMetric, IndexType, LocalVectorEngine, SearchQuery, VectorPoint,
 };
 
+#[path = "quick.rs"]
+mod quick;
+
 const DIM: usize = 128;
-const POINTS: usize = 20_000;
-const QUERIES: usize = 256;
+const FULL_POINTS: usize = 20_000;
+const FULL_QUERIES: usize = 256;
 const SEED: usize = 42;
 
-fn engine_with_index(path: &std::path::Path) -> LocalVectorEngine {
+fn engine_with_index(path: &std::path::Path, points: usize) -> LocalVectorEngine {
     let mut rng = StdRng::seed_from_u64(SEED as u64);
     let engine = LocalVectorEngine::open(path).unwrap();
     engine
@@ -32,7 +38,7 @@ fn engine_with_index(path: &std::path::Path) -> LocalVectorEngine {
             &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_index_type(IndexType::HNSW),
         )
         .unwrap();
-    let points: Vec<VectorPoint> = (0..POINTS)
+    let points: Vec<VectorPoint> = (0..points)
         .map(|i| {
             VectorPoint::new(
                 i as u64,
@@ -47,9 +53,9 @@ fn engine_with_index(path: &std::path::Path) -> LocalVectorEngine {
     engine
 }
 
-fn queries() -> Vec<Vec<f32>> {
+fn queries(n: usize) -> Vec<Vec<f32>> {
     let mut rng = StdRng::seed_from_u64((SEED + 1) as u64);
-    (0..QUERIES)
+    (0..n)
         .map(|_| (0..DIM).map(|_| rng.gen_range(-1.0..1.0)).collect())
         .collect()
 }
@@ -70,12 +76,14 @@ fn run_query_set(engine: &LocalVectorEngine, queries: &[Vec<f32>]) -> usize {
 }
 
 fn bench_concurrent_search(c: &mut Criterion) {
+    let points = quick::scale(FULL_POINTS, 2_000);
+    let n_queries = quick::scale(FULL_QUERIES, 32);
     let dir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(engine_with_index(&dir.path().join("vec")));
-    let queries = Arc::new(queries());
+    let engine = Arc::new(engine_with_index(&dir.path().join("vec"), points));
+    let queries = Arc::new(queries(n_queries));
 
-    let mut group = c.benchmark_group("concurrent_search");
-    group.throughput(Throughput::Elements(QUERIES as u64));
+    let mut group = quick::benchmark_group(c, "concurrent_search");
+    group.throughput(Throughput::Elements(n_queries as u64));
 
     group.bench_function(BenchmarkId::new("threads", 1), |b| {
         b.iter(|| {

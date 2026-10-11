@@ -10,6 +10,9 @@
 //! the multi-worker shape is gated on recall invariants instead.
 //!
 //! Run: `cargo bench -p simvec -- hnsw_build`
+//!
+//! Run convention: default builds 2k/10k-point graphs; `QUICK=1` drops to
+//! 500/2k points for a seconds-long smoke run.
 
 use std::time::Instant;
 
@@ -17,6 +20,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use simvec::{CollectionConfig, DistanceMetric, HnswConfig, IndexType, LocalVectorEngine};
+
+#[path = "quick.rs"]
+mod quick;
 
 const DIM: usize = 128;
 const SEED: u64 = 0xC0FFEE;
@@ -57,8 +63,10 @@ fn build_once(threads: Option<usize>, n: usize) -> std::time::Duration {
 }
 
 fn bench_hnsw_build(c: &mut Criterion) {
-    let mut group = c.benchmark_group("hnsw_build");
-    for &n in &[2_000usize, 10_000] {
+    let mut group = quick::benchmark_group(c, "hnsw_build");
+    // Full run keeps the 10k promotion scale; the smoke gear stays small.
+    let sizes = [quick::scale(2_000, 500), quick::scale(10_000, 2_000)];
+    for &n in &sizes {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_function(BenchmarkId::new("sequential", n), |b| {
             b.iter_custom(|iters| {

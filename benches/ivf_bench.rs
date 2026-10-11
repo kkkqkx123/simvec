@@ -6,6 +6,9 @@
 //! default lives at the bottom of this file.
 //!
 //! Run: `cargo bench -p simvec -- ivf`
+//!
+//! Run convention: default is the full 100k-point promotion scale;
+//! `QUICK=1` shrinks to 5k points for a seconds-long smoke run.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +19,9 @@ use rand::{Rng, SeedableRng};
 use simvec::{
     CollectionConfig, DistanceMetric, IvfConfig, LocalVectorEngine, SearchQuery, VectorPoint,
 };
+
+#[path = "quick.rs"]
+mod quick;
 
 const DIM: usize = 128;
 const SEED: u64 = 0xBEEF;
@@ -77,14 +83,15 @@ fn ground_truth(engine: &LocalVectorEngine, query: &[f32], k: usize) -> Vec<Stri
 }
 
 fn build_time(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ivf_build_time");
-    const N: usize = 100_000;
-    group.bench_function(BenchmarkId::new("build", N), |b| {
+    let mut group = quick::benchmark_group(c, "ivf_build_time");
+    let n = quick::scale(100_000, 5_000);
+    let lists = quick::scale(512, 64) as u32;
+    group.bench_function(BenchmarkId::new("build", n), |b| {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let dir = tempfile::tempdir().unwrap();
-                let engine = engine_with(dir.path(), N, 512);
+                let engine = engine_with(dir.path(), n, lists);
                 let start = Instant::now();
                 engine.build_index("col").unwrap();
                 total += start.elapsed();
@@ -97,19 +104,20 @@ fn build_time(c: &mut Criterion) {
 
 fn latency_and_recall(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let n = 100_000;
-    let engine = engine_with(dir.path(), n, 256);
+    let n = quick::scale(100_000, 5_000);
+    let lists = quick::scale(256, 32) as u32;
+    let engine = engine_with(dir.path(), n, lists);
 
     // Ground truth must come from the exact-scan path, so compute it before
     // the index is published; afterwards searches route through IVF.
-    let queries = unit_vectors(20);
+    let queries = unit_vectors(quick::scale(20, 4));
     let truth: Vec<Vec<String>> = queries
         .iter()
         .map(|q| ground_truth(&engine, q, 10))
         .collect();
     engine.build_index("col").unwrap();
 
-    let mut group = c.benchmark_group("ivf_latency_vs_nprobe");
+    let mut group = quick::benchmark_group(c, "ivf_latency_vs_nprobe");
     let mut report =
         String::from("\nnprobe | latency_mean | recall@10\n------- | ------------ | ---------\n");
     for nprobe in [1usize, 4, 16, 64, 256] {
@@ -127,7 +135,7 @@ fn latency_and_recall(c: &mut Criterion) {
         let recall = hits as f64 / (queries.len() * 10) as f64;
 
         let label = format!("{nprobe}");
-        group.bench_function(BenchmarkId::new("100k", &label), |b| {
+        group.bench_function(BenchmarkId::new(format!("{}k", n / 1000), &label), |b| {
             b.iter(|| {
                 let r = engine
                     .search(
@@ -146,12 +154,14 @@ fn latency_and_recall(c: &mut Criterion) {
 
 fn exact_vs_index_crossover(_c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let n = 100_000;
-    let engine = engine_with(dir.path(), n, 256);
+    let n = quick::scale(100_000, 5_000);
+    let lists = quick::scale(256, 32) as u32;
+    let engine = engine_with(dir.path(), n, lists);
     let query = unit_vectors(1).pop().unwrap();
+    let samples = quick::scale(50, 5);
 
     let mut samples_exact = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..samples {
         let s = Instant::now();
         black_box(
             engine
@@ -163,7 +173,7 @@ fn exact_vs_index_crossover(_c: &mut Criterion) {
 
     engine.build_index("col").unwrap();
     let mut samples_ivf = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..samples {
         let s = Instant::now();
         black_box(
             engine
@@ -183,11 +193,11 @@ fn exact_vs_index_crossover(_c: &mut Criterion) {
 
 fn ivf_upsert_overhead(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(engine_with(dir.path(), 50_000, 256));
+    let engine = Arc::new(engine_with(dir.path(), quick::scale(50_000, 5_000), 256));
 
     let data = unit_vectors(100);
     let mut txn_id = 1u64;
-    let mut group = c.benchmark_group("ivf_upsert_overhead");
+    let mut group = quick::benchmark_group(c, "ivf_upsert_overhead");
 
     group.bench_function("without_index", |b| {
         b.iter(|| {
