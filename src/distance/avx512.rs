@@ -2,9 +2,11 @@
 //!
 //! Extends `avx2.rs` with ZMM (16 x f32) registers. Selection is via
 //! `kernel::best_available`: `Avx512 > Avx2 > Naive` on `x86_64`. The runtime
-//! check is `avx512f` (the common subset of AVX-512); `avx512bw/vl/vnni/bf16`
-//! variants are accepted as supersets but not required for correctness.
-//! Fallback remains the same scalar tail as AVX2.
+//! check is `avx512f + avx512dq + avx512vl`: `horizontal_sum512` uses
+//! `_mm512_extractf32x8_ps`, which is not guaranteed on AVX-512F-only CPUs,
+//! so the gate must match the instructions actually emitted.
+//! `avx512bw/vnni/bf16` are supersets and also satisfy this gate but are not
+//! required. Fallback remains the same scalar tail as AVX2.
 //!
 //! Main loops use dual ZMM accumulators (32 f32 per iteration) matching the
 //! dual-accumulator AVX2 kernels to avoid a serial add dependency chain.
@@ -21,7 +23,7 @@ use std::arch::x86_64::*;
 /// rounding as `avx2::horizontal_sum` (the reference for bench thresholds).
 /// Requires AVX-512F at the call site.
 #[inline]
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 unsafe fn horizontal_sum512(v: __m512) -> f32 {
     // Prefer the single-instruction reduce when available; fallback to
     // manual extract+add so the code works on all Rust versions.
@@ -48,7 +50,7 @@ unsafe fn horizontal_sum512(v: __m512) -> f32 {
 /// Mirrors `avx2::horizontal_sum` with the same rounding. Requires AVX2
 /// at the call site; shared across the 8-wide tail paths in this module.
 #[inline]
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 unsafe fn horizontal_sum256(v: __m256) -> f32 {
     let hi = _mm256_extractf128_ps(v, 1);
     let lo = _mm256_castps256_ps128(v);
@@ -62,7 +64,7 @@ unsafe fn horizontal_sum256(v: __m256) -> f32 {
 ///
 /// # Safety
 /// Caller must ensure `a.len() == b.len()` and CPU supports AVX-512F.
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 pub unsafe fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let mut acc = _mm512_setzero_ps();
@@ -110,7 +112,7 @@ pub unsafe fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Same preconditions as `distance_l2`.
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 pub unsafe fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let mut acc = _mm512_setzero_ps();
@@ -150,7 +152,7 @@ pub unsafe fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Same preconditions as `distance_l2`.
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 pub unsafe fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         let mut acc_dot = _mm512_setzero_ps();
@@ -202,7 +204,7 @@ pub unsafe fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Same preconditions as `distance_l2`.
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 pub unsafe fn distance_l1(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         // Absolute value via integer logic: the float `_mm512_andnot_ps`
@@ -267,7 +269,7 @@ pub unsafe fn distance_l1(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Must only be called with AVX-512F verified at runtime.
-#[target_feature(enable = "avx512f,avx2")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
 pub unsafe fn distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         DistanceMetric::Euclid => distance_l2(a, b),

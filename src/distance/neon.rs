@@ -195,38 +195,23 @@ mod imp_fallback {
     use super::DistanceMetric;
     use crate::distance::naive;
 
-    /// Fallback: on non-aarch64 hosts NEON is unavailable; delegate to naive.
-    /// Marked unsafe to match the aarch64 signature so `kernel.rs` can call
-    /// uniformly without cfg at the call site (availability is guarded there).
-    ///
-    /// # Safety
-    ///
-    /// Delegates to a safe naive implementation; safe to call on any platform.
-    pub unsafe fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
+    /// Fallback: on non-aarch64 hosts NEON is unavailable; delegate to the
+    /// safe naive implementation. Kept as safe fns (no unsafe wrapping) so
+    /// the module adds no unsound surface; `kernel.rs` only references the
+    /// real NEON entry points under `target_arch = "aarch64"`.
+    pub fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
         naive::distance_l2(a, b)
     }
-    /// # Safety
-    ///
-    /// Delegates to a safe naive implementation; safe to call on any platform.
-    pub unsafe fn inner_product(a: &[f32], b: &[f32]) -> f32 {
+    pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
         naive::inner_product(a, b)
     }
-    /// # Safety
-    ///
-    /// Delegates to a safe naive implementation; safe to call on any platform.
-    pub unsafe fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
+    pub fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
         naive::distance_cosine(a, b)
     }
-    /// # Safety
-    ///
-    /// Delegates to a safe naive implementation; safe to call on any platform.
-    pub unsafe fn distance_l1(a: &[f32], b: &[f32]) -> f32 {
+    pub fn distance_l1(a: &[f32], b: &[f32]) -> f32 {
         naive::distance_l1(a, b)
     }
-    /// # Safety
-    ///
-    /// Delegates to a safe naive implementation; safe to call on any platform.
-    pub unsafe fn distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+    pub fn distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
         naive::distance(metric, a, b)
     }
 }
