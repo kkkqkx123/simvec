@@ -268,7 +268,11 @@ mod tests {
                     DistanceMetric::Manhattan,
                 ] {
                     let expected = naive::distance(metric, &a, &b);
+                    // The fallback module exposes safe functions off aarch64.
+                    #[cfg(target_arch = "aarch64")]
                     let got = unsafe { crate::distance::neon::distance(metric, &a, &b) };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let got = crate::distance::neon::distance(metric, &a, &b);
                     assert_kernels_close(metric, dim, expected, got);
                 }
             }
@@ -283,7 +287,10 @@ mod tests {
                 DistanceMetric::Manhattan,
             ] {
                 let expected = naive::distance(metric, a, b);
+                #[cfg(target_arch = "aarch64")]
                 let got = unsafe { crate::distance::neon::distance(metric, a, b) };
+                #[cfg(not(target_arch = "aarch64"))]
+                let got = crate::distance::neon::distance(metric, a, b);
                 assert_eq!(got, expected, "{metric:?} zero-norm neon");
             }
         }

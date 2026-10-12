@@ -172,7 +172,7 @@ define_kernels! {
         when = all(),
         name = "naive",
         available = true,
-        call = |metric, a, b| naive::distance(metric, a, b),
+        call = naive::distance,
     }
 }
 

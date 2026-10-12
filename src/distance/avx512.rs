@@ -30,19 +30,19 @@ unsafe fn horizontal_sum512(v: __m512) -> f32 {
     // `_mm512_reduce_add_ps` is AVX-512F in newer toolchains; if missing,
     // this path still compiles via the extract route below.
     // We use extract to stay compatible with stable 1.88+.
-    unsafe {
-        // Split ZMM into two YMM halves.
-        let lo256 = _mm512_castps512_ps256(v);
-        let hi256 = _mm512_extractf32x8_ps(v, 1);
-        let sum256 = _mm256_add_ps(lo256, hi256);
-        // Reduce YMM -> XMM (same as avx2::horizontal_sum).
-        let hi128 = _mm256_extractf128_ps(sum256, 1);
-        let lo128 = _mm256_castps256_ps128(sum256);
-        let sum128 = _mm_add_ps(hi128, lo128);
-        let sum128 = _mm_hadd_ps(sum128, sum128);
-        let sum128 = _mm_hadd_ps(sum128, sum128);
-        _mm_cvtss_f32(sum128)
-    }
+    // The lane-cast and arithmetic intrinsics below are safe functions that
+    // only require the target features on this function, so no inner block.
+    // Split ZMM into two YMM halves.
+    let lo256 = _mm512_castps512_ps256(v);
+    let hi256 = _mm512_extractf32x8_ps(v, 1);
+    let sum256 = _mm256_add_ps(lo256, hi256);
+    // Reduce YMM -> XMM (same as avx2::horizontal_sum).
+    let hi128 = _mm256_extractf128_ps(sum256, 1);
+    let lo128 = _mm256_castps256_ps128(sum256);
+    let sum128 = _mm_add_ps(hi128, lo128);
+    let sum128 = _mm_hadd_ps(sum128, sum128);
+    let sum128 = _mm_hadd_ps(sum128, sum128);
+    _mm_cvtss_f32(sum128)
 }
 
 /// Horizontally reduce a YMM lane sum to a scalar.
