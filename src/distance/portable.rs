@@ -27,8 +27,8 @@
 //! comparison is gated on this module's `distance` API so swapping the body
 //! later does not touch call sites.
 
-use crate::types::DistanceMetric;
 use crate::distance::naive;
+use crate::types::DistanceMetric;
 
 /// Delegates to naive; replace with `std::simd` or `wide` when the
 /// toolchain allows it.
