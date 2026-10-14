@@ -222,6 +222,7 @@ pub struct Metrics {
     compactions: AtomicU64,
     compaction_race_retries: AtomicU64,
     compaction_contended: AtomicU64,
+    compaction_space_rejections: AtomicU64,
     compaction_latency: PowerLatencyHistogram,
 
     checkpoints: AtomicU64,
@@ -343,6 +344,13 @@ impl Metrics {
         self.compaction_contended.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that compaction was refused before writing anything because the
+    /// target volume could not hold the temp files.
+    pub fn record_compaction_space_rejection(&self) {
+        self.compaction_space_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one committed WAL checkpoint (derived files flushed and the log
     /// truncated).
     pub fn record_checkpoint(&self, elapsed: Duration) {
@@ -387,6 +395,7 @@ impl Metrics {
             compactions: self.compactions.load(Ordering::Relaxed),
             compaction_race_retries: self.compaction_race_retries.load(Ordering::Relaxed),
             compaction_contended: self.compaction_contended.load(Ordering::Relaxed),
+            compaction_space_rejections: self.compaction_space_rejections.load(Ordering::Relaxed),
             compaction: self.compaction_latency.summary(),
 
             checkpoints: self.checkpoints.load(Ordering::Relaxed),
@@ -448,6 +457,9 @@ pub struct MetricsSnapshot {
     pub compactions: u64,
     pub compaction_race_retries: u64,
     pub compaction_contended: u64,
+    /// Compactions refused up front because the target volume lacked space
+    /// for the temp files.
+    pub compaction_space_rejections: u64,
     pub compaction: LatencySummary,
 
     // WAL checkpoints.

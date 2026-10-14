@@ -47,7 +47,7 @@ impl TombstoneBits {
         }
     }
 
-    pub(super) fn count_ones(&self) -> u64 {
+    pub(crate) fn count_ones(&self) -> u64 {
         self.chunks
             .iter()
             .map(|c| c.as_bitslice().count_ones() as u64)

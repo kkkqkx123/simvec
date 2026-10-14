@@ -192,9 +192,13 @@ impl PayloadStore {
     /// Write or overwrite the payload for a slot (full replace).
     ///
     /// Allocates new blocks, writes the data, and updates the tracker and
-    /// bitmask in memory — all within the write lock. Nothing is fsynced here:
-    /// the owning WAL transaction already carries this payload durably, and
+    /// bitmask in memory. Nothing is fsynced here: the owning WAL transaction
+    /// already carries this payload durably, and
     /// [`PayloadStore::checkpoint`] persists the derived state in batch.
+    ///
+    /// The page map is only ever taken for reading here: `ensure_page` and
+    /// `write_value` serialize their own mutations through the inner page map,
+    /// so a payload write never blocks a reader inspecting another page.
     pub fn put(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
         let bytes = match payload {
             Some(p) => serde_json::to_vec(p)?,
@@ -203,7 +207,6 @@ impl PayloadStore {
 
         let mut tracker = self.tracker.write();
         let bitmask = self.bitmask.write();
-        let pages = self.pages.write();
 
         // Free old blocks if the slot had data.
         if let Some(old_ptr) = tracker.get(slot) {
@@ -226,6 +229,7 @@ impl PayloadStore {
         let blocks_needed = self.blocks_needed(bytes.len());
         let (page_id, block_offset) = bitmask.allocate(blocks_needed, &self.config)?;
 
+        let pages = self.pages.read();
         // Ensure the page exists.
         pages.ensure_page(page_id as usize, &self.config)?;
 
@@ -308,16 +312,6 @@ impl PayloadStore {
         }
         new_store.checkpoint()?;
         Ok(new_store)
-    }
-
-    /// The store configuration.
-    pub fn config(&self) -> &StoreConfig {
-        &self.config
-    }
-
-    /// Access the tracker (for persistence during compaction).
-    pub fn tracker(&self) -> &parking_lot::RwLock<Tracker> {
-        &self.tracker
     }
 
     /// Number of blocks needed for a given byte length.
@@ -437,8 +431,7 @@ mod tests {
     fn test_put_leaves_tracker_on_disk_stale_until_checkpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
-            let store =
-                PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
+            let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
             // A burst of writes must not rewrite the whole pointer table per
             // point (the quadratic behavior that used to stall the engine).
             for i in 0..200u32 {
@@ -446,14 +439,16 @@ mod tests {
             }
             // On-disk tracker is untouched: replay from WAL is the recovery
             // path, so per-point persistence is unnecessary.
-            let persisted = Tracker::open(dir.path(), &store.config().clone()).unwrap();
+            let persisted =
+                Tracker::open(dir.path(), &store.config).expect("open persisted tracker");
             assert!(persisted.get(199).is_none());
 
             store.checkpoint().unwrap();
-            let persisted = Tracker::open(dir.path(), &store.config().clone()).unwrap();
+            let persisted =
+                Tracker::open(dir.path(), &store.config).expect("open persisted tracker");
             assert_eq!(
-                persisted.get(199).unwrap(),
-                store.tracker().read().get(199).unwrap()
+                persisted.get(199).expect("slot 199 persisted"),
+                store.tracker.read().get(199).expect("slot 199 in memory"),
             );
         }
         {
@@ -466,30 +461,62 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_makes_overwrites_durable() {
+    fn test_put_then_checkpoint_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        const SLOTS: u32 = 64;
+        {
+            let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
+            for i in 0..SLOTS {
+                store.put(i, Some(&payload(&[("id", json!(i))]))).unwrap();
+            }
+            store.checkpoint().unwrap();
+        }
+        {
+            // The checkpoint persists the data pages and the pointer table, so
+            // reopening the store on its own still yields every write.
+            let store = PayloadStore::open(dir.path()).expect("open");
+            for i in 0..SLOTS {
+                let got = store
+                    .get(i)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("slot {i} lost"));
+                assert_eq!(got.get("id"), Some(&json!(i)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_persists_overwrite_and_delete() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
             let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
-            store.put(0, Some(&payload(&[("a", json!(1))]))).unwrap();
+            for i in 0..8u32 {
+                store.put(i, Some(&payload(&[("id", json!(i))]))).unwrap();
+            }
             store.checkpoint().unwrap();
-            store.put(0, Some(&payload(&[("b", json!(2))]))).unwrap();
+            // Overwrite one slot, free another, then persist the new state.
+            store
+                .put(0, Some(&payload(&[("id", json!("zero"))])))
+                .unwrap();
+            store.put(3, None).unwrap();
+            store.checkpoint().unwrap();
         }
         {
-            // Without a checkpoint the old value remains on disk; reopening
-            // without WAL replay keeps that stale view, which is the documented
-            // derived-state contract.
             let store = PayloadStore::open(dir.path()).expect("open");
-            let got = store.get(0).unwrap().unwrap();
-            assert_eq!(got.get("a"), Some(&json!(1)));
-        }
-        {
-            // A second checkpoint flushes the overwrite.
-            let store = PayloadStore::open(dir.path()).expect("open");
-            store.put(0, Some(&payload(&[("b", json!(2))]))).unwrap();
-            store.checkpoint().unwrap();
-            drop(store);
-            let store = PayloadStore::open(dir.path()).expect("open");
-            assert!(store.get(0).unwrap().unwrap().contains_key("b"));
+            assert_eq!(
+                store.get(0).unwrap().unwrap().get("id"),
+                Some(&json!("zero"))
+            );
+            assert!(store.get(3).unwrap().is_none(), "freed slot stays free");
+            // The bitmask persisted at the checkpoint made those blocks
+            // reusable after reopen.
+            store
+                .put(3, Some(&payload(&[("id", json!("three"))])))
+                .unwrap();
+            assert_eq!(
+                store.get(3).unwrap().unwrap().get("id"),
+                Some(&json!("three"))
+            );
         }
     }
 
@@ -500,6 +527,7 @@ mod tests {
             let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
             store.put(0, Some(&payload(&[("x", json!(1))]))).unwrap();
             store.put(1, Some(&payload(&[("y", json!(2))]))).unwrap();
+            store.checkpoint().unwrap();
         }
         {
             let store = PayloadStore::open(dir.path()).expect("open");

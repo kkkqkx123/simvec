@@ -165,7 +165,7 @@ define_kernels! {
         when = feature = "simd_portable",
         name = "portable",
         available = true,
-        call = |metric, a, b| portable::distance(metric, a, b),
+        call = portable::distance,
     }
     /// Scalar baseline; always available, always correct.
     Naive {

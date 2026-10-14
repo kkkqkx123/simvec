@@ -294,7 +294,8 @@ impl Wal {
     /// Bytes currently held in the log since the last truncate. Drives the
     /// size-based checkpoint schedule.
     pub fn appended_bytes(&self) -> u64 {
-        self.appended_bytes.load(std::sync::atomic::Ordering::Relaxed)
+        self.appended_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Read all valid WAL records into a `Vec<WalTxn>`, returning the highest

@@ -277,6 +277,84 @@ fn test_hnsw_pending_slots_visible_after_restart() {
     }
 }
 
+/// WAL byte-threshold checkpoint: after the log is truncated, a reopen must
+/// expose exactly the points a full replay of the same history would — the
+/// checkpoint flushed every derived file instead of leaving the log as the
+/// only copy.
+#[test]
+fn test_checkpoint_truncated_wal_reopens_with_all_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+    let total = 12u64;
+
+    {
+        let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
+        for id in 0..total {
+            store
+                .apply_ops(&[WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(id)).unwrap(),
+                }])
+                .unwrap();
+            store.checkpoint().unwrap();
+            assert_eq!(
+                store.wal().appended_bytes(),
+                0,
+                "checkpoint must truncate the log"
+            );
+        }
+        assert_eq!(store.count(), total);
+    }
+
+    let store = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(store.count(), total, "truncated log must lose nothing");
+    for id in 0..total {
+        assert!(
+            store.get(&PointId::Num(id)).unwrap().is_some(),
+            "point {id} must survive reopening after a checkpoint"
+        );
+    }
+}
+
+/// A checkpoint that crashed before its truncate: the log still holds the
+/// transactions behind the flushed state, so replay re-applies them and must
+/// converge on the same data without duplicating points.
+#[test]
+fn test_wal_replay_after_checkpoint_marker_stays_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+
+    {
+        let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
+        for id in 0..4u64 {
+            store
+                .apply_ops(&[WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(id)).unwrap(),
+                }])
+                .unwrap();
+        }
+        // Crash window between the `Compact` marker and `truncate()`: the log
+        // keeps both the marker and everything logged before it.
+        store.checkpoint().unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+        wal.append(&WalTxn {
+            txn_id: 99,
+            ops: vec![WalRecord::Compact],
+        })
+        .unwrap();
+    }
+
+    let store = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(
+        store.count(),
+        4,
+        "replay after a checkpoint must not double-count"
+    );
+    for id in 0..4u64 {
+        let got = store.get(&PointId::Num(id)).unwrap().unwrap();
+        assert_eq!(got.vector, point(id).vector);
+    }
+}
+
 #[test]
 fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     let dir = tempfile::tempdir().unwrap();

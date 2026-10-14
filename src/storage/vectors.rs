@@ -104,7 +104,8 @@ impl Vectors {
         }
         *self.file.lock() = file;
         self.segments.store(Arc::new(segments));
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -171,10 +172,7 @@ impl Vectors {
     /// Flush slot writes since the last `sync`. Returns whether anything was
     /// flushed. Called at checkpoint time; WAL replay covers the same data.
     pub fn sync(&self) -> bool {
-        if !self
-            .dirty
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         let file = self.file.lock();

@@ -326,10 +326,22 @@ impl CollectionStore {
     }
 
     /// Reject a compaction whose temp files cannot fit on the target volume.
+    ///
+    /// A half-rewritten collection is unrecoverable without a reindex, so the
+    /// space question is asked up front and the failure is recorded as a
+    /// metric: a growing counter is the signal to provision before the next
+    /// compaction attempt.
     fn ensure_compaction_space(&self) -> Result<()> {
         let needed = self.compaction_footprint();
         let available = available_bytes(&self.dir).unwrap_or(u64::MAX);
         if needed > available {
+            self.metrics.record_compaction_space_rejection();
+            tracing::warn!(
+                collection = %self.inner.read().meta.collection,
+                needed,
+                available,
+                "compaction refused: target volume cannot hold the temp files"
+            );
             return Err(VectorSearchError::InsufficientSpace {
                 operation: format!("compaction of {}", self.dir.display()),
                 needed,

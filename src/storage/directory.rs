@@ -159,10 +159,16 @@ impl BlobDirectory {
         }
         let rec_capacity = read_rec_capacity(&file)? as usize;
         let blob_len = read_blob_len(&file)?;
-        let expected = HEADER_LEN + rec_capacity * rec_size + blob_len as usize;
+        let view = Arc::new(DirView {
+            mmap: Arc::new(map_file(&file, file_len)?),
+            rec_capacity,
+            blob_len,
+            mapped_len: file_len,
+        });
         // The physical file may be longer than the logical end: appends map
         // with headroom and never truncate back, so extra bytes are unused
         // reserved space rather than corruption.
+        let expected = view.logical_len(rec_size);
         if file_len < expected {
             return Err(VectorSearchError::CorruptData(format!(
                 "{} length {} < expected {expected}",
@@ -170,13 +176,6 @@ impl BlobDirectory {
                 file_len
             )));
         }
-        let mmap = map_file(&file, file_len)?;
-        let view = Arc::new(DirView {
-            mmap: Arc::new(mmap),
-            rec_capacity,
-            blob_len,
-            mapped_len: file_len,
-        });
         Ok(Self {
             path: path.to_path_buf(),
             magic,
@@ -244,11 +243,7 @@ impl BlobDirectory {
         let view = self.view.load();
         // Blob bytes first, then the record, then the header water mark.
         let file = self.file.lock();
-        write_at(
-            &file,
-            blob,
-            (blob_offset + view.blob_len as usize) as u64,
-        )?;
+        write_at(&file, blob, (blob_offset + view.blob_len as usize) as u64)?;
         let rec_bytes = encode_rec(
             view.blob_len as u32,
             blob.len() as u32,
@@ -268,8 +263,7 @@ impl BlobDirectory {
             mapped_len: view.mapped_len,
         };
         self.view.store(Arc::new(next));
-        self.dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -284,8 +278,7 @@ impl BlobDirectory {
         }
         let flag_start = HEADER_LEN + slot * self.rec_size + 8;
         write_at(&self.file.lock(), &[flags], flag_start as u64)?;
-        self.dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -340,7 +333,8 @@ impl BlobDirectory {
             blob_len,
             mapped_len: file_len,
         }));
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -396,7 +390,8 @@ impl BlobDirectory {
             blob_len: view.blob_len,
             mapped_len: file_len,
         }));
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

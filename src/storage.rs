@@ -36,7 +36,7 @@ mod tombstones;
 pub(crate) mod vectors;
 mod wal;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -75,8 +75,10 @@ const COMPACTION_THRESHOLD: f64 = 0.20;
 const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How many WAL transactions between meta.bin saves. The WAL is always
-/// fsynced on every transaction, so crash safety is preserved; meta.bin
-/// is an optimization that reduces replay time on restart.
+/// fsynced on every transaction, so crash safety is preserved; meta.bin is an
+/// optimization that shortens replay, not a durability boundary. Slot water
+/// marks and counts are replayed from the log, so this interval — not the
+/// mutation rate — is what paces meta.bin writes.
 const META_SAVE_INTERVAL: u64 = 64;
 
 /// In-memory mutable state, guarded by the store's `RwLock`.
@@ -541,20 +543,25 @@ impl CollectionStore {
                     validate_point(&inner.meta, &point)?;
                 }
             }
-            let prev_next_slot = inner.meta.next_slot;
+            validate_admission_locked(&inner, txn)?;
             let prev_capacity = inner.meta.slot_capacity;
             self.wal.append(txn)?;
             self.apply_records_locked(&mut inner, &txn.ops)?;
             // Monotonic water mark: late/duplicated txn ids must not regress
-            // the last applied id (replay is idempotent, so this is safe).
+            // the last applied txn id (replay is idempotent, so this is safe).
             inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(txn.txn_id);
-            let slot_changed =
-                inner.meta.next_slot != prev_next_slot || inner.meta.slot_capacity != prev_capacity;
+            // Only a capacity change must be persisted immediately:
+            // `Vectors::open` rejects a file whose length disagrees with the
+            // capacity in meta.bin, and that check runs before WAL replay can
+            // reconcile anything. The slot water marks are all replayed from
+            // the log, so saving them per transaction buys nothing but two
+            // fsyncs per batch.
+            let capacity_changed = inner.meta.slot_capacity != prev_capacity;
             let count = self
                 .txns_since_last_save
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 + 1;
-            if slot_changed || count >= META_SAVE_INTERVAL {
+            if capacity_changed || count >= META_SAVE_INTERVAL {
                 inner.meta.save(&self.dir)?;
                 self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
             }
@@ -994,7 +1001,7 @@ impl CollectionStore {
     /// after ordinary mutations.
     pub fn checkpoint(&self) -> Result<u64> {
         let started = std::time::Instant::now();
-        let mut inner = self.inner.write();
+        let inner = self.inner.write();
         // Payload store: dirty pages, block bitmask, slot→pointer table.
         let ps_guard = self.payload_store.load();
         if let Some(ps) = ps_guard.as_ref().as_ref() {
@@ -1036,17 +1043,19 @@ impl CollectionStore {
         let inner = self.inner.read();
         let meta = &inner.meta;
         let dim = meta.vector_size;
-        let mut total = meta.slot_capacity as u64 * dim as u64 * 4;
+        let mut total = meta.slot_capacity * dim as u64 * 4;
         // Payload pointer table: 12 bytes per slot.
         total += meta.next_slot * 12;
         // Payload data area: one 32 MiB page per 256K blocks of 128 B.
         let pages = meta
             .next_slot
-            .div_ceil(payload_store::DEFAULT_PAGE_SIZE as u64 / payload_store::DEFAULT_BLOCK_SIZE as u64)
+            .div_ceil(
+                payload_store::DEFAULT_PAGE_SIZE as u64 / payload_store::DEFAULT_BLOCK_SIZE as u64,
+            )
             .max(1);
         total += pages * payload_store::DEFAULT_PAGE_SIZE as u64;
         // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.
-        total += meta.slot_capacity as u64 * 20;
+        total += meta.slot_capacity * 20;
         // HNSW graph: Arc node per slot plus per-layer adjacency up to 2*m.
         if let Some(hnsw) = &meta.hnsw_config {
             let per_node = 64 + (2 * hnsw.m as u64 + 1) * 4;
@@ -1302,6 +1311,44 @@ fn validate_point(meta: &Meta, point: &VectorPoint) -> Result<()> {
     Ok(())
 }
 
+/// Reject, before the log append, upserts that would grow the live set past
+/// the collection's optional [`max_points`](crate::types::CollectionConfig::max_points)
+/// cap.
+///
+/// Admission has to close before `wal.append`: the log is authoritative, so a
+/// record that is guaranteed to fail while being applied would sit in the WAL
+/// forever and make every later `open` fail. Ids already present keep their
+/// slot, and a batch listing the same new id twice must only be counted once.
+fn validate_admission_locked(inner: &StoreInner, txn: &WalTxn) -> Result<()> {
+    let Some(cap) = inner.meta.max_points else {
+        return Ok(());
+    };
+    let mut new_ids: HashSet<&str> = HashSet::new();
+    for op in &txn.ops {
+        let WalRecord::Upsert { point } = op else {
+            continue;
+        };
+        if inner
+            .reverse
+            .contains_key(&PointId::from(point.id.as_str()))
+        {
+            continue;
+        }
+        if !new_ids.insert(point.id.as_str()) {
+            continue;
+        }
+        let needed = inner.meta.next_slot + new_ids.len() as u64;
+        if needed > cap {
+            return Err(VectorSearchError::CapacityExceeded {
+                collection: inner.meta.collection.clone(),
+                max_points: cap,
+                requested: needed,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn threshold_met(meta: &Meta) -> bool {
     meta.next_slot > 0 && meta.tombstone_count as f64 / meta.next_slot as f64 > COMPACTION_THRESHOLD
 }
@@ -1379,6 +1426,17 @@ mod tests {
         VectorPoint::new(id, (0..dim).map(|_| 0.5).collect()).with_payload(payload)
     }
 
+    /// Upsert through the WAL-backed path, which is the only write path the
+    /// engine uses: the log carries the payload so derived files can stay
+    /// unsynced until a checkpoint.
+    fn upsert_logged(store: &CollectionStore, point: &VectorPoint) {
+        store
+            .apply_ops(&[WalRecord::Upsert {
+                point: WalPoint::from_point(point).unwrap(),
+            }])
+            .unwrap();
+    }
+
     #[test]
     fn test_create_open_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1407,9 +1465,7 @@ mod tests {
         let mut payload = HashMap::new();
         payload.insert("color".to_string(), serde_json::json!("red"));
         payload.insert("size".to_string(), serde_json::json!(42));
-        store
-            .upsert(&point_with_payload(1, 2, payload.clone()))
-            .unwrap();
+        upsert_logged(&store, &point_with_payload(1, 2, payload.clone()));
 
         let got = store.get(&PointId::Num(1)).unwrap().unwrap();
         assert_eq!(got.payload, Some(payload.clone()));
@@ -1511,7 +1567,7 @@ mod tests {
         for (id, price) in [(1u64, 10.0f64), (2, 50.0), (3, 120.0)] {
             let mut p = HashMap::new();
             p.insert("price".to_string(), serde_json::json!(price));
-            store.upsert(&point_with_payload(id, 2, p)).unwrap();
+            upsert_logged(&store, &point_with_payload(id, 2, p));
         }
         assert!(store.list_payload_indexes().is_empty());
         store
@@ -1778,5 +1834,156 @@ mod tests {
 
         let err = CollectionStore::open(&store_dir).unwrap_err();
         assert!(matches!(err, VectorSearchError::CorruptData(_)));
+    }
+
+    /// Pending slots accumulate while an HNSW graph is published, then the
+    /// drain moves them into the graph itself: the queue empties and the
+    /// points stay reachable with only the graph answering.
+    #[test]
+    fn test_drain_pending_empty_backlog_and_stay_visible() {
+        use crate::types::{IndexType, SearchQuery};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("col_d");
+        let cfg = config(2).with_index_type(IndexType::HNSW);
+        let store = CollectionStore::create(&store_dir, "col_d", &cfg).unwrap();
+
+        // Build the graph over the first block of points.
+        for id in 0..40u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+        }
+        assert!(store.build_index().unwrap(), "HNSW graph must publish");
+        assert_eq!(store.pending_len(), 0, "build adopts its own slots");
+
+        // Later writes are queued instead of being inserted inline.
+        for id in 40..60u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+        }
+        assert_eq!(store.pending_len(), 20, "post-publish writes are pending");
+
+        store.drain_pending_hnsw();
+        assert_eq!(store.pending_len(), 0, "drain must empty the queue");
+
+        // With an empty queue the graph is the only index that can answer, so
+        // a hit proves the drained points landed in it.
+        let hits = store.search(&SearchQuery::new(vec![0.55, 1.0], 3)).unwrap();
+        assert!(!hits.is_empty(), "drained points must stay reachable");
+        for hit in &hits {
+            assert!(
+                store.get(&hit.id).unwrap().is_some(),
+                "hit {} must resolve to a live point",
+                hit.id
+            );
+        }
+    }
+
+    /// A graph with no tombstone must not be walked: the repair reports no work
+    /// and leaves the published structure untouched.
+    #[test]
+    fn test_repair_skips_graph_without_tombstones() {
+        use crate::types::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("col_rp");
+        let cfg = config(2).with_index_type(IndexType::HNSW);
+        let store = CollectionStore::create(&store_dir, "col_rp", &cfg).unwrap();
+        for id in 0..12u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32, 1.0]));
+        }
+        assert!(store.build_index().unwrap(), "HNSW graph must publish");
+
+        assert_eq!(
+            store.repair_hnsw().unwrap(),
+            0,
+            "zero tombstones must early-exit"
+        );
+
+        // Tombstone one slot: now the repair does real work.
+        store
+            .apply_ops(&[WalRecord::Delete {
+                point_id: "3".to_string(),
+            }])
+            .unwrap();
+        assert!(
+            store.repair_hnsw().unwrap() > 0,
+            "a tombstoned neighbour must be repaired"
+        );
+    }
+
+    /// meta.bin is force-saved only when capacity grows, so a store that stops
+    /// with a stale meta.bin must still reopen with every logged point: the
+    /// slot water marks and counts are replayed from the WAL.
+    #[test]
+    fn test_stale_meta_bin_recovers_from_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("col_m");
+        {
+            let store = CollectionStore::create(&store_dir, "col_m", &config(2)).unwrap();
+            for id in 0..5u64 {
+                upsert_logged(&store, &VectorPoint::new(id, vec![id as f32, 0.5]));
+            }
+            // Fewer batches than META_SAVE_INTERVAL and no capacity growth, so
+            // meta.bin still carries the pre-write water mark.
+            let on_disk = Meta::load(&store_dir).unwrap();
+            assert_eq!(on_disk.next_slot, 0, "meta.bin must lag the live set");
+        }
+        {
+            let reopened = CollectionStore::open(&store_dir).unwrap();
+            assert_eq!(reopened.count(), 5);
+            for id in 0..5u64 {
+                assert!(
+                    reopened.get(&PointId::Num(id)).unwrap().is_some(),
+                    "point {id} must come back from the log"
+                );
+            }
+        }
+    }
+
+    /// `max_points` is an admission contract: a write past the cap fails
+    /// before it is logged, leaves the live set untouched, and survives
+    /// reopen as the same cap on the same data.
+    #[test]
+    fn test_max_points_cap_rejects_write_and_keeps_data() {
+        use crate::types::SearchQuery;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("col_cap");
+        let cfg = config(2).with_max_points(4);
+        let store = CollectionStore::create(&store_dir, "col_cap", &cfg).unwrap();
+        for id in 0..4u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32, 0.5]));
+        }
+        assert_eq!(store.count(), 4);
+
+        let err = store
+            .apply_ops(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&VectorPoint::new(4, vec![4.0, 0.5])).unwrap(),
+            }])
+            .unwrap_err();
+        assert!(
+            matches!(err, VectorSearchError::CapacityExceeded { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(store.count(), 4, "rejected write must not allocate a slot");
+        assert!(store.get(&PointId::Num(4)).unwrap().is_none());
+        store.checkpoint().unwrap();
+
+        // The rejected record must never have entered the log, so the cap
+        // cannot poison a later open.
+        drop(store);
+        let reopened = CollectionStore::open(&store_dir).unwrap();
+        assert_eq!(reopened.count(), 4);
+        assert_eq!(reopened.meta().max_points, Some(4));
+        assert!(reopened.get(&PointId::Num(4)).unwrap().is_none());
+        let err = reopened
+            .apply_ops(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&VectorPoint::new(5, vec![5.0, 0.5])).unwrap(),
+            }])
+            .unwrap_err();
+        assert!(matches!(err, VectorSearchError::CapacityExceeded { .. }));
+        let hits = reopened
+            .search(&SearchQuery::new(vec![3.0, 0.5], 4))
+            .unwrap();
+        assert_eq!(hits.len(), 4, "existing points must stay searchable");
     }
 }

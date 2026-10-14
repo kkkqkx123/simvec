@@ -164,7 +164,7 @@ fn test_filter_bitmap_survives_reopen() {
         .unwrap();
         for i in 0..10u64 {
             let tag = if i < 3 { "red" } else { "blue" };
-            store.upsert(&blob_point(i, &unit(i, DIM), tag)).unwrap();
+            upsert_batch(&store, &[blob_point(i, &unit(i, DIM), tag)]);
         }
     }
 
