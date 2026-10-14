@@ -34,6 +34,11 @@ impl Keys {
         self.dir.grow_to(target_capacity)
     }
 
+    /// Flush appends since the last `sync` (batched at checkpoint time).
+    pub fn sync(&self) -> bool {
+        self.dir.sync()
+    }
+
     /// Atomically replace the backing file with a compacted `tmp_path`.
     pub fn replace_from(&self, tmp_path: &Path) -> Result<()> {
         self.dir.replace_from(tmp_path)

@@ -133,6 +133,10 @@ pub struct Wal {
     path: PathBuf,
     file: parking_lot::Mutex<File>,
     group: GroupCommit,
+    /// Bytes physically appended since the last truncate. Drives the
+    /// size-based checkpoint schedule: a pure-insert workload never crosses a
+    /// tombstone ratio, so without it the log would grow without bound.
+    appended_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl Wal {
@@ -143,6 +147,7 @@ impl Wal {
             .append(true)
             .create(true)
             .open(path)?;
+        let existing = file.metadata()?.len();
         Ok(Self {
             path: path.to_path_buf(),
             file: parking_lot::Mutex::new(file),
@@ -155,6 +160,7 @@ impl Wal {
                 }),
                 condvar: Condvar::new(),
             },
+            appended_bytes: std::sync::atomic::AtomicU64::new(existing),
         })
     }
 
@@ -194,6 +200,10 @@ impl Wal {
                 let mut file = self.file.lock();
                 file.write_all(&batch).and_then(|_| file.sync_all())
             };
+            if write_result.is_ok() {
+                self.appended_bytes
+                    .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
 
             let mut state = self.group.state.lock();
             state.flushing = false;
@@ -269,13 +279,22 @@ impl Wal {
     }
 
     /// Truncate the log to empty (used after compaction, where all state is
-    /// already durable in the rebuilt files and `meta.bin`).
+    /// already durable in the rebuilt files and `meta.bin`, and after a
+    /// periodic checkpoint, where every derived file has been flushed).
     pub fn truncate(&self) -> Result<()> {
         let mut file = self.file.lock();
         file.set_len(0)?;
         file.rewind()?;
         file.sync_all()?;
+        self.appended_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Bytes currently held in the log since the last truncate. Drives the
+    /// size-based checkpoint schedule.
+    pub fn appended_bytes(&self) -> u64 {
+        self.appended_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Read all valid WAL records into a `Vec<WalTxn>`, returning the highest

@@ -6,13 +6,13 @@
 //!
 //! Pages are named `page_NNNN.bin` (zero-padded to 4 digits).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapOptions};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
 
@@ -22,6 +22,9 @@ use super::{StoreConfig, ValuePointer};
 pub struct Pages {
     base_path: PathBuf,
     page_files: RwLock<HashMap<u32, PageEntry>>,
+    /// Page ids with bytes written since the last `sync`. A checkpoint flushes
+    /// exactly these pages, keeping the per-write cost O(1).
+    dirty: Mutex<HashSet<u32>>,
 }
 
 struct PageEntry {
@@ -38,6 +41,7 @@ impl Pages {
         Ok(Self {
             base_path: pages_dir,
             page_files: RwLock::new(HashMap::new()),
+            dirty: Mutex::new(HashSet::new()),
         })
     }
 
@@ -66,6 +70,7 @@ impl Pages {
         Ok(Self {
             base_path: pages_dir,
             page_files: RwLock::new(page_files),
+            dirty: Mutex::new(HashSet::new()),
         })
     }
 
@@ -81,10 +86,24 @@ impl Pages {
         let path = self.page_path(page_id);
         let file = File::create(&path)?;
         file.set_len(config.page_size as u64)?;
-        file.sync_all()?;
         let entry = Self::open_page(path)?;
         self.page_files.write().insert(page_id, entry);
         Ok(())
+    }
+
+    /// Flush every page written since the last `sync` and return how many
+    /// pages were dirty. Called at checkpoint time only; WAL replay covers
+    /// page contents a crash may have lost before this point.
+    pub fn sync(&self) -> usize {
+        let dirty = std::mem::take(&mut *self.dirty.lock());
+        let count = dirty.len();
+        let pages = self.page_files.read();
+        for page_id in &dirty {
+            if let Some(entry) = pages.get(page_id) {
+                let _ = entry.file.sync_all();
+            }
+        }
+        count
     }
 
     /// Read a value from the pages, following the pointer.
@@ -122,6 +141,11 @@ impl Pages {
     }
 
     /// Write a value to the pages at the given pointer location.
+    ///
+    /// The bytes land in the page cache through the file handle and are
+    /// visible to readers through the page's mmap (both map the same cache
+    /// pages). The page is recorded as dirty so the next checkpoint flushes
+    /// it; the WAL already carries the payload for replay-based recovery.
     pub fn write_value(
         &self,
         pointer: &ValuePointer,
@@ -139,17 +163,9 @@ impl Pages {
         let start = pointer.block_offset as usize * config.block_size;
         let _end = start + data.len();
 
-        // Write through file handle.
-        {
-            let mut file = &entry.file;
-            file.seek(SeekFrom::Start(start as u64))?;
-            file.write_all(data)?;
-            file.sync_all()?;
-        }
-
-        // Re-map to pick up changes.
-        let new_mmap = unsafe { MmapOptions::new().map(&entry.file)? };
-        *entry.mmap.write() = Some(new_mmap);
+        write_at(&entry.file, start as u64, data)?;
+        drop(pages);
+        self.dirty.lock().insert(pointer.page_id);
 
         Ok(())
     }
@@ -174,6 +190,20 @@ impl Pages {
             _len: len,
         })
     }
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
 }
 
 #[cfg(test)]

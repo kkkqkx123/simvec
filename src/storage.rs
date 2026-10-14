@@ -68,6 +68,12 @@ use crate::types::{
 /// Tombstone ratio above which deletes trigger compaction.
 const COMPACTION_THRESHOLD: f64 = 0.20;
 
+/// WAL size at which a background checkpoint runs: flush every derived file,
+/// persist the payload store and truncate the log. Tombstone-ratio compaction
+/// never fires on pure-insert workloads, so without this bound the log would
+/// grow (and replay time with it) without limit.
+const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How many WAL transactions between meta.bin saves. The WAL is always
 /// fsynced on every transaction, so crash safety is preserved; meta.bin
 /// is an optimization that reduces replay time on restart.
@@ -109,8 +115,10 @@ pub struct CollectionStore {
     index: ArcSwap<Option<PublishedIndex>>,
     /// Slots inserted while no index was published and a build was in
     /// flight; drained into the index on publish so probe search never
-    /// misses them.
-    pending: ArcSwap<Vec<u32>>,
+    /// misses them. A mutex-guarded queue: `register_slot` runs under the
+    /// store write lock per point, and cloning an `ArcSwap` snapshot on every
+    /// push made bulk inserts quadratic in the pending backlog.
+    pending: Mutex<Vec<u32>>,
     /// Serializes index build/drain vs compaction. Lock order:
     /// build_mutex or compact_mutex (never both held simultaneously).
     build_mutex: Mutex<()>,
@@ -186,6 +194,11 @@ impl CollectionStore {
         if let Some(qc) = &config.quantization_config {
             qc.validate(config.vector_size)?;
         }
+        if config.max_points == Some(0) {
+            return Err(VectorSearchError::InvalidConfig(
+                "max_points must be >= 1 when set".to_string(),
+            ));
+        }
 
         let dir = dir.as_ref();
         if dir.exists() {
@@ -223,6 +236,8 @@ impl CollectionStore {
                 meta.quantization_config = Some(qc.clone());
             }
         }
+        // Persist the admission cap so it survives reopen.
+        meta.max_points = config.max_points;
         meta.save(dir)?;
 
         let vectors = Vectors::create(
@@ -277,7 +292,7 @@ impl CollectionStore {
             quant: parking_lot::RwLock::new(quant),
             wal,
             index: ArcSwap::from(Arc::new(None)),
-            pending: ArcSwap::from(Arc::new(Vec::new())),
+            pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
             compact_mutex: Mutex::new(()),
             building: AtomicBool::new(false),
@@ -382,7 +397,7 @@ impl CollectionStore {
             quant: parking_lot::RwLock::new(quant),
             wal: Wal::open_or_create(&dir.join("wal.bin"))?,
             index: ArcSwap::from(Arc::new(None)),
-            pending: ArcSwap::from(Arc::new(Vec::new())),
+            pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
             compact_mutex: Mutex::new(()),
             building: AtomicBool::new(false),
@@ -956,6 +971,91 @@ impl CollectionStore {
         threshold_met(&inner.meta)
     }
 
+    /// Whether the WAL has grown past the checkpoint threshold.
+    ///
+    /// Tombstone-driven compaction never fires on insert-heavy workloads, so
+    /// this size-based trigger is what bounds replay time and log growth.
+    pub fn needs_checkpoint(&self) -> bool {
+        self.wal.appended_bytes() >= WAL_CHECKPOINT_BYTES
+    }
+
+    /// Checkpoint: make every derived file durable, persist the payload
+    /// store and truncate the WAL.
+    ///
+    /// Runs on the background maintenance thread under the store write lock,
+    /// so no transaction can interleave with the flush. Ordering matters:
+    /// derived files are synced first, then `meta.bin`, then a WAL checkpoint
+    /// marker (its own append fsyncs everything preceding it) and finally the
+    /// truncate. A crash at any point leaves the log intact, so recovery
+    /// replays forward from a state that is already consistent.
+    ///
+    /// A published ANN index is not rebuilt here: it is a derived structure
+    /// refreshed by the maintenance worker on its own schedule, exactly like
+    /// after ordinary mutations.
+    pub fn checkpoint(&self) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let mut inner = self.inner.write();
+        // Payload store: dirty pages, block bitmask, slot→pointer table.
+        let ps_guard = self.payload_store.load();
+        if let Some(ps) = ps_guard.as_ref().as_ref() {
+            ps.checkpoint()?;
+        }
+        drop(ps_guard);
+        // Directory and vector files touched since the last checkpoint.
+        self.keys.sync();
+        self.payloads.sync();
+        self.vectors.sync();
+        // Durable metadata water marks.
+        inner.meta.save(&self.dir)?;
+        self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
+        // Marker first (this append itself fsyncs the log), then truncate.
+        self.wal.append(&WalTxn {
+            txn_id: inner.meta.last_applied_txn,
+            ops: vec![WalRecord::Compact],
+        })?;
+        self.wal.truncate()?;
+        let live = inner.meta.live_count;
+        drop(inner);
+        self.metrics.record_checkpoint(started.elapsed());
+        tracing::debug!(
+            collection = %self.inner.read().meta.collection,
+            live,
+            "wal checkpoint committed"
+        );
+        Ok(live)
+    }
+
+    /// Estimated resident index footprint in bytes.
+    ///
+    /// Covers the dense vector area (allocated capacity), the payload data
+    /// pages, the payload pointer table, the directory files, the published
+    /// HNSW graph (node table plus adjacency estimates) and the current WAL.
+    /// It is an admission estimate, not an accounting figure: callers use it
+    /// to judge whether a collection fits the host before writing.
+    pub fn memory_estimate(&self) -> u64 {
+        let inner = self.inner.read();
+        let meta = &inner.meta;
+        let dim = meta.vector_size;
+        let mut total = meta.slot_capacity as u64 * dim as u64 * 4;
+        // Payload pointer table: 12 bytes per slot.
+        total += meta.next_slot * 12;
+        // Payload data area: one 32 MiB page per 256K blocks of 128 B.
+        let pages = meta
+            .next_slot
+            .div_ceil(payload_store::DEFAULT_PAGE_SIZE as u64 / payload_store::DEFAULT_BLOCK_SIZE as u64)
+            .max(1);
+        total += pages * payload_store::DEFAULT_PAGE_SIZE as u64;
+        // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.
+        total += meta.slot_capacity as u64 * 20;
+        // HNSW graph: Arc node per slot plus per-layer adjacency up to 2*m.
+        if let Some(hnsw) = &meta.hnsw_config {
+            let per_node = 64 + (2 * hnsw.m as u64 + 1) * 4;
+            total += meta.next_slot * per_node;
+        }
+        total += self.wal.appended_bytes();
+        total
+    }
+
     /// Incrementally repair the HNSW graph by removing references to
     /// tombstoned slots from adjacency lists.
     ///
@@ -983,10 +1083,24 @@ impl CollectionStore {
     }
 
     /// Grow storage to accommodate `needed_slots` slots (0-indexed high water).
+    ///
+    /// Refuses to grow past the collection's optional `max_points` cap: the
+    /// cap is the caller's admission contract, so an over-limit upsert fails
+    /// loudly instead of silently allocating index memory the host may not
+    /// have.
     fn ensure_capacity(&self, inner: &mut StoreInner, needed_slots: u64) -> Result<()> {
         let meta = &mut inner.meta;
         if needed_slots <= meta.slot_capacity {
             return Ok(());
+        }
+        if let Some(cap) = meta.max_points {
+            if needed_slots > cap {
+                return Err(VectorSearchError::CapacityExceeded {
+                    collection: meta.collection.clone(),
+                    max_points: cap,
+                    requested: needed_slots,
+                });
+            }
         }
         self.vectors.grow_to(needed_slots)?;
         let new_capacity = self.vectors.slot_capacity();
@@ -1003,6 +1117,13 @@ impl CollectionStore {
         meta.slot_capacity = new_capacity;
         inner.filter_bitmap.resize(new_capacity as usize);
         inner.payload_indexes.resize(new_capacity as usize);
+        // Capacity change is a rare, natural checkpoint for the payload store's
+        // derived files: it costs O(new slots) once per segment growth instead
+        // of once per point. Failures are non-fatal (the WAL covers replay).
+        let ps_guard = self.payload_store.load();
+        if let Some(ps) = ps_guard.as_ref().as_ref() {
+            let _ = ps.checkpoint();
+        }
         Ok(())
     }
 

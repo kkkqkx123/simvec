@@ -29,6 +29,12 @@ impl Payloads {
         self.dir.grow_to(target_capacity)
     }
 
+    /// Flush tombstone-flag writes since the last `sync` (batched at
+    /// checkpoint time).
+    pub fn sync(&self) -> bool {
+        self.dir.sync()
+    }
+
     /// Mark a slot tombstoned (`true`) or alive (`false`).
     pub fn set_tombstone(&self, slot: usize, tombstoned: bool) -> Result<()> {
         let flags = if tombstoned { FLAG_TOMBSTONE } else { 0 };

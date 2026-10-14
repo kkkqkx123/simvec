@@ -18,6 +18,20 @@ pub enum VectorSearchError {
     InvalidCollectionName(String),
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error("insufficient space for {operation}: needs {needed} bytes, {available} available")]
+    InsufficientSpace {
+        operation: String,
+        needed: u64,
+        available: u64,
+    },
+    #[error(
+        "collection {collection} capacity exceeded: limit {max_points}, requested total {requested}"
+    )]
+    CapacityExceeded {
+        collection: String,
+        max_points: u64,
+        requested: u64,
+    },
     #[error("invalid vector dimension: expected {expected}, got {actual}")]
     InvalidVectorDimension { expected: usize, actual: usize },
     #[error("invalid point id: {0}")]

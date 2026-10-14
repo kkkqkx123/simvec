@@ -21,6 +21,9 @@ pub struct Vectors {
     dim: usize,
     segment_slots: u32,
     segments: ArcSwap<Vec<Arc<Mmap>>>,
+    /// Set on every slot write; cleared by `sync`. A checkpoint flushes the
+    /// file once per dirty window instead of fsyncing per point.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl Vectors {
@@ -43,6 +46,7 @@ impl Vectors {
             dim,
             segment_slots,
             segments: ArcSwap::from(segments),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -74,6 +78,7 @@ impl Vectors {
             dim,
             segment_slots,
             segments: ArcSwap::from(Arc::new(segments)),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -99,6 +104,7 @@ impl Vectors {
         }
         *self.file.lock() = file;
         self.segments.store(Arc::new(segments));
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -137,6 +143,10 @@ impl Vectors {
     }
 
     /// Write the vector for a slot. The slot must be within current capacity.
+    ///
+    /// The bytes land in the page cache through the file handle and are visible
+    /// to readers through the mmap snapshots; the file is marked dirty so the
+    /// next checkpoint flushes it once per batch of writes.
     pub fn write_slot(&self, slot: u64, data: &[f32]) -> Result<()> {
         if data.len() != self.dim {
             return Err(VectorSearchError::InvalidVectorDimension {
@@ -154,7 +164,22 @@ impl Vectors {
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         write_at(&self.file.lock(), bytes, offset as u64)?;
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Flush slot writes since the last `sync`. Returns whether anything was
+    /// flushed. Called at checkpoint time; WAL replay covers the same data.
+    pub fn sync(&self) -> bool {
+        if !self
+            .dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let file = self.file.lock();
+        file.sync_all().ok();
+        true
     }
 
     /// Read the vector for a slot from a snapshot. Borrowed from the mmap.

@@ -49,6 +49,10 @@ enum MaintenanceJob {
     Build(String),
     /// Physically reclaim tombstoned slots in a collection.
     Compact(String),
+    /// Flush derived files, persist the payload store and truncate the WAL.
+    Checkpoint(String),
+    /// Drain the HNSW pending queue into the published graph.
+    Drain(String),
     /// Stop the worker (sent on engine drop).
     Shutdown,
 }
@@ -61,11 +65,11 @@ const MAINTENANCE_TICK: Duration = Duration::from_secs(30);
 /// default) when the config leaves it unset.
 const HNSW_PROMOTION_DEFAULT: usize = 10_000;
 
-/// Pending-slot backlog at which mutations synchronously drain the HNSW
-/// graph instead of waiting for the next maintenance tick. Purely a
-/// guardrail against extreme write storms leaving the graph far behind; the
-/// brute-force pending path in search keeps results correct either way.
-const PENDING_DRAIN_GUARDRAIL: usize = 65_536;
+/// Pending backlog at which mutations ask the maintenance worker to drain
+/// the HNSW graph instead of draining inline. The drain is incremental and
+/// runs off the caller's thread, so a write storm never stalls a single batch
+/// for a multi-second synchronous graph insert.
+const PENDING_DRAIN_ENQUEUE: usize = 4096;
 
 /// The built-in (local) vector engine.
 ///
@@ -555,6 +559,7 @@ impl LocalVectorEngine {
             config.hnsw_config = meta.hnsw_config.clone();
             config.ivf_config = meta.ivf_config.clone();
             config.quantization_config = meta.quantization_config.clone();
+            config.max_points = meta.max_points;
             config
         }))
     }
@@ -573,6 +578,7 @@ impl LocalVectorEngine {
         config.hnsw_config = meta.hnsw_config.clone();
         config.ivf_config = meta.ivf_config.clone();
         config.quantization_config = meta.quantization_config.clone();
+        config.max_points = meta.max_points;
         Ok(CollectionInfo {
             name: meta.collection.clone(),
             vector_count: live,
@@ -582,6 +588,7 @@ impl LocalVectorEngine {
             config,
             status: CollectionStatus::Green,
             index: store.index_info(),
+            memory_bytes: store.memory_estimate(),
         })
     }
 
@@ -849,14 +856,61 @@ impl LocalVectorEngine {
         }
     }
 
-    /// Post-mutation hook, run after the store locks are released: drain an
-    /// extreme pending backlog synchronously (guardrail), schedule a
-    /// background compaction when warranted, and incrementally repair the
-    /// HNSW graph if it has stale references to tombstoned slots.
-    fn after_mutation(&self, collection: &str, store: &Arc<CollectionStore>) {
-        if store.pending_len() >= PENDING_DRAIN_GUARDRAIL {
-            store.drain_pending_hnsw();
+    /// Schedule a background WAL checkpoint once the log outgrows its byte
+    /// threshold. Insert-heavy workloads never cross the tombstone ratio, so
+    /// this is the only trigger that bounds log growth there.
+    fn maybe_schedule_checkpoint(&self, collection: &str, store: &CollectionStore) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return;
+        };
+        if !store.needs_checkpoint() {
+            return;
         }
+        let key = format!("checkpoint:{collection}");
+        let mut guard = self.in_flight.lock();
+        if guard.contains(&key) {
+            return;
+        }
+        guard.insert(key.clone());
+        if jobs
+            .send(MaintenanceJob::Checkpoint(collection.to_string()))
+            .is_err()
+        {
+            guard.remove(&key);
+        }
+    }
+
+    /// Ask the maintenance worker to drain a large HNSW pending backlog. The
+    /// drain is incremental and off the caller's thread; the previous
+    /// synchronous guardrail stalled a single batch for seconds.
+    fn maybe_schedule_drain(&self, collection: &str, store: &CollectionStore) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return;
+        };
+        if store.pending_len() < PENDING_DRAIN_ENQUEUE {
+            return;
+        }
+        let key = format!("drain:{collection}");
+        let mut guard = self.in_flight.lock();
+        if guard.contains(&key) {
+            return;
+        }
+        guard.insert(key.clone());
+        if jobs
+            .send(MaintenanceJob::Drain(collection.to_string()))
+            .is_err()
+        {
+            guard.remove(&key);
+        }
+    }
+
+    /// Post-mutation hook, run after the store locks are released: keep the
+    /// pending backlog bounded by scheduling a background drain, schedule a
+    /// compaction or WAL checkpoint when either threshold is crossed, and
+    /// incrementally repair the HNSW graph if it has stale references to
+    /// tombstoned slots.
+    fn after_mutation(&self, collection: &str, store: &Arc<CollectionStore>) {
+        self.maybe_schedule_drain(collection, store);
         // Incrementally repair HNSW graph references to tombstoned slots.
         // This avoids a full rebuild when tombstones accumulate; the repair
         // is local and idempotent.
@@ -868,6 +922,7 @@ impl LocalVectorEngine {
             );
         }
         self.maybe_schedule_compaction(collection, store);
+        self.maybe_schedule_checkpoint(collection, store);
     }
 
     /// Run one maintenance sweep immediately: post-compaction rebuilds,
@@ -943,6 +998,31 @@ fn maintenance_loop(
                     }
                 }
                 in_flight.lock().remove(&format!("compact:{name}"));
+            }
+            Ok(MaintenanceJob::Checkpoint(name)) => {
+                let store = collections.read().get(&name).cloned();
+                if let Some(store) = store {
+                    match store.checkpoint() {
+                        Ok(live) => tracing::debug!(
+                            collection = %name,
+                            live,
+                            "maintenance wal checkpoint done"
+                        ),
+                        Err(e) => tracing::warn!(
+                            collection = %name,
+                            error = %e,
+                            "maintenance wal checkpoint failed"
+                        ),
+                    }
+                }
+                in_flight.lock().remove(&format!("checkpoint:{name}"));
+            }
+            Ok(MaintenanceJob::Drain(name)) => {
+                let store = collections.read().get(&name).cloned();
+                if let Some(store) = store {
+                    store.drain_pending_hnsw();
+                }
+                in_flight.lock().remove(&format!("drain:{name}"));
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Drain pending HNSW slots into the graph before the
@@ -1054,15 +1134,25 @@ fn sweep_hnsw(
     };
     if store.has_index() {
         // Index is published but slots are not incorporated into the graph
-        // yet (fresh writes routed to pending, or gaps found on open).
-        if store.pending_len() > 0 {
-            tracing::debug!(
-                collection = %name,
-                pending = store.pending_len(),
-                "HNSW index published with pending slots; scheduling rebuild"
-            );
-            LocalVectorEngine::schedule_build(name, jobs, in_flight);
-            return;
+        // yet (fresh writes routed to pending, or gaps found on open). The
+        // maintenance tick drains pending before sweeping, so whatever is
+        // still queued here exceeded one drain: rebuild only when the backlog
+        // is a large share of the graph, otherwise leave it to the next drain.
+        let pending = store.pending_len();
+        if pending > 0 {
+            let nodes = store
+                .index_info()
+                .map_or(0, |info| info.built_at_live_count as usize);
+            if CollectionStore::pending_warrants_rebuild(pending, nodes) {
+                tracing::info!(
+                    collection = %name,
+                    pending,
+                    nodes,
+                    "HNSW pending backlog warrants rebuild"
+                );
+                LocalVectorEngine::schedule_build(name, jobs, in_flight);
+                return;
+            }
         }
         // Staleness upkeep: overwrite upserts since the build, relative to
         // the live count at build time. Prefer the combined `stale_ratio`

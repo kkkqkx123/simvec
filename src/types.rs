@@ -498,6 +498,12 @@ pub struct CollectionConfig {
     pub on_disk_payload: Option<bool>,
     pub shard_number: Option<usize>,
     pub ivf_config: Option<IvfConfig>,
+    /// Optional admission cap on live points. When set, an upsert that would
+    /// grow the live set past this limit fails with
+    /// [`VectorSearchError::CapacityExceeded`](crate::error::VectorSearchError::CapacityExceeded)
+    /// instead of silently allocating unbounded index memory. `None` = no cap.
+    #[serde(default)]
+    pub max_points: Option<u64>,
 }
 
 impl CollectionConfig {
@@ -513,6 +519,7 @@ impl CollectionConfig {
             on_disk_payload: None,
             shard_number: None,
             ivf_config: None,
+            max_points: None,
         }
     }
 
@@ -545,6 +552,12 @@ impl CollectionConfig {
 
     pub fn with_on_disk_payload(mut self, on_disk_payload: bool) -> Self {
         self.on_disk_payload = Some(on_disk_payload);
+        self
+    }
+
+    /// Set the optional live-point admission cap.
+    pub fn with_max_points(mut self, max_points: u64) -> Self {
+        self.max_points = Some(max_points);
         self
     }
 }
@@ -604,6 +617,10 @@ pub struct CollectionInfo {
     pub config: CollectionConfig,
     pub status: CollectionStatus,
     pub index: Option<IndexInfo>,
+    /// Estimated resident index footprint in bytes (vectors, payload pages,
+    /// pointer table, directory files, ANN graph and the current WAL), so
+    /// callers can judge whether a collection fits the host before writing.
+    pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

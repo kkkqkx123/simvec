@@ -34,6 +34,21 @@ pub(super) enum PublishedIndex {
 }
 
 impl CollectionStore {
+    /// Whether a pending backlog of `pending` slots warrants a full HNSW
+    /// rebuild of a published graph with `nodes` nodes. Draining and
+    /// rebuilding cost the same per node, so a rebuild only wins when a large
+    /// share of the graph is absent; smaller backlogs are handled by the
+    /// incremental drain.
+    pub(crate) fn pending_warrants_rebuild(pending: usize, nodes: usize) -> bool {
+        if pending == 0 {
+            return false;
+        }
+        if nodes == 0 {
+            return true;
+        }
+        pending * 2 >= nodes
+    }
+
     /// Supply the IVF configuration after open. Collections persist their
     /// effective config, but the engine-provided
     /// runtime configuration takes precedence. Applies both to future builds
@@ -100,13 +115,12 @@ impl CollectionStore {
         let index = Arc::new(index);
         {
             let tombstones = self.tombstones.load();
-            let mut p = (**self.pending.load()).clone();
+            let mut p = self.pending.lock();
             for slot in covered..next_slot as usize {
                 if slot < capacity && !tombstones.bit(slot) {
                     p.push(slot as u32);
                 }
             }
-            self.pending.store(Arc::new(p));
         }
         self.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
         Ok(())
@@ -160,16 +174,18 @@ impl CollectionStore {
         };
         {
             let tombstones = self.tombstones.load();
-            let mut p = (**self.pending.load()).clone();
+            let mut p = self.pending.lock();
             for slot in covered..next_slot as usize {
                 if slot < capacity && !tombstones.bit(slot) {
                     p.push(slot as u32);
                 }
             }
-            if !p.is_empty() {
+            // Slots appended after the persisted build are handled by the
+            // incremental drain; only a backlog large enough to dwarf the
+            // graph justifies a full rebuild.
+            if Self::pending_warrants_rebuild(p.len(), covered) {
                 self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
             }
-            self.pending.store(Arc::new(p));
         }
         self.index
             .store(Arc::new(Some(PublishedIndex::Hnsw(index))));
@@ -199,18 +215,14 @@ impl CollectionStore {
                 // Defer graph insertion to the maintenance worker; the
                 // brute-force pending path in search_hnsw guarantees
                 // correct visibility in the interim.
-                let mut p = (**self.pending.load()).clone();
-                p.push(slot);
-                self.pending.store(Arc::new(p));
+                self.pending.lock().push(slot);
                 return;
             }
             None => {}
         }
         drop(published);
         if self.building.load(AtomicOrdering::Relaxed) {
-            let mut p = (**self.pending.load()).clone();
-            p.push(slot);
-            self.pending.store(Arc::new(p));
+            self.pending.lock().push(slot);
         }
     }
 
@@ -352,7 +364,7 @@ impl CollectionStore {
         // miscounted as an overwrite-staleness event).
         {
             let inner = self.inner.write();
-            let mut p = (**self.pending.load()).clone();
+            let mut p = self.pending.lock();
             let tombstones = self.tombstones.load();
             let vsnap = self.vectors.snapshot();
             let mut adopted: HashSet<u32> = HashSet::new();
@@ -374,7 +386,6 @@ impl CollectionStore {
                     index.insert(slot, v, &vsnap, segment_slots);
                 }
             }
-            self.pending.store(Arc::new(p));
         }
         let persisted = index.to_persisted();
         // Publish before clearing the building flag: an upsert that loaded
@@ -475,7 +486,7 @@ impl CollectionStore {
         // the published index directly).
         let persisted = {
             let inner = self.inner.write();
-            let mut p = (**self.pending.load()).clone();
+            let mut p = self.pending.lock();
             let tombstones = self.tombstones.load();
             let vsnap = self.vectors.snapshot();
             index.adopt_range(
@@ -492,7 +503,6 @@ impl CollectionStore {
                     }
                 }
             }
-            self.pending.store(Arc::new(p));
             index.to_persisted()
         };
         // Publish before clearing the building flag: an upsert that loaded
@@ -525,7 +535,7 @@ impl CollectionStore {
     pub fn drop_index(&self) -> Result<()> {
         let _guard = self.compact_mutex.lock();
         self.index.store(Arc::new(None));
-        self.pending.store(Arc::new(Vec::new()));
+        self.pending.lock().clear();
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
         self.discard_index_files();
@@ -545,15 +555,13 @@ impl CollectionStore {
             return;
         };
         let pending: Vec<u32> = {
-            let p = self.pending.load();
+            let mut p = self.pending.lock();
             if p.is_empty() {
                 return;
             }
             // Take a snapshot and clear; new arrivals during drain go to
             // the next tick.
-            let taken = (**p).clone();
-            self.pending.store(Arc::new(Vec::new()));
-            taken
+            std::mem::take(&mut *p)
         };
         // Hold build_mutex only — excludes compaction and build, so the
         // graph structure is stable.  The store write lock is NOT held,
@@ -593,7 +601,7 @@ impl CollectionStore {
     /// into the published index). Used by the sweep to schedule rebuilds
     /// when the index is published but has pending gaps.
     pub(crate) fn pending_len(&self) -> usize {
-        self.pending.load().len()
+        self.pending.lock().len()
     }
 
     /// Swap-and-reset the post-compaction rebuild flag.

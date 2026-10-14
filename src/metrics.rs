@@ -223,6 +223,9 @@ pub struct Metrics {
     compaction_race_retries: AtomicU64,
     compaction_contended: AtomicU64,
     compaction_latency: PowerLatencyHistogram,
+
+    checkpoints: AtomicU64,
+    checkpoint_latency: PowerLatencyHistogram,
 }
 
 impl Metrics {
@@ -340,6 +343,13 @@ impl Metrics {
         self.compaction_contended.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one committed WAL checkpoint (derived files flushed and the log
+    /// truncated).
+    pub fn record_checkpoint(&self, elapsed: Duration) {
+        self.checkpoints.fetch_add(1, Ordering::Relaxed);
+        self.checkpoint_latency.record(elapsed.as_nanos() as u64);
+    }
+
     /// Take a point-in-time snapshot. Counters may be slightly skewed
     /// relative to each other under concurrent recording.
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -378,6 +388,9 @@ impl Metrics {
             compaction_race_retries: self.compaction_race_retries.load(Ordering::Relaxed),
             compaction_contended: self.compaction_contended.load(Ordering::Relaxed),
             compaction: self.compaction_latency.summary(),
+
+            checkpoints: self.checkpoints.load(Ordering::Relaxed),
+            checkpoint: self.checkpoint_latency.summary(),
         }
     }
 }
@@ -436,6 +449,10 @@ pub struct MetricsSnapshot {
     pub compaction_race_retries: u64,
     pub compaction_contended: u64,
     pub compaction: LatencySummary,
+
+    // WAL checkpoints.
+    pub checkpoints: u64,
+    pub checkpoint: LatencySummary,
 }
 
 #[cfg(test)]

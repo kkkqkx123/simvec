@@ -13,10 +13,10 @@ use crate::types::{DistanceMetric, HnswConfig, IndexType, IvfConfig, Quantizatio
 /// Current on-disk format version.
 ///
 /// Version 2 adds `quantization_config` for Scalar/Binary/Product quantization
-/// support. No migration is provided for version 1 files created before this
-/// change — they will be rejected on open and must be recreated. The store is
-/// still pre-stable, so breaking format changes are applied directly.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+/// support. Version 3 adds `max_points`, the optional live-point admission
+/// cap. The store is pre-stable, so breaking format changes are applied
+/// directly and older files are rejected on open.
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// Default number of slots per `vectors.bin` segment.
 pub(crate) const SEGMENT_SLOTS_DEFAULT: u32 = 8192;
@@ -52,6 +52,9 @@ pub struct Meta {
     pub tombstone_count: u64,
     /// WAL water mark; reserved for the WAL work item.
     pub last_applied_txn: u64,
+    /// Optional live-point admission cap (see `CollectionConfig::max_points`).
+    #[serde(default)]
+    pub max_points: Option<u64>,
     pub created_at: i64,
 }
 
@@ -81,6 +84,7 @@ impl Meta {
             live_count: 0,
             tombstone_count: 0,
             last_applied_txn: 0,
+            max_points: None,
             created_at: Utc::now().timestamp(),
         }
     }
@@ -91,7 +95,7 @@ impl Meta {
 
     /// Validate invariants on open (aligned with pgvector `CheckDim`).
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != FORMAT_VERSION && self.format_version != 1 {
+        if self.format_version != FORMAT_VERSION {
             return Err(VectorSearchError::CorruptData(format!(
                 "unsupported format version {}",
                 self.format_version
@@ -131,53 +135,9 @@ impl Meta {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("meta.bin");
         let bytes = std::fs::read(&path)?;
-        // Try current layout first (version 2 with quantization).
-        if let Ok(meta) = postcard::from_bytes::<Self>(&bytes) {
-            meta.validate()?;
-            return Ok(meta);
-        }
-        // Fallback: old layout version 1 without `quantization_config`.
-        #[derive(Debug, Clone, Serialize, Deserialize)]
-        struct MetaV1 {
-            format_version: u32,
-            collection: String,
-            vector_size: usize,
-            distance: DistanceMetric,
-            index_type: IndexType,
-            hnsw_config: Option<HnswConfig>,
-            ivf_config: Option<IvfConfig>,
-            segment_slots: u32,
-            slot_capacity: u64,
-            next_slot: u64,
-            live_count: u64,
-            tombstone_count: u64,
-            last_applied_txn: u64,
-            created_at: i64,
-        }
-        if let Ok(old) = postcard::from_bytes::<MetaV1>(&bytes) {
-            let meta = Self {
-                format_version: old.format_version,
-                collection: old.collection,
-                vector_size: old.vector_size,
-                distance: old.distance,
-                index_type: old.index_type,
-                hnsw_config: old.hnsw_config,
-                ivf_config: old.ivf_config,
-                quantization_config: None,
-                segment_slots: old.segment_slots,
-                slot_capacity: old.slot_capacity,
-                next_slot: old.next_slot,
-                live_count: old.live_count,
-                tombstone_count: old.tombstone_count,
-                last_applied_txn: old.last_applied_txn,
-                created_at: old.created_at,
-            };
-            meta.validate()?;
-            return Ok(meta);
-        }
-        Err(VectorSearchError::CorruptData(
-            "meta.bin corrupt or unsupported layout".to_string(),
-        ))
+        let meta = postcard::from_bytes::<Self>(&bytes)?;
+        meta.validate()?;
+        Ok(meta)
     }
 }
 

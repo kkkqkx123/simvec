@@ -110,7 +110,7 @@ impl CollectionStore {
                 self.keys.snapshot(),
                 self.index.load(),
                 mask,
-                self.pending.load_full(),
+                self.pending.lock().clone(),
             )
         };
         let ps_guard = self.payload_store.load();

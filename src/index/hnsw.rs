@@ -1245,6 +1245,12 @@ impl HnswIndex {
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
     ) -> usize {
+        // Cheap early exit: with no tombstones there is nothing to repair, and
+        // the per-chunk popcount of the tombstone table costs far less than a
+        // full node-table walk with per-layer write locks.
+        if tombstones.count_ones() == 0 {
+            return 0;
+        }
         let nodes = self.nodes.read();
         let mut repaired = 0usize;
 

@@ -42,11 +42,21 @@ pub struct DirView {
     mmap: Arc<Mmap>,
     rec_capacity: usize,
     blob_len: u64,
+    /// Bytes currently mapped. The physical file may carry headroom beyond
+    /// the logical end (`HEADER_LEN + rec_capacity * rec_size + blob_len`);
+    /// `open` tolerates that slack so appends only remap on geometric growth
+    /// steps instead of once per append.
+    mapped_len: usize,
 }
 
 impl DirView {
     fn blob_offset(&self, rec_size: usize) -> usize {
         HEADER_LEN + self.rec_capacity * rec_size
+    }
+
+    /// Logical end of the file: header + record array + blob area.
+    fn logical_len(&self, rec_size: usize) -> usize {
+        self.blob_offset(rec_size) + self.blob_len as usize
     }
 
     /// Parse `{ off: u32, len: u32 }` of a record.
@@ -79,7 +89,12 @@ pub struct BlobDirectory {
     rec_size: usize,
     file: parking_lot::Mutex<File>,
     view: ArcSwap<DirView>,
+    /// Set on any write; cleared and fsynced by `sync` at checkpoint time.
+    dirty: std::sync::atomic::AtomicBool,
 }
+
+/// Minimum geometric headroom added when the mapping has to grow.
+const MAPPED_HEADROOM_MIN: usize = 64 * 1024;
 
 impl BlobDirectory {
     /// Create a new file with `initial_capacity` records.
@@ -104,6 +119,7 @@ impl BlobDirectory {
             mmap: Arc::new(mmap),
             rec_capacity: initial_capacity as usize,
             blob_len: 0,
+            mapped_len: file_len,
         });
         Ok(Self {
             path: path.to_path_buf(),
@@ -111,6 +127,7 @@ impl BlobDirectory {
             rec_size,
             file: parking_lot::Mutex::new(file),
             view: ArcSwap::from(view),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -143,9 +160,12 @@ impl BlobDirectory {
         let rec_capacity = read_rec_capacity(&file)? as usize;
         let blob_len = read_blob_len(&file)?;
         let expected = HEADER_LEN + rec_capacity * rec_size + blob_len as usize;
-        if file_len != expected {
+        // The physical file may be longer than the logical end: appends map
+        // with headroom and never truncate back, so extra bytes are unused
+        // reserved space rather than corruption.
+        if file_len < expected {
             return Err(VectorSearchError::CorruptData(format!(
-                "{} length {} != expected {expected}",
+                "{} length {} < expected {expected}",
                 path.display(),
                 file_len
             )));
@@ -155,6 +175,7 @@ impl BlobDirectory {
             mmap: Arc::new(mmap),
             rec_capacity,
             blob_len,
+            mapped_len: file_len,
         });
         Ok(Self {
             path: path.to_path_buf(),
@@ -162,7 +183,20 @@ impl BlobDirectory {
             rec_size,
             file: parking_lot::Mutex::new(file),
             view: ArcSwap::from(view),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Flush writes since the last `sync` to stable storage. Returns whether
+    /// anything was flushed. Called at checkpoint time only; the WAL carries
+    /// the same data for recovery, so per-append fsync is not needed.
+    pub fn sync(&self) -> bool {
+        if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let file = self.file.lock();
+        file.sync_all().ok();
+        true
     }
 
     pub fn snapshot(&self) -> arc_swap::Guard<Arc<DirView>> {
@@ -172,6 +206,11 @@ impl BlobDirectory {
     /// Append a blob and wire up the record for `slot`.
     ///
     /// `slot` must be strictly less than the current record capacity.
+    ///
+    /// Bytes are written through the file handle without fsync; the mapping is
+    /// remapped only when the blob area outgrows the mapped range (geometric
+    /// headroom), so an append is O(1) amortized. Durability comes from the
+    /// WAL plus the batched `sync` at checkpoint time.
     pub fn append_blob(&self, slot: usize, blob: &[u8], flags: u8) -> Result<()> {
         let view = self.view.load();
         if slot >= view.rec_capacity {
@@ -182,10 +221,31 @@ impl BlobDirectory {
         }
         let blob_offset = view.blob_offset(self.rec_size);
         let new_blob_len = view.blob_len + blob.len() as u64;
+        let end = blob_offset + new_blob_len as usize;
 
+        if end > view.mapped_len {
+            // Grow the physical file with headroom and remap once; readers
+            // keep their previous snapshot until this store lands.
+            let headroom = (view.mapped_len / 4).max(MAPPED_HEADROOM_MIN);
+            let new_mapped = end.saturating_add(headroom).max(end);
+            {
+                let file = self.file.lock();
+                file.set_len(new_mapped as u64)?;
+            }
+            let mmap = map_file(&self.file.lock(), new_mapped)?;
+            self.view.store(Arc::new(DirView {
+                mmap: Arc::new(mmap),
+                rec_capacity: view.rec_capacity,
+                blob_len: view.blob_len,
+                mapped_len: new_mapped,
+            }));
+        }
+
+        let view = self.view.load();
         // Blob bytes first, then the record, then the header water mark.
+        let file = self.file.lock();
         write_at(
-            &self.file.lock(),
+            &file,
             blob,
             (blob_offset + view.blob_len as usize) as u64,
         )?;
@@ -196,18 +256,20 @@ impl BlobDirectory {
             self.rec_size,
         );
         let rec_start = HEADER_LEN + slot * self.rec_size;
-        write_at(&self.file.lock(), &rec_bytes, rec_start as u64)?;
-        write_at(&self.file.lock(), &new_blob_len.to_le_bytes(), 16)?;
-        self.file.lock().sync_all()?;
+        write_at(&file, &rec_bytes, rec_start as u64)?;
+        write_at(&file, &new_blob_len.to_le_bytes(), 16)?;
+        drop(file);
 
-        let file_len =
-            (HEADER_LEN + view.rec_capacity * self.rec_size + new_blob_len as usize) as u64;
-        let mmap = map_file(&self.file.lock(), file_len as usize)?;
-        self.view.store(Arc::new(DirView {
-            mmap: Arc::new(mmap),
+        // Publish the new water mark reusing the same mapping.
+        let next = DirView {
+            mmap: Arc::clone(&view.mmap),
             rec_capacity: view.rec_capacity,
             blob_len: new_blob_len,
-        }));
+            mapped_len: view.mapped_len,
+        };
+        self.view.store(Arc::new(next));
+        self.dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -222,6 +284,8 @@ impl BlobDirectory {
         }
         let flag_start = HEADER_LEN + slot * self.rec_size + 8;
         write_at(&self.file.lock(), &[flags], flag_start as u64)?;
+        self.dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -274,7 +338,9 @@ impl BlobDirectory {
             mmap: Arc::new(mmap),
             rec_capacity,
             blob_len,
+            mapped_len: file_len,
         }));
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -328,7 +394,9 @@ impl BlobDirectory {
             mmap: Arc::new(mmap),
             rec_capacity: target_capacity as usize,
             blob_len: view.blob_len,
+            mapped_len: file_len,
         }));
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

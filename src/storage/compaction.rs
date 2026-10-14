@@ -195,6 +195,45 @@ fn write_at(file: &mut File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     file.write_all(buf)
 }
 
+/// Size of `path` in bytes, or 0 when it does not exist.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Recursive size of `dir` in bytes, or 0 when it does not exist.
+fn dir_len(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        total += match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => dir_len(&path),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        };
+    }
+    total
+}
+
+/// Bytes available on the volume holding `path`.
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 impl CollectionStore {
     /// Physically remove tombstoned slots and rebuild all files with compacted
     /// slot numbering `0..live_count`.
@@ -207,9 +246,13 @@ impl CollectionStore {
     /// write pressure a bounded fallback rewrites while holding the write
     /// lock, so compaction always makes progress.
     ///
-    /// Returns the number of live points after compaction.
+    /// Returns the number of live points after compaction. Refuses to start
+    /// when the target volume cannot hold the temp files, so a full disk
+    /// surfaces as [`VectorSearchError::InsufficientSpace`] instead of a
+    /// half-rewritten collection.
     pub fn compact(&self) -> Result<u64> {
         let _compact_guard = self.compact_mutex.lock();
+        self.ensure_compaction_space()?;
         // Hold build_mutex jointly with compact_mutex (order: compact -> build)
         // so quantization rebuilds and index builds cannot interleave slot
         // renumbering. Dropped between attempts to avoid stalling builds longer
@@ -265,6 +308,35 @@ impl CollectionStore {
         let live = self.commit_compaction(&mut inner, &plan);
         self.metrics.record_compaction(started.elapsed());
         live
+    }
+
+    /// Upper bound on the temp-file footprint one compaction needs.
+    ///
+    /// The compacted files can never be larger than the live ones (capacity
+    /// only shrinks, payload data only moves), so the current on-disk size of
+    /// every file that gets rewritten bounds the peak usage of the rewrite
+    /// phase, which briefly doubles that space.
+    fn compaction_footprint(&self) -> u64 {
+        let mut total = file_len(&self.dir.join("vectors.bin"));
+        total += file_len(&self.dir.join("keys.bin"));
+        total += file_len(&self.dir.join("payloads.bin"));
+        total += file_len(&self.dir.join("quant.bin"));
+        total += dir_len(&self.dir.join("payloads_store"));
+        total
+    }
+
+    /// Reject a compaction whose temp files cannot fit on the target volume.
+    fn ensure_compaction_space(&self) -> Result<()> {
+        let needed = self.compaction_footprint();
+        let available = available_bytes(&self.dir).unwrap_or(u64::MAX);
+        if needed > available {
+            return Err(VectorSearchError::InsufficientSpace {
+                operation: format!("compaction of {}", self.dir.display()),
+                needed,
+                available,
+            });
+        }
+        Ok(())
     }
 
     /// Write the three compacted temp files from immutable snapshots.
@@ -340,9 +412,7 @@ impl CollectionStore {
         let new_store = old_store.compact_to(&tmp_payload_store, &live_slots)?;
         let _ = old_store;
         drop(ps_guard);
-        let tracker_guard = new_store.tracker().write();
-        let config = new_store.config().clone();
-        tracker_guard.save(&tmp_payload_store, &config)?;
+        let _ = new_store;
         Ok(())
     }
 
@@ -427,7 +497,7 @@ impl CollectionStore {
         // wholesale. A rebuild is scheduled by the maintenance worker.
         let had_index = self.index.load().is_some();
         self.index.store(Arc::new(None));
-        self.pending.store(Arc::new(Vec::new()));
+        self.pending.lock().clear();
         self.building.store(false, AtomicOrdering::Relaxed);
         if had_index {
             self.needs_rebuild.store(true, AtomicOrdering::Relaxed);

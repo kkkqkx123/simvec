@@ -3,6 +3,12 @@
 //! Tracks which blocks across all pages are in use (1) or free (0).
 //! Protected by `parking_lot::RwLock` for safe concurrent access.
 //!
+//! Allocation state lives in memory during normal operation and is persisted
+//! only at a payload-store checkpoint. A crash leaves the on-disk bitmap
+//! stale, but WAL replay re-applies every allocation and converges the
+//! in-memory state; stale free bits can only leak a block, never alias two
+//! live payloads.
+//!
 //! # On-disk format
 //!
 //! ```text
@@ -128,6 +134,9 @@ impl MmapBitmask {
     }
 
     /// Allocate `count` contiguous blocks. Returns (page_id, block_offset).
+    ///
+    /// In-memory only; the updated bitmap is persisted by
+    /// [`MmapBitmask::persist`] at checkpoint time.
     pub fn allocate(&self, count: u32, config: &StoreConfig) -> Result<(u32, u32)> {
         let mut inner = self.inner.write();
 
@@ -137,9 +146,6 @@ impl MmapBitmask {
             for i in 0..count {
                 inner.set_bit(start + i as u64, true);
             }
-            let mut file = self.file.lock();
-            Self::write_file(&mut file, &inner)?;
-            file.sync_all()?;
             return Ok((pid, off));
         }
 
@@ -157,14 +163,11 @@ impl MmapBitmask {
             inner.set_bit(start + i as u64, true);
         }
 
-        let mut file = self.file.lock();
-        Self::write_file(&mut file, &inner)?;
-        file.sync_all()?;
-
         Ok((new_page_id, 0))
     }
 
-    /// Free `count` blocks starting at (page_id, block_offset).
+    /// Free `count` blocks starting at (page_id, block_offset). In-memory
+    /// only; persisted by [`MmapBitmask::persist`] at checkpoint time.
     pub fn free_blocks(
         &self,
         page_id: usize,
@@ -179,9 +182,17 @@ impl MmapBitmask {
         for i in 0..blocks {
             inner.set_bit(start + i as u64, false);
         }
+    }
+
+    /// Persist the current allocation state to disk and fsync it. Called at
+    /// payload-store checkpoint time, so the full bitmap is written at most
+    /// once per checkpoint instead of once per payload write.
+    pub fn persist(&self) -> Result<()> {
+        let inner = self.inner.read();
         let mut file = self.file.lock();
-        Self::write_file(&mut file, &inner).ok();
-        file.sync_all().ok();
+        Self::write_file(&mut file, &inner)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     fn read_file(file: &mut File) -> Result<BitmaskInner> {
@@ -286,6 +297,7 @@ mod tests {
         {
             let bm = MmapBitmask::create(dir.path(), &config).unwrap();
             bm.allocate(5, &config).unwrap();
+            bm.persist().unwrap();
         }
         {
             let bm = MmapBitmask::open(dir.path(), &config).unwrap();
