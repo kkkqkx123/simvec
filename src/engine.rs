@@ -21,7 +21,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord, WalTxn};
+use crate::storage::{CollectionStore, WalPoint, WalRecord};
 use crate::types::{
     CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexType, IvfConfig, Payload,
     PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
@@ -147,7 +147,7 @@ impl LocalVectorEngine {
             if name.contains(".rebuild-") || name.contains(".old-") || name.contains(".suspect-") {
                 continue;
             }
-            let store = Arc::new(CollectionStore::open(&path)?);
+            let store = CollectionStore::open(&path)?;
             collections.insert(name, store);
         }
 
@@ -242,7 +242,7 @@ impl LocalVectorEngine {
             }
         }
         let dir = self.root_dir.join(name);
-        let store = Arc::new(CollectionStore::create(&dir, name, &effective)?);
+        let store = CollectionStore::create(&dir, name, &effective)?;
         self.collections.write().insert(name.to_string(), store);
         Ok(())
     }
@@ -427,18 +427,14 @@ impl LocalVectorEngine {
         if let Err(error) = rename_result {
             if live_dir.exists() {
                 if let Ok(store) = CollectionStore::open(&live_dir) {
-                    self.collections
-                        .write()
-                        .insert(live.to_string(), Arc::new(store));
+                    self.collections.write().insert(live.to_string(), store);
                 } else if let Some(store) = live_store {
                     self.collections.write().insert(live.to_string(), store);
                 }
             } else if backup_dir.exists() {
                 let _ = std::fs::rename(&backup_dir, &live_dir);
                 if let Ok(store) = CollectionStore::open(&live_dir) {
-                    self.collections
-                        .write()
-                        .insert(live.to_string(), Arc::new(store));
+                    self.collections.write().insert(live.to_string(), store);
                 } else if let Some(store) = live_store {
                     self.collections.write().insert(live.to_string(), store);
                 }
@@ -448,9 +444,7 @@ impl LocalVectorEngine {
             return Err(error);
         }
         let store = CollectionStore::open(&live_dir)?;
-        self.collections
-            .write()
-            .insert(live.to_string(), Arc::new(store));
+        self.collections.write().insert(live.to_string(), store);
         // Keep the backup handle loaded for inspection (`count`, reverse
         // recovery) without exposing it to search: nothing routes to
         // `.old-*` names and `collection_names` hides them.
@@ -458,7 +452,7 @@ impl LocalVectorEngine {
             if let Ok(backup_store) = CollectionStore::open(&backup_dir) {
                 self.collections
                     .write()
-                    .insert(backup_name.clone(), Arc::new(backup_store));
+                    .insert(backup_name.clone(), backup_store);
             }
         }
         self.prune_old_backups(live, Some(&backup_name));
@@ -491,9 +485,7 @@ impl LocalVectorEngine {
         }
         std::fs::rename(&backup_dir, &live_dir)?;
         let store = CollectionStore::open(&live_dir)?;
-        self.collections
-            .write()
-            .insert(live.to_string(), Arc::new(store));
+        self.collections.write().insert(live.to_string(), store);
         Ok(backup_name)
     }
 
@@ -789,11 +781,18 @@ impl LocalVectorEngine {
     /// Commit protocol entry for coordinated transactions.
     ///
     /// Ops are grouped by collection and each collection receives one WAL
-    /// transaction carrying `txn_id`. Collections are processed in
-    /// lexicographic order so a crash always advances the per-collection water
-    /// marks in a deterministic order. Replay is idempotent, so graph WAL
-    /// replay may re-apply the same txn id without double-applying data.
-    pub fn apply_txn(&self, txn_id: u64, ops: Vec<TxnOp>) -> Result<()> {
+    /// transaction. Collections are processed in lexicographic order so a
+    /// crash always advances the per-collection water marks in a
+    /// deterministic order. Replay is idempotent, so graph WAL replay may
+    /// re-apply the same ops without double-applying data.
+    ///
+    /// The caller's transaction id is intentionally not carried into the
+    /// per-collection logs: each collection assigns its own log sequence
+    /// numbers, which is what keeps the log order, the apply order and the
+    /// slot numbering of every collection consistent on its own. No atomicity
+    /// is promised across collections — a crash can leave one collection
+    /// committed and another not, and replay converges each one.
+    pub fn apply_txn(&self, ops: Vec<TxnOp>) -> Result<()> {
         let mut by_collection: HashMap<String, Vec<WalRecord>> = HashMap::new();
         for op in ops {
             match op {
@@ -818,7 +817,7 @@ impl LocalVectorEngine {
         for name in names {
             let ops = by_collection.remove(&name).expect("key present");
             let store = self.store(&name)?;
-            store.apply_txn(&WalTxn { txn_id, ops })?;
+            store.apply_txn(&ops)?;
             self.maybe_schedule_compaction(&name, &store);
         }
         Ok(())
@@ -1969,7 +1968,7 @@ mod tests {
                 point_id: "42".to_string(),
             },
         ];
-        engine.apply_txn(7, ops).unwrap();
+        engine.apply_txn(ops).unwrap();
 
         assert_eq!(engine.count("col_a").unwrap(), 1);
         assert_eq!(engine.count("col_b").unwrap(), 1);
@@ -1977,13 +1976,10 @@ mod tests {
 
         // Replaying the same txn id is idempotent.
         engine
-            .apply_txn(
-                7,
-                vec![TxnOp::Upsert {
-                    collection: "col_a".to_string(),
-                    point: point(2, 4),
-                }],
-            )
+            .apply_txn(vec![TxnOp::Upsert {
+                collection: "col_a".to_string(),
+                point: point(2, 4),
+            }])
             .unwrap();
         assert_eq!(engine.count("col_a").unwrap(), 1);
     }
@@ -1992,13 +1988,10 @@ mod tests {
     fn test_apply_txn_unknown_collection() {
         let engine = engine();
         let err = engine
-            .apply_txn(
-                1,
-                vec![TxnOp::Upsert {
-                    collection: "nope".to_string(),
-                    point: point(1, 4),
-                }],
-            )
+            .apply_txn(vec![TxnOp::Upsert {
+                collection: "nope".to_string(),
+                point: point(1, 4),
+            }])
             .unwrap_err();
         assert!(matches!(err, VectorSearchError::CollectionNotFound(_)));
     }
@@ -2008,13 +2001,10 @@ mod tests {
         let engine = engine();
         engine.create_collection("col", &config(4)).unwrap();
         let err = engine
-            .apply_txn(
-                1,
-                vec![TxnOp::Upsert {
-                    collection: "col".to_string(),
-                    point: VectorPoint::new(1u64, vec![1.0, 2.0]),
-                }],
-            )
+            .apply_txn(vec![TxnOp::Upsert {
+                collection: "col".to_string(),
+                point: VectorPoint::new(1u64, vec![1.0, 2.0]),
+            }])
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2034,13 +2024,10 @@ mod tests {
             let engine = LocalVectorEngine::open(&root).unwrap();
             engine.create_collection("col", &config(4)).unwrap();
             engine
-                .apply_txn(
-                    3,
-                    vec![TxnOp::Upsert {
-                        collection: "col".to_string(),
-                        point: point(1, 4),
-                    }],
-                )
+                .apply_txn(vec![TxnOp::Upsert {
+                    collection: "col".to_string(),
+                    point: point(1, 4),
+                }])
                 .unwrap();
             engine.upsert("col", point(2, 4)).unwrap();
             engine.delete("col", "2").unwrap();

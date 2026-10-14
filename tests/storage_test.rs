@@ -20,6 +20,28 @@ fn point(id: u64, dim: usize) -> VectorPoint {
     )
 }
 
+/// Upsert through the WAL-backed path, which is the only write path the
+/// engine uses: the log carries the payload so derived files can stay
+/// unsynced until a checkpoint.
+fn upsert_logged(store: &CollectionStore, point: &VectorPoint) {
+    store
+        .apply_ops(&[WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(point).unwrap(),
+        }])
+        .unwrap();
+}
+
+/// Delete through the WAL-backed path. Returns whether the id was live.
+fn delete_logged(store: &CollectionStore, id: &PointId) -> bool {
+    let existed = store.get(id).unwrap().is_some();
+    store
+        .apply_ops(&[WalRecord::Delete {
+            point_id: id.to_string(),
+        }])
+        .unwrap();
+    existed
+}
+
 /// Batch upsert through the WAL-backed apply path: one WAL append and one
 /// meta.bin save for the whole batch instead of per-point saves.
 fn upsert_batch(store: &CollectionStore, ids: impl IntoIterator<Item = u64>, dim: usize) {
@@ -39,25 +61,19 @@ fn test_apply_txn_roundtrip_and_replay() {
     let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
 
     store
-        .apply_txn(&WalTxn {
-            txn_id: 1,
-            ops: vec![
-                WalRecord::Upsert {
-                    point: simvec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
-                },
-                WalRecord::Upsert {
-                    point: simvec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
-                },
-            ],
-        })
+        .apply_txn(&[
+            WalRecord::Upsert {
+                point: simvec::storage::WalPoint::from_point(&point(1, 4)).unwrap(),
+            },
+            WalRecord::Upsert {
+                point: simvec::storage::WalPoint::from_point(&point(2, 4)).unwrap(),
+            },
+        ])
         .unwrap();
     store
-        .apply_txn(&WalTxn {
-            txn_id: 2,
-            ops: vec![WalRecord::Delete {
-                point_id: "1".to_string(),
-            }],
-        })
+        .apply_txn(&[WalRecord::Delete {
+            point_id: "1".to_string(),
+        }])
         .unwrap();
 
     assert_eq!(store.count(), 1);
@@ -81,7 +97,7 @@ fn test_wal_written_memory_not_applied_recovers() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col");
     let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
-    store.upsert(&point(1, 4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
     drop(store);
 
     // Simulate a crash between "WAL fsync" and "apply to memory": append
@@ -122,8 +138,8 @@ fn test_replay_is_idempotent_for_duplicate_txns() {
         }],
     };
     // Same txn applied twice (crash + coordinator retry semantics).
-    store.apply_txn(&txn).unwrap();
-    store.apply_txn(&txn).unwrap();
+    store.apply_txn(&txn.ops).unwrap();
+    store.apply_txn(&txn.ops).unwrap();
     assert_eq!(store.count(), 1, "re-applying an upsert must not duplicate");
 
     let del = WalTxn {
@@ -132,8 +148,8 @@ fn test_replay_is_idempotent_for_duplicate_txns() {
             point_id: "1".to_string(),
         }],
     };
-    store.apply_txn(&del).unwrap();
-    store.apply_txn(&del).unwrap();
+    store.apply_txn(&del.ops).unwrap();
+    store.apply_txn(&del.ops).unwrap();
     assert_eq!(store.count(), 0, "re-applying a delete is a no-op");
 }
 
@@ -145,12 +161,9 @@ fn test_apply_txn_rejects_invalid_before_wal_append() {
 
     let bad = VectorPoint::new(1u64, vec![1.0, 2.0]); // wrong dim
     let err = store
-        .apply_txn(&WalTxn {
-            txn_id: 1,
-            ops: vec![WalRecord::Upsert {
-                point: simvec::storage::WalPoint::from_point(&bad).unwrap(),
-            }],
-        })
+        .apply_txn(&[WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(&bad).unwrap(),
+        }])
         .unwrap_err();
     assert!(matches!(
         err,
@@ -176,7 +189,7 @@ fn test_compact_rebuilds_and_search_stays_correct() {
     // Delete some points (below the 20% threshold: 4/20 = 20%, threshold is
     // strictly greater, so no auto-compaction).
     for i in [3u64, 7, 11, 15] {
-        assert!(store.delete(&PointId::Num(i)).unwrap());
+        assert!(delete_logged(&store, &PointId::Num(i)));
     }
     assert_eq!(store.count(), 16);
     let meta = store.meta();
@@ -222,14 +235,14 @@ fn test_compact_with_payloads_and_no_auto_trigger() {
     payload.insert("color".to_string(), serde_json::json!("red"));
     let mut p = point(1, 2);
     p.payload = Some(payload.clone());
-    store.upsert(&p).unwrap();
+    upsert_logged(&store, &p);
     let mut p2 = point(2, 2);
     let mut payload2 = HashMap::new();
     payload2.insert("color".to_string(), serde_json::json!("blue"));
     p2.payload = Some(payload2.clone());
-    store.upsert(&p2).unwrap();
+    upsert_logged(&store, &p2);
 
-    assert!(store.delete(&PointId::Num(1)).unwrap());
+    assert!(delete_logged(&store, &PointId::Num(1)));
     // The tombstone is visible immediately and reclaimed by an explicit
     // compaction (the engine schedules the same work in the background).
     let meta = store.meta();
@@ -254,7 +267,7 @@ fn test_compact_checkpoint_truncates_wal() {
     let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
     upsert_batch(&store, 0..6, 4);
     for i in 0..2u64 {
-        assert!(store.delete(&PointId::Num(i)).unwrap());
+        assert!(delete_logged(&store, &PointId::Num(i)));
     }
     store.compact().unwrap();
     // A compaction checkpoint truncates the WAL.
@@ -271,7 +284,7 @@ fn test_grow_after_compact() {
     let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
     upsert_batch(&store, 0..40, 4);
     for i in 0..20u64 {
-        assert!(store.delete(&PointId::Num(i)).unwrap());
+        assert!(delete_logged(&store, &PointId::Num(i)));
     }
     assert_eq!(store.count(), 20);
 
@@ -279,7 +292,7 @@ fn test_grow_after_compact() {
     upsert_batch(&store, 40..120, 4);
     assert_eq!(store.count(), 100);
     // A couple of individual upserts keep single-write growth covered.
-    store.upsert(&point(200, 4)).unwrap();
+    upsert_logged(&store, &point(200, 4));
     assert_eq!(store.count(), 101);
     for i in 40..120u64 {
         assert_eq!(
@@ -294,8 +307,7 @@ fn test_grow_after_compact() {
 fn compaction_under_concurrent_writes_stays_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col");
-    let store =
-        std::sync::Arc::new(CollectionStore::create(&store_dir, "col", &config(4)).unwrap());
+    let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
 
     // Writer: each round appends 8 fresh ids then deletes the first 4 of the
     // same round (one WAL-backed batch per phase), so tombstones keep
@@ -308,7 +320,7 @@ fn compaction_under_concurrent_writes_stays_consistent() {
             for r in 0..ROUNDS {
                 upsert_batch(&store, r * 8..r * 8 + 8, 4);
                 for j in 0..4u64 {
-                    assert!(store.delete(&PointId::Num(r * 8 + j)).unwrap());
+                    assert!(delete_logged(&store, &PointId::Num(r * 8 + j)));
                 }
             }
         })

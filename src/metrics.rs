@@ -8,13 +8,16 @@
 //!
 //! Instrumented paths, per collection:
 //! - mutations: applied transactions, upserted/deleted points, apply latency
-//!   (dominated by the WAL fsync inside the store write lock)
+//!   (the in-memory/mmap apply of one transaction on the commit-queue
+//!   worker; the WAL fsync it waits for is billed to the writer instead)
 //! - searches: exact/IVF/HNSW path split, filtered queries, latency, and the
 //!   accuracy-fallback retries that signal recall degradation under filters
 //! - index lifecycle: build counts and latencies per tier, load-time
 //!   fallbacks to exact scan
 //! - compaction: commits, race retries, contended write-lock fallbacks,
 //!   latency
+//! - commit queue: group-commit flush counts and group size, queue depth, and
+//!   cumulative writer wait time
 //! - lock contention: adjacency/list write-lock acquisition counts and wait
 //!   times (compiled in only with the `lock-metrics` feature, off by
 //!   default), plus the version-double-read reloads observed on the HNSW
@@ -227,6 +230,16 @@ pub struct Metrics {
 
     checkpoints: AtomicU64,
     checkpoint_latency: PowerLatencyHistogram,
+
+    /// WAL batch flushes. Paired with `wal_txns_flushed` this is the group
+    /// size: a ratio above 1 means concurrent writers shared an fsync.
+    wal_flushes: AtomicU64,
+    /// Transactions carried by those flushes.
+    wal_txns_flushed: AtomicU64,
+    /// Queue depth observed at the last flush (gauge).
+    apply_queue_depth: AtomicU64,
+    /// Cumulative time writers spent waiting for flush + apply, nanoseconds.
+    apply_wait_nanos: AtomicU64,
 }
 
 impl Metrics {
@@ -358,6 +371,25 @@ impl Metrics {
         self.checkpoint_latency.record(elapsed.as_nanos() as u64);
     }
 
+    /// Record one group-commit flush: `txns` transactions shared a single
+    /// WAL fsync.
+    pub fn record_wal_flush(&self, txns: usize) {
+        self.wal_flushes.fetch_add(1, Ordering::Relaxed);
+        self.wal_txns_flushed
+            .fetch_add(txns as u64, Ordering::Relaxed);
+    }
+
+    /// Record the commit-queue depth observed when a flush started.
+    pub fn record_apply_queue_depth(&self, depth: u64) {
+        self.apply_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Record how long one writer waited between enqueue and apply.
+    pub fn record_apply_wait(&self, waited: Duration) {
+        self.apply_wait_nanos
+            .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     /// Take a point-in-time snapshot. Counters may be slightly skewed
     /// relative to each other under concurrent recording.
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -400,6 +432,11 @@ impl Metrics {
 
             checkpoints: self.checkpoints.load(Ordering::Relaxed),
             checkpoint: self.checkpoint_latency.summary(),
+
+            wal_flushes: self.wal_flushes.load(Ordering::Relaxed),
+            wal_txns_flushed: self.wal_txns_flushed.load(Ordering::Relaxed),
+            apply_queue_depth: self.apply_queue_depth.load(Ordering::Relaxed),
+            apply_wait_nanos: self.apply_wait_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -411,7 +448,9 @@ pub struct MetricsSnapshot {
     pub txns_applied: u64,
     pub points_upserted: u64,
     pub points_deleted: u64,
-    /// Apply latency includes the WAL fsync inside the store write lock.
+    /// Apply latency of one transaction on the commit-queue worker. The WAL
+    /// fsync that precedes it is shared by the whole batch and is billed to
+    /// the writers through `apply_wait_nanos`.
     pub apply_txn: LatencySummary,
 
     // Searches.
@@ -465,6 +504,16 @@ pub struct MetricsSnapshot {
     // WAL checkpoints.
     pub checkpoints: u64,
     pub checkpoint: LatencySummary,
+
+    // Commit queue.
+    /// WAL batch flushes. Compare with `wal_txns_flushed` for the group size.
+    pub wal_flushes: u64,
+    /// Transactions carried by those flushes.
+    pub wal_txns_flushed: u64,
+    /// Queue depth observed at the last flush (gauge, not a counter).
+    pub apply_queue_depth: u64,
+    /// Cumulative time writers spent waiting for flush + apply, nanoseconds.
+    pub apply_wait_nanos: u64,
 }
 
 #[cfg(test)]

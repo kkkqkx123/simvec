@@ -29,6 +29,26 @@ fn color_point(i: u64, dim: usize, color: &str) -> VectorPoint {
     unit(i, dim).with_payload_kv("color", serde_json::json!(color))
 }
 
+/// Delete through the WAL-backed path. Returns whether the id was live.
+fn delete_logged(store: &CollectionStore, id: &PointId) -> bool {
+    let existed = store.get(id).unwrap().is_some();
+    store
+        .apply_ops(&[simvec::storage::WalRecord::Delete {
+            point_id: id.to_string(),
+        }])
+        .unwrap();
+    existed
+}
+
+/// Upsert through the WAL-backed path.
+fn upsert_logged(store: &CollectionStore, point: &VectorPoint) {
+    store
+        .apply_ops(&[simvec::storage::WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(point).unwrap(),
+        }])
+        .unwrap();
+}
+
 fn seed(store: &CollectionStore, n: u64, dim: usize, with_color: bool) {
     // One WAL-backed batch: a single WAL append + meta save for the seed set.
     let points: Vec<VectorPoint> = (0..n)
@@ -325,8 +345,8 @@ fn test_deleted_points_are_skipped() {
     )
     .unwrap();
     seed(&store, 10, 8, false);
-    store.delete(&PointId::Num(3)).unwrap();
-    store.delete(&PointId::Num(7)).unwrap();
+    delete_logged(&store, &PointId::Num(3));
+    delete_logged(&store, &PointId::Num(7));
 
     let query = unit(3, 8).vector;
     let results = store.search(&SearchQuery::new(query.clone(), 10)).unwrap();
@@ -351,7 +371,7 @@ fn test_search_after_compaction() {
     .unwrap();
     seed(&store, 20, 8, false);
     for i in 0..5u64 {
-        store.delete(&PointId::Num(i)).unwrap();
+        delete_logged(&store, &PointId::Num(i));
     }
     // Tombstoned slots stay invisible immediately; physical reclamation is
     // explicit here (the engine schedules it in the background).
@@ -413,7 +433,7 @@ fn test_nested_filter_and_geo() {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect(),
     );
-    store.upsert(&p).unwrap();
+    upsert_logged(&store, &p);
     let mut p2 = unit(2, 4);
     p2.payload = Some(
         serde_json::json!({
@@ -426,7 +446,7 @@ fn test_nested_filter_and_geo() {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect(),
     );
-    store.upsert(&p2).unwrap();
+    upsert_logged(&store, &p2);
 
     let nested = VectorFilter::new().must(FilterCondition::new(
         "addresses",

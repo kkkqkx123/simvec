@@ -247,7 +247,6 @@ fn filter_selectivity(c: &mut Criterion) {
         .collect();
     engine
         .apply_txn(
-            1,
             points
                 .iter()
                 .map(|p| TxnOp::Upsert {
@@ -316,15 +315,12 @@ fn upsert_wal(c: &mut Criterion) {
         .collect();
     group.bench_function("single", |b| {
         b.iter(|| {
-            let (txn_id, point) = &single[rng.gen_range(0..single.len())];
+            let (_, point) = &single[rng.gen_range(0..single.len())];
             engine
-                .apply_txn(
-                    *txn_id,
-                    vec![TxnOp::Upsert {
-                        collection: collection.to_string(),
-                        point: point.clone(),
-                    }],
-                )
+                .apply_txn(vec![TxnOp::Upsert {
+                    collection: collection.to_string(),
+                    point: point.clone(),
+                }])
                 .unwrap();
             black_box(())
         })
@@ -341,10 +337,8 @@ fn upsert_wal(c: &mut Criterion) {
         .enumerate()
         .map(|(i, v)| VectorPoint::new(format!("b{i}"), v.clone()))
         .collect();
-    let mut batch_txn = 0u64;
     group.bench_function("batch_100", |b| {
         b.iter(|| {
-            batch_txn += 1;
             let ops: Vec<TxnOp> = batch_points
                 .iter()
                 .map(|p| TxnOp::Upsert {
@@ -352,7 +346,7 @@ fn upsert_wal(c: &mut Criterion) {
                     point: p.clone(),
                 })
                 .collect();
-            engine.apply_txn(batch_txn, ops).unwrap();
+            engine.apply_txn(ops).unwrap();
             black_box(())
         })
     });

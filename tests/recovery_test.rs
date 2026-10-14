@@ -24,28 +24,19 @@ fn test_reopen_replays_wal_exactly_once() {
     {
         let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 1,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(1)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(1)).unwrap(),
+            }])
             .unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 2,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(2)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(2)).unwrap(),
+            }])
             .unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 3,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(3)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(3)).unwrap(),
+            }])
             .unwrap();
     }
 
@@ -66,20 +57,17 @@ fn test_replay_delete_batch_and_compact_marker() {
     {
         let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 1,
-                ops: vec![
-                    WalRecord::Upsert {
-                        point: WalPoint::from_point(&point(1)).unwrap(),
-                    },
-                    WalRecord::Upsert {
-                        point: WalPoint::from_point(&point(2)).unwrap(),
-                    },
-                    WalRecord::Upsert {
-                        point: WalPoint::from_point(&point(3)).unwrap(),
-                    },
-                ],
-            })
+            .apply_txn(&[
+                WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(1)).unwrap(),
+                },
+                WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(2)).unwrap(),
+                },
+                WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(3)).unwrap(),
+                },
+            ])
             .unwrap();
     }
 
@@ -120,20 +108,14 @@ fn test_partial_wal_record_is_tolerated() {
     {
         let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 1,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(1)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(1)).unwrap(),
+            }])
             .unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 2,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(2)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(2)).unwrap(),
+            }])
             .unwrap();
     }
 
@@ -162,12 +144,9 @@ fn test_upsert_overwrite_after_replay_does_not_duplicate() {
     {
         let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 1,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(1)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(1)).unwrap(),
+            }])
             .unwrap();
     }
 
@@ -203,12 +182,9 @@ fn test_replay_reconciles_stale_meta_counts() {
     {
         let store = CollectionStore::create(&store_dir, "col", &config()).unwrap();
         store
-            .apply_txn(&WalTxn {
-                txn_id: 1,
-                ops: vec![WalRecord::Upsert {
-                    point: WalPoint::from_point(&point(1)).unwrap(),
-                }],
-            })
+            .apply_txn(&[WalRecord::Upsert {
+                point: WalPoint::from_point(&point(1)).unwrap(),
+            }])
             .unwrap();
         // Crash window: WAL written but meta.bin not yet persisted with the
         // live_count bump. Append directly to the WAL.

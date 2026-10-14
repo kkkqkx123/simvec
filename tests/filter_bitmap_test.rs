@@ -73,6 +73,26 @@ fn upsert_batch(store: &CollectionStore, points: &[VectorPoint]) {
     store.apply_ops(&ops).unwrap();
 }
 
+/// Delete through the WAL-backed path. Returns whether the id was live.
+fn delete_logged(store: &CollectionStore, id: &PointId) -> bool {
+    let existed = store.get(id).unwrap().is_some();
+    store
+        .apply_ops(&[simvec::storage::WalRecord::Delete {
+            point_id: id.to_string(),
+        }])
+        .unwrap();
+    existed
+}
+
+/// Upsert through the WAL-backed path.
+fn upsert_logged(store: &CollectionStore, point: &VectorPoint) {
+    store
+        .apply_ops(&[simvec::storage::WalRecord::Upsert {
+            point: simvec::storage::WalPoint::from_point(point).unwrap(),
+        }])
+        .unwrap();
+}
+
 /// Oracle: sort ids by descending score to `query_vector` among `ids` and
 /// return them in rank order.
 fn oracle(query_vector: &[f32], ids: &[u64]) -> Vec<u64> {
@@ -199,10 +219,10 @@ fn test_filter_bitmap_after_compaction() {
         .unwrap();
         for i in 0..20u64 {
             let tag = if i < 5 { "red" } else { "blue" };
-            store.upsert(&blob_point(i, &unit(i, DIM), tag)).unwrap();
+            upsert_logged(&store, &blob_point(i, &unit(i, DIM), tag));
         }
         for i in 0..5u64 {
-            store.delete(&PointId::Num(i)).unwrap();
+            delete_logged(&store, &PointId::Num(i));
         }
         store.compact().unwrap();
     }
@@ -231,7 +251,7 @@ fn test_overwrite_changes_bitmap_membership() {
         &config(DistanceMetric::Cosine, DIM).with_index_type(simvec::types::IndexType::FLAT),
     )
     .unwrap();
-    store.upsert(&blob_point(0, &unit(0, DIM), "red")).unwrap();
+    upsert_logged(&store, &blob_point(0, &unit(0, DIM), "red"));
 
     let filter_red = VectorFilter::new().must(FilterCondition::match_value("tag", "red"));
     let filter_blue = VectorFilter::new().must(FilterCondition::match_value("tag", "blue"));
@@ -241,7 +261,7 @@ fn test_overwrite_changes_bitmap_membership() {
         .unwrap();
     assert_eq!(r.len(), 1, "red filter must find the point");
 
-    store.upsert(&blob_point(0, &unit(0, DIM), "blue")).unwrap();
+    upsert_logged(&store, &blob_point(0, &unit(0, DIM), "blue"));
     let r = store
         .search(&SearchQuery::new(unit(0, DIM), 5).with_filter(filter_red))
         .unwrap();
@@ -264,12 +284,10 @@ fn test_filter_bitmap_with_non_indexed_conditions() {
     .unwrap();
     for i in 0..10u64 {
         let price = (i + 1) as f64;
-        store
-            .upsert(
-                &VectorPoint::new(i, unit(i, DIM))
-                    .with_payload_kv("price", serde_json::json!(price)),
-            )
-            .unwrap();
+        upsert_logged(
+            &store,
+            &VectorPoint::new(i, unit(i, DIM)).with_payload_kv("price", serde_json::json!(price)),
+        );
     }
 
     let filter = VectorFilter::new().must(FilterCondition::range(
@@ -375,11 +393,10 @@ fn test_prefilter_bitmap_falls_back_for_complex_filter() {
     )
     .unwrap();
     for i in 0..10u64 {
-        store
-            .upsert(
-                &VectorPoint::new(i, unit(i, DIM)).with_payload_kv("tag", serde_json::json!("red")),
-            )
-            .unwrap();
+        upsert_logged(
+            &store,
+            &VectorPoint::new(i, unit(i, DIM)).with_payload_kv("tag", serde_json::json!("red")),
+        );
     }
 
     let filter = VectorFilter::new()

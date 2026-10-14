@@ -12,6 +12,10 @@
 //! the compaction falls back to rewriting while holding the write lock, so
 //! progress is always guaranteed. In both paths the `compact_mutex`
 //! excludes index builds/drains, keeping slot numbers stable for the index.
+//!
+//! The commit also truncates the WAL, so it gates the commit queue for its
+//! duration: a transaction that is queued or halfway through the queue
+//! worker would otherwise be cut out of the log it was just fsynced into.
 
 use std::fs::File;
 use std::io::Write;
@@ -276,6 +280,12 @@ impl CollectionStore {
             let version = self.mutations.load(AtomicOrdering::Relaxed);
             self.write_temp_files(&plan)?;
             {
+                // The commit truncates the WAL, so the queue is gated for its
+                // duration: no transaction may be queued or halfway through
+                // the worker while the log is cut. Writers keep flowing during
+                // the heavy rewrite above; the mutation counter still detects
+                // a write that raced it.
+                let _gate = self.queue.quiesce();
                 let mut inner = self.inner.write();
                 let raced = self.mutations.load(AtomicOrdering::Relaxed) != version
                     || inner.meta.next_slot != plan.next_slot
@@ -297,6 +307,7 @@ impl CollectionStore {
         // still holding both compact+build guards so no build races it.
         self.metrics.record_compaction_contended();
         let _build_guard = self.build_mutex.lock();
+        let _gate = self.queue.quiesce();
         let mut inner = self.inner.write();
         if inner.meta.tombstone_count == 0 || inner.meta.next_slot == 0 {
             return Ok(inner.meta.live_count);

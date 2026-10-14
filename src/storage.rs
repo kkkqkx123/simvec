@@ -7,14 +7,19 @@
 //! - `payloads.bin` slot -> payload blob directory + tombstone flags
 //! - `wal.bin`      append-only transaction log (crash recovery)
 //!
-//! Writes are serialized through the store's `RwLock`; readers snapshot the
-//! mmap-backed `ArcSwap` views and can scan without the lock afterwards.
-//! Mutations go through [`CollectionStore::apply_txn`]: the WAL is appended
-//! and fsync'ed before the transaction is applied to memory, so a crash at
-//! any point recovers by idempotent replay.
+//! Readers snapshot the mmap-backed `ArcSwap` views and scan without the
+//! store lock. Mutations go through the commit queue
+//! ([`CollectionStore::apply_txn`]): one short write-lock critical section
+//! assigns the lsn and the slots, the queue worker flushes the whole backlog
+//! with a single WAL fsync and then applies it in lsn order, and the caller
+//! returns only once its transaction is applied. A crash at any point
+//! recovers by idempotent replay in log order — which rebuilds exactly the
+//! slot numbering the live store used, because reserve and replay walk the
+//! log in the same order.
 //!
 //! This module hosts the store type itself plus its lifecycle and
 //! mutation/read paths; orthogonal concerns live in sibling modules:
+//! - [`queue`]       commit queue: group commit plus the single applier
 //! - [`tombstones`]   lock-free tombstone table
 //! - [`compaction`]   physical tombstone reclamation
 //! - [`index_lifecycle`]  ANN index load/build/publish/drop
@@ -31,15 +36,17 @@ mod payload_key;
 mod payload_store;
 mod payloads;
 pub(crate) mod quant;
+mod queue;
 mod search;
 mod tombstones;
 pub(crate) mod vectors;
 mod wal;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use bitvec::prelude::*;
@@ -56,6 +63,7 @@ use self::index_lifecycle::PublishedIndex;
 use self::keys::Keys;
 use self::payloads::Payloads;
 use self::quant::QuantStore;
+use self::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
 use self::vectors::Vectors;
 
 use crate::error::{Result, VectorSearchError};
@@ -85,6 +93,17 @@ const META_SAVE_INTERVAL: u64 = 64;
 struct StoreInner {
     meta: Meta,
     reverse: HashMap<PointId, u32>,
+    /// Slots handed out by the commit queue's reserve step for transactions
+    /// that are not applied yet. An id stays here from the moment its slot is
+    /// reserved until the applier writes the directory entry, so a concurrent
+    /// transaction upserting the same id reuses the slot instead of getting a
+    /// second one. The slot numbers are exactly the ones replay assigns,
+    /// because both walk the log in the same order.
+    reserved: HashMap<PointId, u32>,
+    /// Next log sequence number to hand out. Initialized above the water mark
+    /// replayed at open, so a replayed record can never collide with a new
+    /// one.
+    next_lsn: u64,
     /// IVF configuration for `IndexType::IVF` collections. Persisted in
     /// `meta.bin`; the engine may still override it at runtime via
     /// [`CollectionStore::set_ivf_config`].
@@ -95,6 +114,36 @@ struct StoreInner {
     filter_bitmap: FilterBitmap,
     /// Declared per-field payload indexes (MapIndex / NumericIndex).
     payload_indexes: PayloadIndexManager,
+}
+
+thread_local! {
+    /// True on the commit-queue worker thread: joining itself in `Drop` would
+    /// deadlock, so shutdown skips the join there.
+    static COMMIT_WORKER: Cell<bool> = const { Cell::new(false) };
+    /// True while the worker applies a batch. `apply_txn` must never run on
+    /// that thread: the worker is the only applier, so waiting for its own
+    /// batch would deadlock.
+    static APPLYING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn set_applying(value: bool) {
+    APPLYING.with(|applying| applying.set(value));
+}
+
+fn is_commit_worker() -> bool {
+    COMMIT_WORKER.with(|worker| worker.get())
+}
+
+fn set_commit_worker(value: bool) {
+    COMMIT_WORKER.with(|worker| worker.set(value));
+}
+
+/// Guard the invariant that the apply path never enqueues a transaction.
+fn assert_not_applying() {
+    debug_assert!(
+        !APPLYING.with(|applying| applying.get()),
+        "the commit-queue apply path must not enqueue transactions"
+    );
 }
 
 /// A single opened collection.
@@ -113,6 +162,13 @@ pub struct CollectionStore {
     /// quantization is disabled or not yet built.
     quant: parking_lot::RwLock<Option<QuantStore>>,
     wal: Wal,
+    /// Commit queue: group commit for the WAL plus the single applier thread.
+    /// Shared with that thread, which observes the store through a weak
+    /// reference so a dropped collection is never kept alive by it.
+    queue: Arc<CommitQueue>,
+    /// Weak self-reference, so the commit-queue worker can observe the store
+    /// without keeping it alive past the last user.
+    self_weak: Weak<CollectionStore>,
     /// Published ANN index; `None` = exact scan. Swapped atomically.
     index: ArcSwap<Option<PublishedIndex>>,
     /// Slots inserted while no index was published and a build was in
@@ -152,7 +208,7 @@ impl CollectionStore {
         dir: impl AsRef<Path>,
         collection: &str,
         config: &CollectionConfig,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         Self::create_with_segment_slots(dir, collection, config, meta::SEGMENT_SLOTS_DEFAULT)
     }
 
@@ -163,7 +219,7 @@ impl CollectionStore {
         collection: &str,
         config: &CollectionConfig,
         segment_slots: u32,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         validate_collection_name(collection)?;
         if config.vector_size == 0 {
             return Err(VectorSearchError::InvalidVectorDimension {
@@ -276,11 +332,14 @@ impl CollectionStore {
             &dir.join("payloads_store"),
             payload_store::StoreConfig::default(),
         )?;
-        Ok(Self {
+        Ok(Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
                 meta,
                 reverse: HashMap::new(),
+                reserved: HashMap::new(),
+                next_lsn: 1,
                 ivf_config: config.ivf_config.clone(),
                 last_drift_ratio: None,
                 filter_bitmap: FilterBitmap::with_capacity(slot_capacity as usize),
@@ -293,6 +352,7 @@ impl CollectionStore {
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: parking_lot::RwLock::new(quant),
             wal,
+            queue: Arc::new(CommitQueue::new()),
             index: ArcSwap::from(Arc::new(None)),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
@@ -304,12 +364,12 @@ impl CollectionStore {
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),
             metrics: Arc::new(Metrics::default()),
-        })
+        }))
     }
 
     /// Open an existing collection directory, rebuilding the id->slot map and
     /// replaying the WAL (idempotent).
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(dir: impl AsRef<Path>) -> Result<Arc<Self>> {
         let dir = dir.as_ref();
         for name in &["meta.bin", "vectors.bin", "keys.bin", "payloads.bin"] {
             let path = dir.join(name);
@@ -380,24 +440,30 @@ impl CollectionStore {
         };
 
         let payload_store = Some(PayloadStore::open(&payload_store_path)?);
+        let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let tombstones = ArcSwap::from(Arc::new(TombstoneBits::from_bits(tombstones)));
 
-        let store = Self {
+        let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
                 ivf_config: meta.ivf_config.clone(),
                 meta,
                 reverse,
+                reserved: HashMap::new(),
+                next_lsn: 1,
                 last_drift_ratio: None,
                 filter_bitmap,
                 payload_indexes,
             }),
-            tombstones: ArcSwap::from(Arc::new(TombstoneBits::from_bits(tombstones))),
+            tombstones,
             vectors,
             keys,
             payloads,
             payload_store: ArcSwap::from(Arc::new(payload_store)),
             quant: parking_lot::RwLock::new(quant),
-            wal: Wal::open_or_create(&dir.join("wal.bin"))?,
+            wal,
+            queue: Arc::new(CommitQueue::new()),
             index: ArcSwap::from(Arc::new(None)),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
@@ -409,7 +475,7 @@ impl CollectionStore {
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),
             metrics: Arc::new(Metrics::default()),
-        };
+        });
         store.replay_wal()?;
         store.load_index()?;
         Ok(store)
@@ -497,59 +563,70 @@ impl CollectionStore {
         )
     }
 
-    /// Upsert a point. Existing ids reuse their slot (overwrite); new ids get
-    /// the next free slot (growing capacity when needed).
+    /// Apply a WAL-backed transaction.
     ///
-    /// Raw apply without WAL: engine paths must use [`CollectionStore::apply_txn`]
-    /// so that mutations are crash-safe and recoverable by replay.
-    pub fn upsert(&self, point: &VectorPoint) -> Result<()> {
-        let mut inner = self.inner.write();
-        self.apply_upsert_locked(&mut inner, point)?;
-        inner.meta.save(&self.dir)?;
-        Ok(())
-    }
-
-    /// Delete a point by id (tombstone; physical removal happens on
-    /// compaction). Returns whether the point existed.
-    pub fn delete(&self, id: &PointId) -> Result<bool> {
-        let mut inner = self.inner.write();
-        let slot = match inner.reverse.remove(id) {
-            Some(slot) => slot,
-            None => return Ok(false),
-        };
-        self.apply_delete_slot_locked(&mut inner, slot)?;
-        // Physical reclamation is scheduled by the engine's maintenance
-        // worker once the tombstone ratio crosses the compaction threshold;
-        // reads already filter tombstoned slots.
-        Ok(true)
-    }
-
-    /// Apply a WAL-backed transaction:
+    /// Four steps, of which only two hold the store write lock:
     ///
-    /// 1. validate every op (no invalid data may be logged);
-    /// 2. append the whole `WalTxn` to `wal.bin` + fsync;
-    /// 3. apply to memory and the mmap files;
-    /// 4. persist `meta.bin` (with `last_applied_txn` advanced).
+    /// 1. **reserve** — validate every op (no invalid data may be logged) and
+    ///    resolve the slot for every upsert, in one short `inner.write()`
+    ///    critical section that also assigns the lsn and the queue position;
+    /// 2. **flush** — the commit-queue worker drains the whole backlog into
+    ///    one WAL batch, so concurrent writers share a single fsync;
+    /// 3. **apply** — the same worker applies the batch in lsn order under a
+    ///    short `inner.write()`;
+    /// 4. **complete** — the worker settles the ticket and wakes this caller.
     ///
-    /// On success the caller's buffer may be drained; on failure nothing was
-    /// applied in memory and the call may be retried (replay is idempotent).
-    pub fn apply_txn(&self, txn: &WalTxn) -> Result<()> {
-        let started = std::time::Instant::now();
+    /// Nothing is applied before its record is durable, and the call returns
+    /// only once the transaction is applied, so `get`/`search` see exactly
+    /// what a successful return promises.
+    pub fn apply_txn(&self, ops: &[WalRecord]) -> Result<()> {
+        assert_not_applying();
+        // Validation happens before anything is logged: a logged record that
+        // fails while being applied would sit in the WAL forever and make
+        // every later open fail.
         {
-            let mut inner = self.inner.write();
-            for op in &txn.ops {
+            let inner = self.inner.read();
+            for op in ops {
                 if let WalRecord::Upsert { point } = op {
-                    let point = point.to_point()?;
-                    validate_point(&inner.meta, &point)?;
+                    validate_point(&inner.meta, &point.to_point()?)?;
                 }
             }
-            validate_admission_locked(&inner, txn)?;
-            let prev_capacity = inner.meta.slot_capacity;
-            self.wal.append(txn)?;
-            self.apply_records_locked(&mut inner, &txn.ops)?;
-            // Monotonic water mark: late/duplicated txn ids must not regress
-            // the last applied txn id (replay is idempotent, so this is safe).
-            inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(txn.txn_id);
+        }
+        // Pass the queue gate before taking the store write lock: a
+        // checkpoint or compaction owns the WAL while it truncates the log,
+        // and a writer that blocked on the gate while holding the write lock
+        // could never let that pass finish.
+        let permit = self.queue.begin_write();
+        let enqueued = std::time::Instant::now();
+        let completion = {
+            let mut inner = self.inner.write();
+            validate_admission_locked(&inner, ops)?;
+            self.reserve_slots_locked(&mut inner, ops);
+            let lsn = inner.next_lsn;
+            inner.next_lsn = lsn + 1;
+            // The lsn, the slot reservations and the queue position are fixed
+            // in this one critical section: together they are the log order,
+            // and the worker applies in exactly that order.
+            CommitQueue::enqueue(&self.queue, &self.self_weak, lsn, ops.to_vec())?
+        };
+        drop(permit);
+        let outcome = completion.wait(APPLY_WAIT_TIMEOUT);
+        self.metrics.record_apply_wait(enqueued.elapsed());
+        outcome
+    }
+
+    /// Apply one queued transaction. Runs on the commit-queue worker, in lsn
+    /// order, after the transaction's WAL batch is durable.
+    pub(crate) fn apply_queued_txn(&self, lsn: u64, ops: &[WalRecord]) -> Result<()> {
+        let started = std::time::Instant::now();
+        let prev_capacity = self.inner.read().meta.slot_capacity;
+        {
+            let mut inner = self.inner.write();
+            self.apply_records_locked(&mut inner, ops)?;
+            // The lsn comes from the queue's monotonic counter, so this only
+            // ever advances; replay applies the same records in the same order
+            // and converges on the same water mark.
+            inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(lsn);
             // Only a capacity change must be persisted immediately:
             // `Vectors::open` rejects a file whose length disagrees with the
             // capacity in meta.bin, and that check runs before WAL replay can
@@ -566,23 +643,42 @@ impl CollectionStore {
                 self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
             }
         }
-        let (upserts, deletes) = count_ops(&txn.ops);
+        let (upserts, deletes) = count_ops(ops);
         self.metrics
             .record_apply_txn(upserts, deletes, started.elapsed());
         Ok(())
     }
 
-    /// Apply a WAL-backed batch of records with an auto-assigned txn id.
+    /// Reserve a slot for every upsert of a not-yet-applied id.
+    ///
+    /// Reservations are pure in-memory bookkeeping: nothing durable is
+    /// written here, so a reservation that never becomes a committed
+    /// transaction leaves no trace on disk. They exist so that two concurrent
+    /// transactions upserting the same new id agree on one slot, and so that
+    /// `max_points` admission stays exact before anything is logged.
+    fn reserve_slots_locked(&self, inner: &mut StoreInner, ops: &[WalRecord]) {
+        for op in ops {
+            let WalRecord::Upsert { point } = op else {
+                continue;
+            };
+            let id = PointId::from(point.id.as_str());
+            if inner.reverse.contains_key(&id) || inner.reserved.contains_key(&id) {
+                continue;
+            }
+            // Slots above the applied water mark are taken one per in-flight
+            // reservation, so the reserved numbers are exactly the ones replay
+            // assigns when it walks the same log order.
+            let slot = (inner.meta.next_slot + inner.reserved.len() as u64) as u32;
+            inner.reserved.insert(id, slot);
+        }
+    }
+
+    /// Apply a WAL-backed batch of records.
     ///
     /// This is the crash-safe path for single-collection operations exposed by
-    /// the engine; unlike [`CollectionStore::apply_txn`] the caller does not
-    /// coordinate a graph transaction id.
+    /// the engine; the log sequence number is assigned by the commit queue.
     pub fn apply_ops(&self, ops: &[WalRecord]) -> Result<()> {
-        let txn_id = self.inner.read().meta.last_applied_txn + 1;
-        self.apply_txn(&WalTxn {
-            txn_id,
-            ops: ops.to_vec(),
-        })
+        self.apply_txn(ops)
     }
 
     /// Delete every live point matching `filter`. Returns the number of
@@ -630,6 +726,9 @@ impl CollectionStore {
                 self.apply_records_locked(&mut inner, &txn.ops)?;
             }
             inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(last);
+            // Hand out lsns above the replayed water mark so a record that
+            // just replayed can never collide with a new one.
+            inner.next_lsn = inner.meta.last_applied_txn + 1;
             let live = inner.reverse.len() as u64;
             let tomb = self.tombstones.load().count_ones();
             let changed = inner.meta.live_count != live || inner.meta.tombstone_count != tomb;
@@ -691,18 +790,7 @@ impl CollectionStore {
 
     fn apply_upsert_locked(&self, inner: &mut StoreInner, point: &VectorPoint) -> Result<()> {
         validate_point(&inner.meta, point)?;
-
-        let slot = if let Some(slot) = inner.reverse.get(&point.id) {
-            *slot as u64
-        } else {
-            let slot = inner.meta.next_slot;
-            self.ensure_capacity(inner, slot + 1)?;
-            self.keys.append_key(slot as usize, &point.id.to_string())?;
-            inner.reverse.insert(point.id.clone(), slot as u32);
-            inner.meta.next_slot += 1;
-            inner.meta.live_count += 1;
-            slot
-        };
+        let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
 
         self.vectors.write_slot(slot, &point.vector)?;
         // Mirror the vector into quantized storage when ready.
@@ -727,6 +815,39 @@ impl CollectionStore {
         inner
             .payload_indexes
             .register_slot(slot as u32, point.payload.as_ref());
+        Ok(())
+    }
+
+    /// Resolve the slot an upsert writes to.
+    ///
+    /// A slot reserved by the commit queue's reserve step is filled in here:
+    /// the reservation fixed the number — so replay rebuilds the same one —
+    /// and this step writes the directory entry that makes the point visible.
+    /// Reads never observe an id before this point, because only `reverse`
+    /// publishes it.
+    fn resolve_upsert_slot_locked(&self, inner: &mut StoreInner, id: &PointId) -> Result<u64> {
+        if let Some(slot) = inner.reserved.remove(id) {
+            self.init_slot_locked(inner, id, slot)?;
+            return Ok(slot as u64);
+        }
+        if let Some(slot) = inner.reverse.get(id).copied() {
+            return Ok(slot as u64);
+        }
+        let slot = inner.meta.next_slot as u32;
+        self.init_slot_locked(inner, id, slot)?;
+        Ok(slot as u64)
+    }
+
+    /// Publish one new slot: grow the files if needed, write the id into
+    /// `keys.bin`, and record the mapping and the counters.
+    fn init_slot_locked(&self, inner: &mut StoreInner, id: &PointId, slot: u32) -> Result<()> {
+        self.ensure_capacity(inner, slot as u64 + 1)?;
+        self.keys.append_key(slot as usize, &id.to_string())?;
+        inner.reverse.insert(id.clone(), slot);
+        // A reserved slot can sit beyond the applied high-water mark; the mark
+        // only ever moves forward.
+        inner.meta.next_slot = inner.meta.next_slot.max(slot as u64 + 1);
+        inner.meta.live_count += 1;
         Ok(())
     }
 
@@ -771,6 +892,16 @@ impl CollectionStore {
             vector,
             payload,
         }))
+    }
+
+    /// Slot currently holding `id`, or `None` when it is absent or tombstoned.
+    ///
+    /// Exposed so tests (and operators) can verify that the live slot
+    /// numbering matches the one WAL replay rebuilds, which is the invariant
+    /// the commit queue exists to preserve.
+    pub fn slot_of(&self, id: &PointId) -> Option<u32> {
+        let slot = self.inner.read().reverse.get(id).copied()?;
+        (!self.tombstones.load().bit(slot as usize)).then_some(slot)
     }
 
     /// Number of live points.
@@ -1001,6 +1132,9 @@ impl CollectionStore {
     /// after ordinary mutations.
     pub fn checkpoint(&self) -> Result<u64> {
         let started = std::time::Instant::now();
+        // The log is truncated below, so no transaction may be queued — or
+        // halfway through the worker — while this runs.
+        let _gate = self.queue.quiesce();
         let inner = self.inner.write();
         // Payload store: dirty pages, block bitmask, slot→pointer table.
         let ps_guard = self.payload_store.load();
@@ -1296,6 +1430,12 @@ impl CollectionStore {
     }
 }
 
+impl Drop for CollectionStore {
+    fn drop(&mut self) {
+        self.queue.shutdown();
+    }
+}
+
 fn validate_point(meta: &Meta, point: &VectorPoint) -> Result<()> {
     if point.vector.len() != meta.vector_size {
         return Err(VectorSearchError::InvalidVectorDimension {
@@ -1315,29 +1455,29 @@ fn validate_point(meta: &Meta, point: &VectorPoint) -> Result<()> {
 /// the collection's optional [`max_points`](crate::types::CollectionConfig::max_points)
 /// cap.
 ///
-/// Admission has to close before `wal.append`: the log is authoritative, so a
-/// record that is guaranteed to fail while being applied would sit in the WAL
-/// forever and make every later `open` fail. Ids already present keep their
-/// slot, and a batch listing the same new id twice must only be counted once.
-fn validate_admission_locked(inner: &StoreInner, txn: &WalTxn) -> Result<()> {
+/// Admission has to close before the queue takes the transaction: the log is
+/// authoritative, so a record that is guaranteed to fail while being applied
+/// would sit in the WAL forever and make every later `open` fail. Ids already
+/// present keep their slot, an id reserved by an in-flight transaction keeps
+/// the slot that reservation took, and a batch listing the same new id twice
+/// must only be counted once.
+fn validate_admission_locked(inner: &StoreInner, ops: &[WalRecord]) -> Result<()> {
     let Some(cap) = inner.meta.max_points else {
         return Ok(());
     };
     let mut new_ids: HashSet<&str> = HashSet::new();
-    for op in &txn.ops {
+    for op in ops {
         let WalRecord::Upsert { point } = op else {
             continue;
         };
-        if inner
-            .reverse
-            .contains_key(&PointId::from(point.id.as_str()))
-        {
+        let id = PointId::from(point.id.as_str());
+        if inner.reverse.contains_key(&id) || inner.reserved.contains_key(&id) {
             continue;
         }
         if !new_ids.insert(point.id.as_str()) {
             continue;
         }
-        let needed = inner.meta.next_slot + new_ids.len() as u64;
+        let needed = inner.meta.next_slot + inner.reserved.len() as u64 + new_ids.len() as u64;
         if needed > cap {
             return Err(VectorSearchError::CapacityExceeded {
                 collection: inner.meta.collection.clone(),
@@ -1437,13 +1577,31 @@ mod tests {
             .unwrap();
     }
 
+    /// Delete through the WAL-backed path. Returns whether the id was live.
+    fn delete_logged(store: &CollectionStore, id: &PointId) -> bool {
+        let existed = store.get(id).unwrap().is_some();
+        store
+            .apply_ops(&[WalRecord::Delete {
+                point_id: id.to_string(),
+            }])
+            .unwrap();
+        existed
+    }
+
+    /// Result-returning upsert for the rejection tests.
+    fn upsert_logged_result(store: &CollectionStore, point: &VectorPoint) -> Result<()> {
+        store.apply_ops(&[WalRecord::Upsert {
+            point: WalPoint::from_point(point).unwrap(),
+        }])
+    }
+
     #[test]
     fn test_create_open_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_a");
         let store = CollectionStore::create(&store_dir, "col_a", &config(4)).unwrap();
-        store.upsert(&point(1, 4)).unwrap();
-        store.upsert(&point(2, 4)).unwrap();
+        upsert_logged(&store, &point(1, 4));
+        upsert_logged(&store, &point(2, 4));
         assert_eq!(store.count(), 2);
         drop(store);
 
@@ -1486,7 +1644,7 @@ mod tests {
         let store = CollectionStore::create(&store_dir, "col_pf", &config(2)).unwrap();
         let mut payload = HashMap::new();
         payload.insert("color".to_string(), serde_json::json!("red"));
-        store.upsert(&point_with_payload(1, 2, payload)).unwrap();
+        upsert_logged(&store, &point_with_payload(1, 2, payload));
 
         // Partial merge overwrites the given keys and preserves the rest.
         let fields: Payload = [
@@ -1534,7 +1692,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_r");
         let store = CollectionStore::create(&store_dir, "col_r", &config(2)).unwrap();
-        store.upsert(&point(1, 2)).unwrap();
+        upsert_logged(&store, &point(1, 2));
         store
             .set_payload_field(
                 &PointId::Num(1),
@@ -1623,7 +1781,7 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("keep".to_string(), serde_json::json!("yes"));
         p.insert("drop".to_string(), serde_json::json!("gone"));
-        store.upsert(&point_with_payload(1, 2, p.clone())).unwrap();
+        upsert_logged(&store, &point_with_payload(1, 2, p.clone()));
 
         let query = SearchQuery::new(vec![0.5, 0.5], 5)
             .with_payload_selector(PayloadSelector::include(vec!["keep".to_string()]));
@@ -1643,11 +1801,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_o");
         let store = CollectionStore::create(&store_dir, "col_o", &config(4)).unwrap();
-        store.upsert(&point(1, 4)).unwrap();
-        store.upsert(&point(2, 4)).unwrap();
+        upsert_logged(&store, &point(1, 4));
+        upsert_logged(&store, &point(2, 4));
 
         let overwritten = VectorPoint::new(1u64, vec![9.0; 4]);
-        store.upsert(&overwritten).unwrap();
+        upsert_logged(&store, &overwritten);
 
         assert_eq!(store.count(), 2, "overwrite must not grow live count");
         let got = store.get(&PointId::Num(1)).unwrap().unwrap();
@@ -1665,7 +1823,7 @@ mod tests {
 
         let total = 100u64;
         for i in 0..total {
-            store.upsert(&point(i, 4)).unwrap();
+            upsert_logged(&store, &point(i, 4));
         }
         assert_eq!(store.count(), total);
         let meta = store.meta();
@@ -1695,13 +1853,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_d");
         let store = CollectionStore::create(&store_dir, "col_d", &config(4)).unwrap();
-        store.upsert(&point(1, 4)).unwrap();
-        store.upsert(&point(2, 4)).unwrap();
-        store.upsert(&point(3, 4)).unwrap();
+        upsert_logged(&store, &point(1, 4));
+        upsert_logged(&store, &point(2, 4));
+        upsert_logged(&store, &point(3, 4));
 
-        assert!(store.delete(&PointId::Num(2)).unwrap());
+        assert!(delete_logged(&store, &PointId::Num(2)));
         assert!(
-            !store.delete(&PointId::Num(2)).unwrap(),
+            !delete_logged(&store, &PointId::Num(2)),
             "double delete is a no-op"
         );
         assert!(store.get(&PointId::Num(2)).unwrap().is_none());
@@ -1734,13 +1892,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_r");
         let store = CollectionStore::create(&store_dir, "col_r", &config(4)).unwrap();
-        store.upsert(&point(1, 4)).unwrap();
-        assert!(store.delete(&PointId::Num(1)).unwrap());
+        upsert_logged(&store, &point(1, 4));
+        assert!(delete_logged(&store, &PointId::Num(1)));
 
         // Without an intervening compaction the re-insert takes a fresh slot:
         // the stale tombstone stays pending and flags the collection for
         // background compaction, while visibility is already correct.
-        store.upsert(&point(1, 4)).unwrap();
+        upsert_logged(&store, &point(1, 4));
         assert_eq!(store.count(), 1);
         let meta = store.meta();
         assert_eq!(meta.next_slot, 2);
@@ -1756,7 +1914,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CollectionStore::create(dir.path().join("col_v"), "col_v", &config(4)).unwrap();
         let bad = VectorPoint::new(1u64, vec![1.0, 2.0]);
-        let err = store.upsert(&bad).unwrap_err();
+        let err = upsert_logged_result(&store, &bad).unwrap_err();
         assert!(matches!(
             err,
             VectorSearchError::InvalidVectorDimension {
@@ -1771,11 +1929,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CollectionStore::create(dir.path().join("col_n"), "col_n", &config(2)).unwrap();
         let bad = VectorPoint::new(1u64, vec![f32::NAN, 1.0]);
-        let err = store.upsert(&bad).unwrap_err();
+        let err = upsert_logged_result(&store, &bad).unwrap_err();
         assert!(matches!(err, VectorSearchError::NonFiniteElement(0)));
 
         let bad_inf = VectorPoint::new(1u64, vec![1.0, f32::INFINITY]);
-        let err = store.upsert(&bad_inf).unwrap_err();
+        let err = upsert_logged_result(&store, &bad_inf).unwrap_err();
         assert!(matches!(err, VectorSearchError::NonFiniteElement(1)));
     }
 
@@ -1821,7 +1979,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("col_c");
         let store = CollectionStore::create(&store_dir, "col_c", &config(4)).unwrap();
-        store.upsert(&point(1, 4)).unwrap();
+        upsert_logged(&store, &point(1, 4));
         drop(store);
 
         // Corrupt vectors.bin by truncating it.

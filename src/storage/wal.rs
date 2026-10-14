@@ -2,18 +2,27 @@
 //!
 //! Each record is `[u32 len][u32 crc32][postcard(WalTxn)]`; the checksum covers
 //! the encoded payload so a torn or bit-rotted record cannot be mistaken for a
-//! committed transaction. Appends are fsync'ed before the caller applies the
-//! transaction to memory. Replay is idempotent: upserts overwrite by point id,
-//! deletes of missing points are no-ops, and `Compact` checkpoints only advance
-//! the water mark. A truncated or checksum-failed final record (crash
-//! mid-append) stops the replay silently and is treated as end of log;
-//! anything else malformed is reported as `CorruptData`.
+//! committed transaction. Durability is one `write_all` + `sync_all` per
+//! *batch*: the commit queue (`super::queue`) hands its whole backlog to
+//! [`Wal::append_batch`], so concurrent writers share a single fsync — that
+//! shared fsync is what makes group commit actually group. Single-record
+//! appends (maintenance markers) go through the same batch path.
+//!
+//! A batch that fails at any point is rolled back to the offset it started
+//! at. Without the rollback a half-written record would sit in the middle of
+//! the log, and replay stops at the first checksum mismatch — silently
+//! discarding every record behind it.
+//!
+//! Replay is idempotent: upserts overwrite by point id, deletes of missing
+//! points are no-ops, and `Compact` checkpoints only advance the water mark.
+//! A truncated or checksum-failed final record (crash mid-append) stops the
+//! replay silently and is treated as end of log; anything else malformed is
+//! reported as `CorruptData`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
@@ -22,29 +31,21 @@ use crate::types::{PointId, VectorPoint};
 /// Maximum accepted single-record size (guards against corrupt length fields).
 const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
 
-/// State shared between concurrent appenders for group commit.
-struct CommitBatch {
-    /// Buffered record bytes waiting to be flushed.
-    buffer: Vec<u8>,
-    /// Number of appenders currently waiting in this batch.
-    pending: usize,
-    /// True if the leader is currently writing + fsyncing.
-    flushing: bool,
-    /// Set to Ok(()) after a successful flush, Err on failure.
-    result: std::result::Result<(), std::io::Error>,
-}
-
-/// Group commit state: multiple appenders share a single write+fsync.
-struct GroupCommit {
-    state: Mutex<CommitBatch>,
-    condvar: Condvar,
-}
-
 /// One transaction: a batch of operations applied atomically to a collection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalTxn {
     pub txn_id: u64,
     pub ops: Vec<WalRecord>,
+}
+
+/// Borrowed view of [`WalTxn`] for encoding a batch without cloning ops.
+///
+/// Field-for-field identical to the owned form, and postcard is a
+/// non-self-describing format, so both produce the same bytes.
+#[derive(Serialize)]
+struct WalTxnRef<'a> {
+    txn_id: u64,
+    ops: &'a [WalRecord],
 }
 
 /// A point as persisted in the WAL. The id is a string and the payload is
@@ -128,15 +129,18 @@ pub enum WalRecord {
     },
 }
 
-/// Append-only WAL file with group commit.
+/// Append-only WAL file. Every durable mutation goes through
+/// [`Wal::append_batch`], one write + one fsync per batch.
 pub struct Wal {
     path: PathBuf,
     file: parking_lot::Mutex<File>,
-    group: GroupCommit,
     /// Bytes physically appended since the last truncate. Drives the
     /// size-based checkpoint schedule: a pure-insert workload never crosses a
     /// tombstone ratio, so without it the log would grow without bound.
     appended_bytes: std::sync::atomic::AtomicU64,
+    /// Test-only: fail the next batch append, to exercise the failure paths.
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 impl Wal {
@@ -151,83 +155,79 @@ impl Wal {
         Ok(Self {
             path: path.to_path_buf(),
             file: parking_lot::Mutex::new(file),
-            group: GroupCommit {
-                state: Mutex::new(CommitBatch {
-                    buffer: Vec::new(),
-                    pending: 0,
-                    flushing: false,
-                    result: Ok(()),
-                }),
-                condvar: Condvar::new(),
-            },
             appended_bytes: std::sync::atomic::AtomicU64::new(existing),
+            #[cfg(test)]
+            fail_next_append: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Append a transaction using group commit: multiple concurrent appends
-    /// share a single write_all + fsync to reduce per-transaction disk latency.
+    /// Test-only: make the next batch append fail without writing anything,
+    /// the way a failing `write_all` or `sync_all` would.
+    #[cfg(test)]
+    pub fn fail_next_append_for_test(&self) {
+        self.fail_next_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Append a single transaction (one write + one fsync).
     pub fn append(&self, txn: &WalTxn) -> Result<()> {
-        let bytes = postcard::to_stdvec(txn)?;
-        if bytes.len() > MAX_RECORD_LEN as usize {
-            return Err(VectorSearchError::Internal(format!(
-                "wal record too large: {} bytes",
-                bytes.len()
-            )));
+        self.append_batch(&[(txn.txn_id, &txn.ops)])
+    }
+
+    /// Append a batch of transactions with a single `write_all` +
+    /// `sync_all`.
+    ///
+    /// The batch is the unit of group commit: everything handed in here shares
+    /// one fsync, so a batch's transactions all become durable together and
+    /// none of them is applied unless the whole batch is durable.
+    ///
+    /// On failure the batch is rolled back to the log length it started from.
+    /// Leaving a torn record behind would make every later replay stop at
+    /// that checksum mismatch and drop the rest of the log, so the rollback
+    /// is part of the failure contract, not an optimization.
+    pub fn append_batch(&self, batch: &[(u64, &[WalRecord])]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
-        let mut record = Vec::with_capacity(8 + bytes.len());
-        record.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        record.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-        record.extend_from_slice(&bytes);
-
-        let mut state = self.group.state.lock();
-        state.buffer.extend_from_slice(&record);
-        state.pending += 1;
-
-        // If someone is already flushing, wait for it.
-        while state.flushing {
-            self.group.condvar.wait(&mut state);
-        }
-
-        // If we are the leader (first to arrive or previous flush finished),
-        // perform the write + fsync for the entire batch.
-        if state.pending > 0 && !state.flushing {
-            state.flushing = true;
-            let batch_len = state.buffer.len();
-            let batch = std::mem::replace(&mut state.buffer, Vec::with_capacity(batch_len));
-            drop(state);
-
-            let write_result = {
-                let mut file = self.file.lock();
-                file.write_all(&batch).and_then(|_| file.sync_all())
-            };
-            if write_result.is_ok() {
-                self.appended_bytes
-                    .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut buffer = Vec::new();
+        for (txn_id, ops) in batch {
+            let bytes = postcard::to_stdvec(&WalTxnRef {
+                txn_id: *txn_id,
+                ops,
+            })?;
+            if bytes.len() > MAX_RECORD_LEN as usize {
+                return Err(VectorSearchError::Internal(format!(
+                    "wal record too large: {} bytes",
+                    bytes.len()
+                )));
             }
-
-            let mut state = self.group.state.lock();
-            state.flushing = false;
-            state.pending = 0;
-            state.result = write_result;
-            self.group.condvar.notify_all();
-
-            return match &state.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string()).into()),
-            };
+            buffer.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+            buffer.extend_from_slice(&bytes);
         }
 
-        // We are a follower: wait for the leader to finish.
-        loop {
-            self.group.condvar.wait(&mut state);
-            if !state.flushing {
-                break;
-            }
+        let mut file = self.file.lock();
+        #[cfg(test)]
+        if self
+            .fail_next_append
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(VectorSearchError::Internal(
+                "test-injected wal append failure".to_string(),
+            ));
         }
-        match &state.result {
-            Ok(()) => Ok(()),
-            Err(e) => Err(std::io::Error::new(e.kind(), e.to_string()).into()),
+        let start_len = file.metadata()?.len();
+        let write_result = file.write_all(&buffer).and_then(|_| file.sync_all());
+        if let Err(e) = write_result {
+            // Drop the partial batch so the log keeps a clean suffix.
+            let _ = file.set_len(start_len);
+            let _ = file.sync_all();
+            return Err(e.into());
         }
+        drop(file);
+        self.appended_bytes
+            .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Replay all records in order, invoking `f` for each decoded transaction.
