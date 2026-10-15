@@ -1657,7 +1657,16 @@ mod tests {
         engine.delete("col", "2").unwrap();
 
         let store = engine.store("col").unwrap();
-        assert!(store.needs_compaction());
+        // Deletes are visible the moment they return, so the caller never
+        // waits for the compaction they trigger. Whether the threshold still
+        // reads as "needs compaction" here is deliberately not asserted: the
+        // maintenance worker races this point and may already have drained
+        // it. The threshold itself is covered on the store path, which no
+        // background worker touches.
+        assert_eq!(store.count(), 7);
+        for id in 0..3u64 {
+            assert!(engine.get("col", &id.to_string()).unwrap().is_none());
+        }
 
         // The maintenance worker drains the queue promptly; poll briefly so
         // the test does not depend on exact thread scheduling.

@@ -110,7 +110,12 @@ struct QueueState {
     /// Set while a checkpoint / compaction critical section is draining or
     /// holding the queue: new writers wait, so no WAL append can interleave
     /// with the log truncate those sections perform.
-    quiescing: bool,
+    ///
+    /// Counted, never a flag: an explicit `compact_collection` call can race
+    /// the maintenance worker's checkpoint for the same collection, and the
+    /// first of the two finishing must not open the gate while the other is
+    /// still inside its log-truncate window.
+    quiescing: usize,
     /// Writers that passed the gate but have not enqueued yet. Quiescing
     /// waits for this to reach zero as well as for the queue to drain: a
     /// writer already inside the store write lock must never block on the
@@ -142,13 +147,37 @@ struct QueueState {
 
 /// Guard over a maintenance critical section (checkpoint / compaction).
 ///
-/// Dropping it — including while unwinding a panic — lets writers back in, so
-/// a failed maintenance pass cannot leave them blocked forever.
+/// Dropping it — including while unwinding a panic — releases one gate
+/// registration, so a failed maintenance pass cannot leave writers blocked
+/// forever.
 pub(crate) struct QuiesceGuard<'a>(&'a CommitQueue);
+
+impl<'a> QuiesceGuard<'a> {
+    /// Take one registration on the gate: writers stop entering from here.
+    fn register(queue: &'a CommitQueue) -> Self {
+        {
+            let mut state = queue.state.lock();
+            state.quiescing += 1;
+        }
+        Self(queue)
+    }
+
+    /// Block until no transaction is queued and no writer is on its way in.
+    fn wait_drained(&self) {
+        let mut state = self.0.state.lock();
+        while (state.in_flight > 0 || state.writers > 0) && !state.poisoned {
+            self.0.drained.wait(&mut state);
+        }
+    }
+}
 
 impl Drop for QuiesceGuard<'_> {
     fn drop(&mut self) {
-        self.0.open_gate();
+        {
+            let mut state = self.0.state.lock();
+            state.quiescing = state.quiescing.saturating_sub(1);
+        }
+        self.0.work.notify_all();
     }
 }
 
@@ -187,7 +216,7 @@ impl CommitQueue {
                 queue: VecDeque::new(),
                 waiters: Vec::new(),
                 in_flight: 0,
-                quiescing: false,
+                quiescing: 0,
                 writers: 0,
                 poisoned: false,
                 worker: None,
@@ -348,7 +377,7 @@ impl CommitQueue {
     /// Must be taken before the store write lock, never inside it.
     pub(crate) fn begin_write(&self) -> WritePermit<'_> {
         let mut state = self.state.lock();
-        while state.quiescing && !state.poisoned {
+        while state.quiescing > 0 && !state.poisoned {
             self.work.wait(&mut state);
         }
         state.writers += 1;
@@ -362,21 +391,12 @@ impl CommitQueue {
     /// A checkpoint or compaction truncates the WAL, so no transaction may be
     /// queued — or halfway through the worker — while it runs.
     pub(crate) fn quiesce(&self) -> QuiesceGuard<'_> {
-        {
-            let mut state = self.state.lock();
-            state.quiescing = true;
-            while (state.in_flight > 0 || state.writers > 0) && !state.poisoned {
-                self.drained.wait(&mut state);
-            }
-        }
-        QuiesceGuard(self)
-    }
-
-    fn open_gate(&self) {
-        let mut state = self.state.lock();
-        state.quiescing = false;
-        drop(state);
-        self.work.notify_all();
+        // Register first and wait second: a caller unwinding from the wait
+        // still releases its registration through the guard's `Drop`, so the
+        // gate cannot stay closed forever.
+        let guard = QuiesceGuard::register(self);
+        guard.wait_drained();
+        guard
     }
 
     /// Stop the worker and join it. Called from `CollectionStore::drop`.
@@ -406,7 +426,7 @@ impl CommitQueue {
     /// queue. Test-only observation hook.
     #[cfg(test)]
     pub(crate) fn quiescing(&self) -> bool {
-        self.state.lock().quiescing
+        self.state.lock().quiescing > 0
     }
 
     /// Whether the worker is parked on the test hold. Test-only observation
@@ -595,6 +615,31 @@ mod tests {
             .expect_err("poisoned queue fails its waiters");
         assert!(err.to_string().contains("injected"));
         assert!(queue.in_flight() == 0);
+    }
+
+    /// Two maintenance critical sections can overlap — an explicit
+    /// `compact_collection` call racing the maintenance worker's checkpoint
+    /// for the same collection. The first one finishing must not open the
+    /// gate on the second: writers entering there would append into a log the
+    /// surviving section is about to truncate.
+    #[test]
+    fn overlapping_maintenance_sections_keep_the_gate_closed() {
+        let queue = Arc::new(CommitQueue::new());
+        let first = queue.quiesce();
+        assert!(queue.quiescing(), "the first section closed the gate");
+        let second = queue.quiesce();
+
+        drop(first);
+        assert!(
+            queue.quiescing(),
+            "the surviving section still owns the gate"
+        );
+
+        drop(second);
+        assert!(!queue.quiescing(), "the gate reopens with the last section");
+        // Writers flow again once every section is gone.
+        let permit = queue.begin_write();
+        drop(permit);
     }
 
     /// Group commit is the point of the queue: with the backlog filled before
