@@ -642,6 +642,51 @@ mod tests {
         drop(permit);
     }
 
+    /// Real threads, no parking: the guard against a regression that moves the
+    /// WAL append back inside the store write lock.
+    ///
+    /// The parked test above proves the flush path batches a backlog, but says
+    /// nothing about whether writers can pile up at all — parking the worker
+    /// fills the queue regardless of what the write path looks like. If
+    /// enqueueing were serialized again, the backlog could never exceed one
+    /// transaction and the observed group size would collapse to 1, which is
+    /// what this test detects.
+    #[test]
+    fn real_writers_group_a_flush_without_being_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir.path().join("col"));
+        let before = store.metrics().snapshot();
+
+        const WRITERS: usize = 8;
+        const PER_WRITER: u64 = 15;
+        let start = Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for writer in 0..WRITERS as u64 {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for i in 0..PER_WRITER {
+                    let id = writer * 1_000 + i;
+                    store.apply_ops(&[upsert_op(&point(id))]).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let metrics = store.metrics().snapshot();
+        let txns = metrics.wal_txns_flushed - before.wal_txns_flushed;
+        let flushes = metrics.wal_flushes - before.wal_flushes;
+        assert_eq!(txns, WRITERS as u64 * PER_WRITER, "every txn was logged");
+        assert_eq!(store.count(), txns);
+        assert!(
+            flushes < txns,
+            "concurrent writers must share fsyncs, saw {flushes} flushes for {txns} txns"
+        );
+    }
+
     /// Group commit is the point of the queue: with the backlog filled before
     /// the worker wakes, the whole backlog must share one WAL fsync.
     #[test]

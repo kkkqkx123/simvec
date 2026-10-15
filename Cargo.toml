@@ -82,3 +82,7 @@ harness = false
 [[bench]]
 name = "distance_bench"
 harness = false
+
+[[bench]]
+name = "concurrent_write_bench"
+harness = false
