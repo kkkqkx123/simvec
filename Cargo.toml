@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Local vector search engine: exact scan, mmap storage, WAL"
 license = "Apache-2.0"
+repository = "https://github.com/kkkqkx123/simvec"
+homepage = "https://github.com/kkkqkx123/simvec"
 autobenches = false
 
 [lib]
