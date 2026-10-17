@@ -139,24 +139,14 @@ fn snap(metrics: &simvec::metrics::MetricsSnapshot) -> (u64, u64, u64, u64) {
     )
 }
 
-/// Store path: the commit queue and nothing else. No engine, no maintenance
-/// thread, no index build, so the queue's own effect is isolated. Payload-free
-/// on purpose: the engine modes below are where that cost belongs.
-fn run_store(dir: &PathBuf, writer_count: usize, total: usize) -> Report {
-    let store = CollectionStore::create(
-        dir,
-        "col",
-        &CollectionConfig::new(DIM, DistanceMetric::Cosine),
-    )
-    .unwrap();
-    let store = Arc::new(store);
-    let before = store.metrics().snapshot();
-    let (f0, t0, w0, a0) = snap(&before);
-
+/// Drive `total` transactions across `writer_count` threads against `store`,
+/// joining every writer. Shared by the warmup and measured phases so both
+/// exercise the identical concurrency shape.
+fn run_store_phase(store: &Arc<CollectionStore>, writer_count: usize, total: usize) {
     let start = Arc::new(std::sync::Barrier::new(writer_count));
     let mut handles = Vec::new();
     for w in 0..writer_count {
-        let store = Arc::clone(&store);
+        let store = Arc::clone(store);
         let start = Arc::clone(&start);
         handles.push(std::thread::spawn(move || {
             // The barrier puts every writer inside the queue at once: without
@@ -172,10 +162,34 @@ fn run_store(dir: &PathBuf, writer_count: usize, total: usize) -> Report {
             }
         }));
     }
-    let clock = Instant::now();
     for h in handles {
         h.join().unwrap();
     }
+}
+
+/// Store path: the commit queue and nothing else. No engine, no maintenance
+/// thread, no index build, so the queue's own effect is isolated. Payload-free
+/// on purpose: the engine modes below are where that cost belongs.
+///
+/// A warmup pass runs first and is discarded; it amortizes the first-batch
+/// payload serialization and any WAL/index growth so the measured pass reports
+/// steady state instead of a cold-start spike (the occasional single-writer
+/// stall reported earlier was indistinguishable from that cold start).
+fn run_store(dir: &PathBuf, writer_count: usize, total: usize) -> Report {
+    let store = CollectionStore::create(
+        dir,
+        "col",
+        &CollectionConfig::new(DIM, DistanceMetric::Cosine),
+    )
+    .unwrap();
+    let store = Arc::new(store);
+    run_store_phase(&store, writer_count, total);
+
+    let before = store.metrics().snapshot();
+    let (f0, t0, w0, a0) = snap(&before);
+
+    let clock = Instant::now();
+    run_store_phase(&store, writer_count, total);
     let total_ms = clock.elapsed().as_secs_f64() * 1000.0;
 
     let after = store.metrics().snapshot();
@@ -192,22 +206,19 @@ fn run_store(dir: &PathBuf, writer_count: usize, total: usize) -> Report {
     }
 }
 
-/// Engine path: the wrapper layer's shape. Adds the maintenance thread, the
-/// HNSW index build and the post-mutation repair, all of which compete for
-/// the same cores the overlapping was supposed to free.
-fn run_engine(dir: &PathBuf, writer_count: usize, total: usize, with_payload: bool) -> Report {
-    let engine = LocalVectorEngine::open(dir).unwrap();
-    engine
-        .create_collection("col", &CollectionConfig::new(DIM, DistanceMetric::Cosine))
-        .unwrap();
-    let before = engine.collection_metrics("col").unwrap();
-    let (f0, t0, w0, a0) = snap(&before);
-    let engine = Arc::new(engine);
-
+/// Drive `total` transactions across `writer_count` threads against `engine`,
+/// joining every writer. Shared by the warmup and measured phases so both
+/// exercise the identical concurrency shape.
+fn run_engine_phase(
+    engine: &Arc<LocalVectorEngine>,
+    writer_count: usize,
+    total: usize,
+    with_payload: bool,
+) {
     let start = Arc::new(std::sync::Barrier::new(writer_count));
     let mut handles = Vec::new();
     for w in 0..writer_count {
-        let engine = Arc::clone(&engine);
+        let engine = Arc::clone(engine);
         let start = Arc::clone(&start);
         handles.push(std::thread::spawn(move || {
             start.wait();
@@ -228,10 +239,32 @@ fn run_engine(dir: &PathBuf, writer_count: usize, total: usize, with_payload: bo
             }
         }));
     }
-    let clock = Instant::now();
     for h in handles {
         h.join().unwrap();
     }
+}
+
+/// Engine path: the wrapper layer's shape. Adds the maintenance thread, the
+/// HNSW index build and the post-mutation repair, all of which compete for
+/// the same cores the overlapping was supposed to free.
+///
+/// A warmup pass runs first and is discarded, amortizing the first-batch
+/// payload serialization and the HNSW index build so the measured pass reports
+/// steady state (the occasional single-writer stall reported earlier was
+/// indistinguishable from that cold start).
+fn run_engine(dir: &PathBuf, writer_count: usize, total: usize, with_payload: bool) -> Report {
+    let engine = LocalVectorEngine::open(dir).unwrap();
+    engine
+        .create_collection("col", &CollectionConfig::new(DIM, DistanceMetric::Cosine))
+        .unwrap();
+    let engine = Arc::new(engine);
+    run_engine_phase(&engine, writer_count, total, with_payload);
+
+    let before = engine.collection_metrics("col").unwrap();
+    let (f0, t0, w0, a0) = snap(&before);
+
+    let clock = Instant::now();
+    run_engine_phase(&engine, writer_count, total, with_payload);
     let total_ms = clock.elapsed().as_secs_f64() * 1000.0;
 
     let after = engine.collection_metrics("col").unwrap();
