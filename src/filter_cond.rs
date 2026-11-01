@@ -279,6 +279,25 @@ impl FilterCondition {
     }
 }
 
+/// Restricted filter value for OpenAPI documentation.
+///
+/// The JSON wire shape is identical to a plain JSON value. The untagged
+/// representation keeps runtime payloads unchanged while letting the schema
+/// expose candidate branches instead of an unknown array item.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+#[schema(no_recursion)]
+pub enum FilterValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    UInteger(u64),
+    Float(f64),
+    String(String),
+    Array(Vec<FilterValue>),
+    Object(std::collections::HashMap<String, FilterValue>),
+}
+
 /// Predicate of a [`FilterCondition`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[schema(no_recursion)]
@@ -289,7 +308,7 @@ pub enum ConditionType {
     },
     /// Match any of the given values (OR semantics).
     MatchAny {
-        #[schema(value_type = Vec<serde_json::Value>)]
+        #[schema(value_type = Vec<FilterValue>)]
         values: Vec<PayloadValue>,
     },
     /// Numeric range over the field value.
