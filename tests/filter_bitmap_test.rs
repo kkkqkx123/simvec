@@ -114,8 +114,7 @@ fn test_prefilter_bitmap_high_selectivity_recall() {
     let store = CollectionStore::create(
         dir.path().join("col"),
         "col",
-        &config(DistanceMetric::Cosine, DIM)
-            .with_hnsw(hnsw_config()),
+        &config(DistanceMetric::Cosine, DIM).with_hnsw(hnsw_config()),
     )
     .unwrap();
 

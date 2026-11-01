@@ -49,8 +49,7 @@ fn engine_with_hnsw(path: &std::path::Path, n_per_blob: usize) -> LocalVectorEng
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(hnsw_config()),
         )
         .unwrap();
     let points = clustered_points(n_per_blob);
@@ -212,8 +211,7 @@ fn promotion_after_full_scan_threshold() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(cfg),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(cfg),
         )
         .unwrap();
 
@@ -341,8 +339,7 @@ fn stale_ratio_triggers_background_rebuild() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(cfg),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(cfg),
         )
         .unwrap();
     let points: Vec<VectorPoint> = (0..15u64)
@@ -405,12 +402,11 @@ fn scan_limit_config_controls_iterative_expansion() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(HnswConfig {
-                    iterative_max_rounds: Some(1),
-                    max_scan_tuples: Some(64),
-                    ..hnsw_config()
-                }),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(HnswConfig {
+                iterative_max_rounds: Some(1),
+                max_scan_tuples: Some(64),
+                ..hnsw_config()
+            }),
         )
         .unwrap();
     let points = clustered_points(20);
@@ -434,11 +430,10 @@ fn scan_limit_config_controls_iterative_expansion() {
     let err = engine
         .create_collection(
             "bad",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(HnswConfig {
-                    max_scan_tuples: Some(0),
-                    ..hnsw_config()
-                }),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(HnswConfig {
+                max_scan_tuples: Some(0),
+                ..hnsw_config()
+            }),
         )
         .unwrap_err();
     assert!(matches!(err, VectorSearchError::InvalidConfig(_)));

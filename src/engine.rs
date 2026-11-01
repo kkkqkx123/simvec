@@ -23,8 +23,8 @@ use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
 use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig, Payload,
-    PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
+    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
 };
 
 /// A single operation of a coordinated transaction, grouped per collection.

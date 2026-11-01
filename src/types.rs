@@ -36,8 +36,6 @@ pub enum DistanceMetric {
     Manhattan,
 }
 
-
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HnswConfig {
     /// Maximum connections per layer above the ground layer; the ground

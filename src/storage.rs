@@ -69,8 +69,8 @@ use self::vectors::Vectors;
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId,
-    QuantizationConfig, VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
+    VectorPoint,
 };
 
 /// Tombstone ratio above which deletes trigger compaction.

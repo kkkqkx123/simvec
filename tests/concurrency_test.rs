@@ -87,8 +87,7 @@ fn metrics_record_ann_path_and_build() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Cosine).with_hnsw(hnsw_config()),
         )
         .unwrap();
 
@@ -121,8 +120,7 @@ fn concurrent_hnsw_search() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Cosine).with_hnsw(hnsw_config()),
         )
         .unwrap();
 
@@ -163,8 +161,7 @@ fn concurrent_hnsw_insert_and_search() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(hnsw_config()),
         )
         .unwrap();
 
@@ -219,8 +216,7 @@ fn concurrent_write_read_covers_version_double_read() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(hnsw_config()),
         )
         .unwrap();
 
@@ -328,8 +324,7 @@ fn collection_info_reports_build_progress() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_hnsw(hnsw_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Cosine).with_hnsw(hnsw_config()),
         )
         .unwrap();
     let points: Vec<VectorPoint> = (0..60).map(|i| point(i as u64, DIM)).collect();
@@ -357,8 +352,7 @@ fn concurrent_ivf_search() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_ivf(ivf_config()),
+            &CollectionConfig::new(DIM, DistanceMetric::Cosine).with_ivf(ivf_config()),
         )
         .unwrap();
 
@@ -396,14 +390,13 @@ fn hnsw_concurrent_build() {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Cosine)
-                .with_hnsw(HnswConfig {
-                    m: 8,
-                    ef_construct: 16,
-                    ef_search: 16,
-                    max_indexing_threads: Some(4),
-                    ..HnswConfig::default()
-                }),
+            &CollectionConfig::new(DIM, DistanceMetric::Cosine).with_hnsw(HnswConfig {
+                m: 8,
+                ef_construct: 16,
+                ef_search: 16,
+                max_indexing_threads: Some(4),
+                ..HnswConfig::default()
+            }),
         )
         .unwrap();
 

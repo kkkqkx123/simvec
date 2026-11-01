@@ -50,8 +50,7 @@ fn build_once(threads: Option<usize>, n: usize) -> std::time::Duration {
     engine
         .create_collection(
             "col",
-            &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_hnsw(hnsw),
+            &CollectionConfig::new(DIM, DistanceMetric::Euclid).with_hnsw(hnsw),
         )
         .unwrap();
     engine.upsert_batch("col", &random_points(n)).unwrap();

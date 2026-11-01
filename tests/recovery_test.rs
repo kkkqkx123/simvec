@@ -335,18 +335,17 @@ fn test_wal_replay_after_checkpoint_marker_stays_idempotent() {
 fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_ivf");
-    let cfg = CollectionConfig::new(4, DistanceMetric::Cosine)
-        .with_ivf(simvec::types::IvfConfig {
-            lists: Some(2),
-            min_build_points: 1,
-            sample_limit: 64,
-            kmeans_max_iter: 5,
-            drift_threshold: 0.10,
-            drift_check_interval: u64::MAX,
-            default_nprobe: 1,
-            auto_promotion: false,
-            max_probes: None,
-        });
+    let cfg = CollectionConfig::new(4, DistanceMetric::Cosine).with_ivf(simvec::types::IvfConfig {
+        lists: Some(2),
+        min_build_points: 1,
+        sample_limit: 64,
+        kmeans_max_iter: 5,
+        drift_threshold: 0.10,
+        drift_check_interval: u64::MAX,
+        default_nprobe: 1,
+        auto_promotion: false,
+        max_probes: None,
+    });
 
     {
         let store = CollectionStore::create(&store_dir, "col_ivf", &cfg).unwrap();
