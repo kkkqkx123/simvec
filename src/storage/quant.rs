@@ -122,9 +122,9 @@ impl QuantStore {
         meta.slot_capacity = slot_capacity;
         // Scalar/binary ready immediately (global scale or trivial bits).
         // Product needs training; mark not ready until build_quantization runs.
-        meta.ready = !matches!(config.quant_type, Some(QuantizationType::Product { .. }));
+        meta.ready = !matches!(config.quant_type, QuantizationType::Product { .. });
         // For scalar, init dummy scale (will be recomputed on build).
-        if matches!(config.quant_type, Some(QuantizationType::Scalar { .. })) {
+        if matches!(config.quant_type, QuantizationType::Scalar { .. }) {
             meta.scalar_min = Some(0.0);
             meta.scalar_max = Some(1.0);
             meta.scalar_scale = Some(1.0 / 255.0);
@@ -306,7 +306,7 @@ impl QuantStore {
     pub fn encode(&self, vector: &[f32]) -> Result<Vec<u8>> {
         let meta = self.meta.read();
         match &self.config.quant_type {
-            Some(QuantizationType::Scalar { .. }) => {
+            QuantizationType::Scalar { .. } => {
                 let min = meta.scalar_min.unwrap_or(0.0);
                 let max = meta.scalar_max.unwrap_or(1.0);
                 let scale = meta.scalar_scale.unwrap_or((max - min) / 255.0);
@@ -319,7 +319,7 @@ impl QuantStore {
                 }
                 Ok(out)
             }
-            Some(QuantizationType::Binary { .. }) => {
+            QuantizationType::Binary { .. } => {
                 let mut out = vec![0u8; self.bytes_per_vector];
                 for (i, &v) in vector.iter().enumerate() {
                     if v > 0.0 {
@@ -328,7 +328,7 @@ impl QuantStore {
                 }
                 Ok(out)
             }
-            Some(QuantizationType::Product { compression, .. }) => {
+            QuantizationType::Product { compression, .. } => {
                 if !meta.ready {
                     return Err(VectorSearchError::Internal(
                         "product quantization codebook not ready".to_string(),
@@ -360,9 +360,6 @@ impl QuantStore {
                 }
                 Ok(out)
             }
-            None => Err(VectorSearchError::Internal(
-                "quantization not configured".to_string(),
-            )),
         }
     }
 
@@ -371,7 +368,7 @@ impl QuantStore {
     pub fn distance_quantized(&self, query: &[f32], code: &[u8], metric: DistanceMetric) -> f32 {
         let meta = self.meta.read();
         match &self.config.quant_type {
-            Some(QuantizationType::Scalar { .. }) => {
+            QuantizationType::Scalar { .. } => {
                 // Dequantize code to approx f32 and compute true distance.
                 let min = meta.scalar_min.unwrap_or(0.0);
                 let scale = meta.scalar_scale.unwrap_or(1.0 / 255.0);
@@ -422,7 +419,7 @@ impl QuantStore {
                     }
                 }
             }
-            Some(QuantizationType::Binary { .. }) => {
+            QuantizationType::Binary { .. } => {
                 // Hamming distance; for all metrics lower hamming = nearer.
                 // Compute popcount of xor between query bits and stored bits.
                 let qbits = encode_binary(query);
@@ -432,7 +429,7 @@ impl QuantStore {
                 }
                 ham as f32
             }
-            Some(QuantizationType::Product { .. }) => {
+            QuantizationType::Product { .. } => {
                 if let (Some(cb), Some(&m), Some(&subdim)) = (
                     meta.codebook.as_ref(),
                     meta.pq_m.as_ref(),
@@ -511,7 +508,6 @@ impl QuantStore {
                     f32::INFINITY
                 }
             }
-            None => f32::INFINITY,
         }
     }
 
@@ -525,7 +521,7 @@ impl QuantStore {
         dim: usize,
     ) -> Result<()> {
         match &self.config.quant_type {
-            Some(QuantizationType::Scalar { quantile, .. }) => {
+            QuantizationType::Scalar { quantile, .. } => {
                 let quantile = quantile.unwrap_or(0.99);
                 // Gather all float values across live vectors for quantile clipping.
                 let mut values: Vec<f32> = Vec::with_capacity(live_slots.len() * dim);
@@ -585,7 +581,7 @@ impl QuantStore {
                 file.sync_all()?;
                 Ok(())
             }
-            Some(QuantizationType::Binary { .. }) => {
+            QuantizationType::Binary { .. } => {
                 {
                     let mut meta = self.meta.write();
                     meta.ready = true;
@@ -604,7 +600,7 @@ impl QuantStore {
                 self.file.lock().sync_all()?;
                 Ok(())
             }
-            Some(QuantizationType::Product { compression, .. }) => {
+            QuantizationType::Product { compression, .. } => {
                 let m = compression.pq_m(dim);
                 let subdim = dim / m.max(1);
                 // Gather vectors per subspace for k-means training.
@@ -672,7 +668,6 @@ impl QuantStore {
                 self.file.lock().sync_all()?;
                 Ok(())
             }
-            None => Ok(()),
         }
     }
 

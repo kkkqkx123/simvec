@@ -84,9 +84,7 @@ fn eval_condition(
         ConditionType::IsNull => {
             Ok(get_field(payload, &condition.field).is_none_or(|v| v.is_null()))
         }
-        ConditionType::HasId { ids } => {
-            Ok(ids.iter().any(|candidate| candidate == &id.to_string()))
-        }
+        ConditionType::HasId { ids } => Ok(ids.iter().any(|candidate| candidate == id)),
         ConditionType::Nested { filter } => {
             let Some(Value::Array(elements)) = get_field(payload, &condition.field) else {
                 return Ok(false);

@@ -86,6 +86,10 @@ impl WalPoint {
 }
 
 /// A single mutation logged in the WAL.
+///
+/// Delete variants keep point ids as strings on purpose: the binary codec
+/// cannot encode the untagged point id enum, so the typed boundary ends at
+/// the transaction entry and replay converts back exactly once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
     Upsert {

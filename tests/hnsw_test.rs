@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use simvec::{
-    CollectionConfig, DistanceMetric, FilterCondition, HnswConfig, LocalVectorEngine, SearchMode,
-    SearchQuery, VectorFilter, VectorPoint, VectorSearchError,
+    CollectionConfig, DistanceMetric, FilterCondition, HnswConfig, IndexKind, LocalVectorEngine,
+    PointId, SearchMode, SearchQuery, VectorFilter, VectorPoint, VectorSearchError,
 };
 
 const DIM: usize = 8;
@@ -81,7 +81,7 @@ fn publish_search_drop_roundtrip() {
 
         let info = engine.collection_info("col").unwrap();
         let index = info.index.expect("index info present");
-        assert_eq!(index.index_kind, 2);
+        assert_eq!(index.index_kind, IndexKind::Hnsw);
         assert_eq!(index.m, 8);
         assert_eq!(index.ef_construct, 16);
 
@@ -131,7 +131,7 @@ fn index_persists_across_restart() {
     );
     let info = reopened.collection_info("col").unwrap();
     let index = info.index.unwrap();
-    assert_eq!(index.index_kind, 2);
+    assert_eq!(index.index_kind, IndexKind::Hnsw);
     // The effective config is persisted in meta.bin, so the rehydrated
     // graph keeps its search-time default instead of the crate default.
     assert_eq!(index.ef_search_default, 16);
@@ -175,7 +175,7 @@ fn deleted_points_are_never_returned() {
 
     // Delete one blob-1 member; queries near blob 1 must not surface it,
     // even though the node stays in the graph for navigation.
-    engine.delete("col", "p12").unwrap();
+    engine.delete("col", &PointId::from("p12")).unwrap();
     let hits = engine
         .search(
             "col",
@@ -238,7 +238,7 @@ fn promotion_after_full_scan_threshold() {
     );
 
     let info = engine.collection_info("col").unwrap();
-    assert_eq!(info.index.unwrap().index_kind, 2);
+    assert_eq!(info.index.unwrap().index_kind, IndexKind::Hnsw);
 }
 
 #[test]
@@ -370,7 +370,7 @@ fn stale_ratio_triggers_background_rebuild() {
     }
     engine.drain_pending("col").unwrap();
     let info_before = engine.collection_info("col").unwrap().index.unwrap();
-    assert_eq!(info_before.index_kind, 2);
+    assert_eq!(info_before.index_kind, IndexKind::Hnsw);
     assert!(
         info_before.stale_overwrite_count > 0,
         "overwrites must be observable"
@@ -423,7 +423,7 @@ fn scan_limit_config_controls_iterative_expansion() {
     // Filter matching a single point: the first pass comes up short for
     // limit=5, so iterative expansion runs and must stop within one round /
     // 64 visited nodes. The query must terminate with valid results.
-    let marker_id = clustered_points(1).remove(0).id.to_string();
+    let marker_id = clustered_points(1).remove(0).id;
     let filter = VectorFilter::new().must(FilterCondition::has_id(vec![marker_id.clone()]));
     let results = engine
         .search(
@@ -432,7 +432,7 @@ fn scan_limit_config_controls_iterative_expansion() {
         )
         .unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id.to_string(), marker_id);
+    assert_eq!(results[0].id, marker_id);
 
     // Zero values are rejected by config validation at collection creation.
     let err = engine

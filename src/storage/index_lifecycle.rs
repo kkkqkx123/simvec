@@ -24,7 +24,7 @@ use super::CollectionStore;
 use crate::error::Result;
 use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
 use crate::metrics::IndexTier;
-use crate::types::{HnswConfig, IndexInfo, IndexType, IvfConfig};
+use crate::types::{HnswConfig, IndexInfo, IndexKind, IndexType, IvfConfig};
 
 /// A published ANN index; `None` = exact scan. Both tiers are derived
 /// structures over `vectors.bin` and swap in atomically.
@@ -245,11 +245,7 @@ impl CollectionStore {
         {
             let needs = {
                 let inner = self.inner.read();
-                inner
-                    .meta
-                    .quantization_config
-                    .as_ref()
-                    .is_some_and(|qc| qc.enabled && qc.quant_type.is_some())
+                inner.meta.quantization_config.as_ref().is_some()
             };
             let ready = self.has_quantization();
             if needs && !ready {
@@ -263,10 +259,7 @@ impl CollectionStore {
                 // sweeps. Keep product rebuild lazy (already ready) to avoid
                 // repeated k-means.
                 let qc = self.inner.read().meta.quantization_config.clone().unwrap();
-                if matches!(
-                    qc.quant_type,
-                    Some(crate::types::QuantizationType::Scalar { .. })
-                ) {
+                if matches!(qc.quant_type, crate::types::QuantizationType::Scalar { .. }) {
                     let _ = self.build_quantization();
                 }
             }
@@ -660,7 +653,7 @@ impl CollectionStore {
         let published = self.index.load();
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => Some(IndexInfo {
-                index_kind: 1,
+                index_kind: IndexKind::Ivf,
                 lists: index.list_count() as u32,
                 nprobe_default: index.default_nprobe(),
                 m: 0,
@@ -675,7 +668,7 @@ impl CollectionStore {
                 build_points_total,
             }),
             Some(PublishedIndex::Hnsw(index)) => Some(IndexInfo {
-                index_kind: 2,
+                index_kind: IndexKind::Hnsw,
                 lists: 0,
                 nprobe_default: 0,
                 m: index.m(),
@@ -697,7 +690,7 @@ impl CollectionStore {
                     None
                 } else {
                     Some(IndexInfo {
-                        index_kind: 0,
+                        index_kind: IndexKind::ExactScan,
                         lists: 0,
                         nprobe_default: 0,
                         m: 0,

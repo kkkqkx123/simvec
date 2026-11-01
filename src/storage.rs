@@ -289,11 +289,7 @@ impl CollectionStore {
             }
         }
         // Persist quantization config alongside other tier settings.
-        if let Some(qc) = &config.quantization_config {
-            if qc.enabled {
-                meta.quantization_config = Some(qc.clone());
-            }
-        }
+        meta.quantization_config = config.quantization_config.clone();
         // Persist the admission cap so it survives reopen.
         meta.max_points = config.max_points;
         meta.save(dir)?;
@@ -308,18 +304,14 @@ impl CollectionStore {
         // Create quantized storage if requested. Scalar/Binary are ready immediately;
         // Product needs a codebook build before it becomes usable.
         let quant = if let Some(qc) = &config.quantization_config {
-            if qc.enabled && qc.quant_type.is_some() {
-                Some(QuantStore::create(
-                    dir,
-                    config.vector_size,
-                    config.distance,
-                    qc,
-                    meta.segment_slots,
-                    meta.slot_capacity,
-                )?)
-            } else {
-                None
-            }
+            Some(QuantStore::create(
+                dir,
+                config.vector_size,
+                config.distance,
+                qc,
+                meta.segment_slots,
+                meta.slot_capacity,
+            )?)
         } else {
             None
         };
@@ -423,18 +415,14 @@ impl CollectionStore {
         // Load quantized storage if configured. Missing or corrupt quant files are
         // treated as absent (derived structure) so open still succeeds; the
         // collection will run exact until `build_quantization` recreates them.
-        let quant = if let Some(qc) = &meta.quantization_config {
-            if qc.enabled && qc.quant_type.is_some() {
-                QuantStore::open(
-                    dir,
-                    meta.vector_size,
-                    meta.distance,
-                    meta.segment_slots,
-                    meta.slot_capacity,
-                )?
-            } else {
-                None
-            }
+        let quant = if meta.quantization_config.is_some() {
+            QuantStore::open(
+                dir,
+                meta.vector_size,
+                meta.distance,
+                meta.segment_slots,
+                meta.slot_capacity,
+            )?
         } else {
             None
         };
@@ -685,7 +673,7 @@ impl CollectionStore {
     /// deleted points. Runs as a single WAL-backed batch so recovery replays
     /// the filter match deterministically.
     pub fn delete_by_filter(&self, filter: &crate::types::VectorFilter) -> Result<u64> {
-        let point_ids: Vec<String> = {
+        let point_ids: Vec<PointId> = {
             let inner = self.inner.read();
             let tombstones = self.tombstones.load();
             let keysnap = self.keys.snapshot();
@@ -700,7 +688,7 @@ impl CollectionStore {
                 let id = PointId::from(key);
                 let payload = self.read_payload_at(slot as u32)?;
                 if crate::filter::matches(filter, &id, payload.as_ref())? {
-                    point_ids.push(id.to_string());
+                    point_ids.push(id);
                 }
             }
             point_ids
@@ -709,7 +697,8 @@ impl CollectionStore {
             return Ok(0);
         }
         let deleted = point_ids.len() as u64;
-        self.apply_ops(&[WalRecord::DeleteBatch { point_ids }])?;
+        let encoded: Vec<String> = point_ids.iter().map(|id| id.to_string()).collect();
+        self.apply_ops(&[WalRecord::DeleteBatch { point_ids: encoded }])?;
         Ok(deleted)
     }
 
@@ -756,10 +745,12 @@ impl CollectionStore {
                     let point = point.to_point()?;
                     self.apply_upsert_locked(inner, &point)?;
                 }
-                WalRecord::Delete { point_id } => self.apply_delete_locked(inner, point_id)?,
+                WalRecord::Delete { point_id } => {
+                    self.apply_delete_locked(inner, &PointId::from(point_id.as_str()))?
+                }
                 WalRecord::DeleteBatch { point_ids } => {
                     for id in point_ids {
-                        self.apply_delete_locked(inner, id)?;
+                        self.apply_delete_locked(inner, &PointId::from(id.as_str()))?;
                     }
                 }
                 WalRecord::SetPayload { slot, payload } => {
@@ -799,8 +790,8 @@ impl CollectionStore {
                 let _ = q.write_slot(slot, &point.vector);
             } else if matches!(
                 q.config().quant_type,
-                Some(crate::types::QuantizationType::Scalar { .. })
-                    | Some(crate::types::QuantizationType::Binary { .. })
+                crate::types::QuantizationType::Scalar { .. }
+                    | crate::types::QuantizationType::Binary { .. }
             ) {
                 // Scalar/Binary are always ready after create/rebuild; attempt to
                 // quantize even when `ready` flag races the build.
@@ -851,9 +842,8 @@ impl CollectionStore {
         Ok(())
     }
 
-    fn apply_delete_locked(&self, inner: &mut StoreInner, point_id: &str) -> Result<()> {
-        let id = PointId::from(point_id.to_string());
-        if let Some(slot) = inner.reverse.remove(&id) {
+    fn apply_delete_locked(&self, inner: &mut StoreInner, id: &PointId) -> Result<()> {
+        if let Some(slot) = inner.reverse.remove(id) {
             self.apply_delete_slot_locked(inner, slot)?;
         }
         Ok(())
@@ -1034,16 +1024,16 @@ impl CollectionStore {
     /// Returns up to `limit` points starting after `offset` (the last
     /// point_id from the previous page). When `with_payload` is false the
     /// payload field is omitted; when `with_vector` is false the vector
-    /// field is omitted. The returned `Option<String>` is the id of the
+    /// field is omitted. The returned `Option<PointId>` is the id of the
     /// last point in the page (use as the next `offset`), or `None` when
     /// there are no more pages.
     pub fn scroll(
         &self,
         limit: usize,
-        offset: Option<&str>,
+        offset: Option<&PointId>,
         with_payload: Option<bool>,
         with_vector: Option<bool>,
-    ) -> Result<(Vec<VectorPoint>, Option<String>)> {
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let inner = self.inner.read();
         let tombstones = self.tombstones.load();
         let keysnap = self.keys.snapshot();
@@ -1054,7 +1044,7 @@ impl CollectionStore {
 
         let mut skip = offset.is_some();
         let mut results = Vec::with_capacity(limit);
-        let mut last_id: Option<String> = None;
+        let mut last_id: Option<PointId> = None;
 
         for slot in 0..inner.meta.next_slot as usize {
             if tombstones.bit(slot) {
@@ -1062,13 +1052,13 @@ impl CollectionStore {
             }
             let key = Keys::read_key(&keysnap, slot)?
                 .ok_or_else(|| VectorSearchError::CorruptData(format!("slot {slot} has no key")))?;
+            let id = PointId::from(key);
             if skip {
-                if key == offset.unwrap_or("") {
+                if Some(&id) == offset {
                     skip = false;
                 }
                 continue;
             }
-            let id = PointId::from(key);
             let payload = if include_payload {
                 self.read_payload_at(slot as u32)?
             } else {
@@ -1087,7 +1077,7 @@ impl CollectionStore {
             } else {
                 None
             };
-            last_id = Some(id.to_string());
+            last_id = Some(id.clone());
             results.push(VectorPoint {
                 id,
                 vector: vector.unwrap_or_default(),
@@ -1280,7 +1270,7 @@ impl CollectionStore {
         let qc = {
             let inner = self.inner.read();
             match &inner.meta.quantization_config {
-                Some(qc) if qc.enabled && qc.quant_type.is_some() => qc.clone(),
+                Some(qc) => qc.clone(),
                 _ => return Ok(false),
             }
         };
@@ -1348,7 +1338,7 @@ impl CollectionStore {
     }
 
     /// Replace quantization config at runtime (engine setting). Persists to
-    /// `meta.bin` and creates or drops the quant files accordingly.
+    /// `meta.bin` and creates or replaces the quant files accordingly.
     ///
     /// Crash-safe order: quant files are created/synced first, then `meta.bin`
     /// is swapped. If the process crashes before `meta.bin` is durable the
@@ -1356,9 +1346,9 @@ impl CollectionStore {
     /// quant files are discarded on the next open.
     pub fn set_quantization_config(&self, config: QuantizationConfig) -> Result<()> {
         config.validate(self.inner.read().meta.vector_size)?;
-        // Create or drop quant files before persisting meta, so a crash
+        // Create quant files before persisting meta, so a crash
         // cannot leave meta claiming quantization while files are missing.
-        let new_quant = if config.enabled && config.quant_type.is_some() {
+        let new_quant = {
             // Pre-create the store while not holding the inner write lock.
             let (dim, distance, segment_slots, slot_capacity) = {
                 let inner = self.inner.read();
@@ -1396,17 +1386,6 @@ impl CollectionStore {
             // Hold the quant guard briefly to ensure files are durable before
             // meta claims them; QuantStore::create already fsyncs.
             drop(qguard);
-            Some(config.clone())
-        } else {
-            // Disable: drop in-memory store and remove files first.
-            {
-                let mut qguard = self.quant.write();
-                *qguard = None;
-            }
-            let _ = std::fs::remove_file(self.dir.join("quant.bin"));
-            let _ = std::fs::remove_file(self.dir.join("quant_meta.bin"));
-            // Still persist the disabled config so callers can distinguish
-            // "never configured" vs "explicitly disabled".
             Some(config.clone())
         };
         let mut inner = self.inner.write();

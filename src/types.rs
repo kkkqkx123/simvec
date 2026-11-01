@@ -280,86 +280,64 @@ pub enum QuantizationType {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantizationConfig {
-    pub enabled: bool,
-    pub quant_type: Option<QuantizationType>,
+    pub quant_type: QuantizationType,
 }
 
 impl QuantizationConfig {
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            quant_type: None,
-        }
-    }
-
     pub fn scalar(quantile: f32) -> Self {
         Self {
-            enabled: true,
-            quant_type: Some(QuantizationType::Scalar {
+            quant_type: QuantizationType::Scalar {
                 quantile: Some(quantile),
                 always_ram: Some(true),
-            }),
+            },
         }
     }
 
     pub fn product(compression: CompressionRatio) -> Self {
         Self {
-            enabled: true,
-            quant_type: Some(QuantizationType::Product {
+            quant_type: QuantizationType::Product {
                 compression,
                 always_ram: Some(true),
-            }),
+            },
         }
     }
 
     pub fn binary() -> Self {
         Self {
-            enabled: true,
-            quant_type: Some(QuantizationType::Binary {
+            quant_type: QuantizationType::Binary {
                 always_ram: Some(true),
-            }),
+            },
         }
     }
 
     pub fn with_always_ram(mut self, always_ram: bool) -> Self {
-        if let Some(ref mut qt) = self.quant_type {
-            match qt {
-                QuantizationType::Scalar { always_ram: ar, .. } => *ar = Some(always_ram),
-                QuantizationType::Product { always_ram: ar, .. } => *ar = Some(always_ram),
-                QuantizationType::Binary { always_ram: ar } => *ar = Some(always_ram),
-            }
+        match &mut self.quant_type {
+            QuantizationType::Scalar { always_ram: ar, .. }
+            | QuantizationType::Product { always_ram: ar, .. }
+            | QuantizationType::Binary { always_ram: ar } => *ar = Some(always_ram),
         }
         self
     }
 
     pub fn always_ram(&self) -> bool {
         match &self.quant_type {
-            Some(QuantizationType::Scalar { always_ram, .. })
-            | Some(QuantizationType::Product { always_ram, .. })
-            | Some(QuantizationType::Binary { always_ram }) => always_ram.unwrap_or(true),
-            None => true,
+            QuantizationType::Scalar { always_ram, .. }
+            | QuantizationType::Product { always_ram, .. }
+            | QuantizationType::Binary { always_ram } => always_ram.unwrap_or(true),
         }
     }
 
     pub fn quantile_or_default(&self) -> f32 {
         match &self.quant_type {
-            Some(QuantizationType::Scalar { quantile, .. }) => quantile.unwrap_or(0.99),
+            QuantizationType::Scalar { quantile, .. } => quantile.unwrap_or(0.99),
             _ => 0.99,
         }
     }
 
     pub fn validate(&self, dim: usize) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let Some(qt) = &self.quant_type else {
-            return Err(VectorSearchError::InvalidConfig(
-                "quantization enabled but quant_type is None".to_string(),
-            ));
-        };
-        match qt {
+        match &self.quant_type {
             QuantizationType::Scalar { quantile, .. } => {
                 if let Some(q) = quantile {
                     if !q.is_finite() || *q <= 0.0 || *q > 1.0 {
@@ -383,19 +361,15 @@ impl QuantizationConfig {
     }
 
     pub fn quant_bytes_per_vector(&self, dim: usize) -> usize {
-        if !self.enabled {
-            return 0;
-        }
         match &self.quant_type {
-            Some(QuantizationType::Scalar { .. }) => dim,
-            Some(QuantizationType::Binary { .. }) => dim.div_ceil(8),
-            Some(QuantizationType::Product { compression, .. }) => compression.pq_m(dim),
-            None => 0,
+            QuantizationType::Scalar { .. } => dim,
+            QuantizationType::Binary { .. } => dim.div_ceil(8),
+            QuantizationType::Product { compression, .. } => compression.pq_m(dim),
         }
     }
 
     pub fn is_product(&self) -> bool {
-        matches!(self.quant_type, Some(QuantizationType::Product { .. }))
+        matches!(self.quant_type, QuantizationType::Product { .. })
     }
 }
 
@@ -568,14 +542,21 @@ impl Default for CollectionConfig {
     }
 }
 
+/// Published index tier backing a collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    ExactScan,
+    Ivf,
+    Hnsw,
+}
+
 /// Index state exposed through [`CollectionInfo`].
 ///
 /// Kind-agnostic: IVF reports list/nprobe fields, HNSW reports graph
 /// parameters; fields that do not apply to the active kind stay zeroed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexInfo {
-    /// 0 = exact scan, 1 = IVFFlat, 2 = HNSW.
-    pub index_kind: u8,
+    pub index_kind: IndexKind,
     /// IVF only: number of clusters.
     pub lists: u32,
     /// IVF only: default nprobe.
@@ -1150,18 +1131,10 @@ mod tests {
     }
 
     #[test]
-    fn test_quantization_config_disabled() {
-        let cfg = QuantizationConfig::disabled();
-        assert!(!cfg.enabled);
-        assert!(cfg.quant_type.is_none());
-    }
-
-    #[test]
     fn test_quantization_config_scalar() {
         let cfg = QuantizationConfig::scalar(0.99);
-        assert!(cfg.enabled);
         match cfg.quant_type {
-            Some(QuantizationType::Scalar { .. }) => {}
+            QuantizationType::Scalar { .. } => {}
             _ => panic!("expected Scalar"),
         }
     }
@@ -1169,9 +1142,8 @@ mod tests {
     #[test]
     fn test_quantization_config_product() {
         let cfg = QuantizationConfig::product(CompressionRatio::X8);
-        assert!(cfg.enabled);
         match cfg.quant_type {
-            Some(QuantizationType::Product { compression, .. }) => {
+            QuantizationType::Product { compression, .. } => {
                 assert!(matches!(compression, CompressionRatio::X8));
             }
             _ => panic!("expected Product"),
@@ -1181,9 +1153,8 @@ mod tests {
     #[test]
     fn test_quantization_config_binary() {
         let cfg = QuantizationConfig::binary();
-        assert!(cfg.enabled);
         match cfg.quant_type {
-            Some(QuantizationType::Binary { .. }) => {}
+            QuantizationType::Binary { .. } => {}
             _ => panic!("expected Binary"),
         }
     }
@@ -1192,7 +1163,7 @@ mod tests {
     fn test_quantization_config_with_always_ram() {
         let cfg = QuantizationConfig::scalar(0.5).with_always_ram(false);
         match cfg.quant_type {
-            Some(QuantizationType::Scalar { always_ram, .. }) => {
+            QuantizationType::Scalar { always_ram, .. } => {
                 assert_eq!(always_ram, Some(false));
             }
             _ => panic!("expected Scalar"),
@@ -1420,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_filter_condition_has_id() {
-        let ids = vec!["1".to_string(), "2".to_string()];
+        let ids = vec![PointId::from("1"), PointId::from("2")];
         let c = FilterCondition::has_id(ids);
         assert_eq!(c.field, "_id");
     }

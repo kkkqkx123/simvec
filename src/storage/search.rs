@@ -260,16 +260,15 @@ impl CollectionStore {
         }
         let k = query.offset.unwrap_or(0).saturating_add(query.limit);
         // Oversampling: trade recall vs latency. Scalar 2x, Binary 4x, Product 3x.
-        let oversample = match quant.config().quant_type.as_ref() {
-            Some(crate::types::QuantizationType::Scalar { .. }) => 2usize,
-            Some(crate::types::QuantizationType::Binary { .. }) => 4usize,
-            Some(crate::types::QuantizationType::Product { .. }) => 3usize,
-            None => 2usize,
+        let oversample = match &quant.config().quant_type {
+            crate::types::QuantizationType::Scalar { .. } => 2usize,
+            crate::types::QuantizationType::Binary { .. } => 4usize,
+            crate::types::QuantizationType::Product { .. } => 3usize,
         };
         let quant_k = (k * oversample).min(next_slot as usize).max(k);
         // Precompute binary query bits once to avoid per-slot allocation.
-        let query_bits: Option<Vec<u8>> = match quant.config().quant_type.as_ref() {
-            Some(crate::types::QuantizationType::Binary { .. }) => {
+        let query_bits: Option<Vec<u8>> = match &quant.config().quant_type {
+            crate::types::QuantizationType::Binary { .. } => {
                 Some(super::quant::encode_binary_for_query(&query.vector))
             }
             _ => None,
@@ -423,8 +422,8 @@ impl CollectionStore {
         };
         // Binary hamming can be computed from pre-encoded query bits without
         // per-slot allocation; other types use the quantized distance helper.
-        let score = match quant.config().quant_type.as_ref() {
-            Some(crate::types::QuantizationType::Binary { .. }) => {
+        let score = match &quant.config().quant_type {
+            crate::types::QuantizationType::Binary { .. } => {
                 let qbits = query_bits.expect("binary query bits precomputed");
                 let mut ham = 0u32;
                 for (a, b) in qbits.iter().zip(code.iter()) {

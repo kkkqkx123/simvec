@@ -16,7 +16,9 @@ pub type Payload = HashMap<String, serde_json::Value>;
 pub type PayloadValue = serde_json::Value;
 
 /// Point identifier: numeric or UUID-shaped string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(untagged)]
 pub enum PointId {
     Num(u64),
@@ -253,7 +255,7 @@ impl FilterCondition {
         Self::new(field, ConditionType::IsNull)
     }
 
-    pub fn has_id(ids: Vec<String>) -> Self {
+    pub fn has_id(ids: Vec<PointId>) -> Self {
         Self::new("_id", ConditionType::HasId { ids })
     }
 
@@ -316,7 +318,7 @@ pub enum ConditionType {
     IsEmpty,
     IsNull,
     HasId {
-        ids: Vec<String>,
+        ids: Vec<PointId>,
     },
     Nested {
         filter: Box<VectorFilter>,

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::thread;
 
 use simvec::{
-    CollectionConfig, DistanceMetric, HnswConfig, IvfConfig, LocalVectorEngine, SearchQuery,
-    VectorPoint,
+    CollectionConfig, DistanceMetric, HnswConfig, IvfConfig, LocalVectorEngine, PointId,
+    SearchQuery, VectorPoint,
 };
 
 const DIM: usize = 16;
@@ -60,7 +60,7 @@ fn metrics_record_mutations_and_searches() {
     // One batch = one WAL transaction.
     let points: Vec<VectorPoint> = (0..50).map(|i| point(i as u64, DIM)).collect();
     engine.upsert_batch("col", &points).unwrap();
-    engine.delete("col", "0").unwrap();
+    engine.delete("col", &PointId::from("0")).unwrap();
 
     let after_writes = engine.collection_metrics("col").unwrap();
     assert_eq!(after_writes.txns_applied, 2);

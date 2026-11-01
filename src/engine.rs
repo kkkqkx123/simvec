@@ -38,7 +38,7 @@ pub enum TxnOp {
     /// Delete a point by id from a collection.
     Delete {
         collection: String,
-        point_id: String,
+        point_id: PointId,
     },
 }
 
@@ -626,7 +626,7 @@ impl LocalVectorEngine {
     }
 
     /// Delete a point by id (WAL-backed). Deleting a missing id is a no-op.
-    pub fn delete(&self, collection: &str, point_id: &str) -> Result<()> {
+    pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::Delete {
             point_id: point_id.to_string(),
@@ -640,10 +640,10 @@ impl LocalVectorEngine {
     }
 
     /// Delete a batch of points (WAL-backed, single transaction).
-    pub fn delete_batch(&self, collection: &str, point_ids: &[String]) -> Result<()> {
+    pub fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> Result<()> {
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::DeleteBatch {
-            point_ids: point_ids.to_vec(),
+            point_ids: point_ids.iter().map(|id| id.to_string()).collect(),
         }]);
         if result.is_err() {
             store.metrics().record_delete_error();
@@ -683,9 +683,9 @@ impl LocalVectorEngine {
     }
 
     /// Fetch a point by id.
-    pub fn get(&self, collection: &str, point_id: &str) -> Result<Option<VectorPoint>> {
+    pub fn get(&self, collection: &str, point_id: &PointId) -> Result<Option<VectorPoint>> {
         let store = self.store(collection)?;
-        store.get(&PointId::from(point_id.to_string()))
+        store.get(point_id)
     }
 
     /// Number of live points in a collection.
@@ -695,9 +695,14 @@ impl LocalVectorEngine {
 
     /// Replace the payload for a single point. The point must exist and not
     /// be tombstoned. The entire payload map is replaced atomically.
-    pub fn set_payload(&self, collection: &str, point_id: &str, payload: Payload) -> Result<()> {
+    pub fn set_payload(
+        &self,
+        collection: &str,
+        point_id: &PointId,
+        payload: Payload,
+    ) -> Result<()> {
         let store = self.store(collection)?;
-        store.set_payload(&PointId::from(point_id.to_string()), payload)
+        store.set_payload(point_id, payload)
     }
 
     /// Remove specific keys from a point's payload. The remaining keys are
@@ -705,11 +710,11 @@ impl LocalVectorEngine {
     pub fn delete_payload(
         &self,
         collection: &str,
-        point_id: &str,
+        point_id: &PointId,
         keys: Vec<String>,
     ) -> Result<()> {
         let store = self.store(collection)?;
-        store.delete_payload_keys(&PointId::from(point_id.to_string()), keys)
+        store.delete_payload_keys(point_id, keys)
     }
 
     /// Set a single field on a point's payload (merge semantics). A missing
@@ -718,7 +723,7 @@ impl LocalVectorEngine {
     pub fn set_payload_field(
         &self,
         collection: &str,
-        point_id: &str,
+        point_id: &PointId,
         key: String,
         value: serde_json::Value,
     ) -> Result<()> {
@@ -731,11 +736,11 @@ impl LocalVectorEngine {
     pub fn set_payload_fields(
         &self,
         collection: &str,
-        point_id: &str,
+        point_id: &PointId,
         fields: Payload,
     ) -> Result<()> {
         let store = self.store(collection)?;
-        store.set_payload_fields(&PointId::from(point_id.to_string()), fields)
+        store.set_payload_fields(point_id, fields)
     }
 
     /// Create a payload field index on a collection. The index is populated
@@ -770,10 +775,10 @@ impl LocalVectorEngine {
         &self,
         collection: &str,
         limit: usize,
-        offset: Option<&str>,
+        offset: Option<&PointId>,
         with_payload: Option<bool>,
         with_vector: Option<bool>,
-    ) -> Result<(Vec<VectorPoint>, Option<String>)> {
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let store = self.store(collection)?;
         store.scroll(limit, offset, with_payload, with_vector)
     }
@@ -808,7 +813,9 @@ impl LocalVectorEngine {
                 } => by_collection
                     .entry(collection)
                     .or_default()
-                    .push(WalRecord::Delete { point_id }),
+                    .push(WalRecord::Delete {
+                        point_id: point_id.to_string(),
+                    }),
             }
         }
 
@@ -1280,10 +1287,10 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     async fn upsert_batch(&self, collection: &str, points: Vec<VectorPoint>) -> EngineResult<()>;
 
     /// Delete a point by id.
-    async fn delete(&self, collection: &str, point_id: &str) -> EngineResult<()>;
+    async fn delete(&self, collection: &str, point_id: &PointId) -> EngineResult<()>;
 
     /// Delete a batch of points by id.
-    async fn delete_batch(&self, collection: &str, point_ids: &[&str]) -> EngineResult<()>;
+    async fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> EngineResult<()>;
 
     /// Delete every point matching the given filter.
     async fn delete_by_filter(&self, collection: &str, filter: VectorFilter) -> EngineResult<()>;
@@ -1292,7 +1299,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     async fn set_payload(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         payload: Payload,
     ) -> EngineResult<()>;
 
@@ -1300,7 +1307,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     async fn set_payload_fields(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         fields: Payload,
     ) -> EngineResult<()>;
 
@@ -1308,7 +1315,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     async fn delete_payload(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         keys: Vec<String>,
     ) -> EngineResult<()>;
 
@@ -1317,10 +1324,10 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
         &self,
         collection: &str,
         limit: usize,
-        offset: Option<&str>,
+        offset: Option<&PointId>,
         with_payload: Option<bool>,
         with_vector: Option<bool>,
-    ) -> EngineResult<(Vec<VectorPoint>, Option<String>)>;
+    ) -> EngineResult<(Vec<VectorPoint>, Option<PointId>)>;
 
     // ---- reads ----
 
@@ -1329,7 +1336,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
         -> EngineResult<Vec<SearchResult>>;
 
     /// Fetch a single point by id.
-    async fn get(&self, collection: &str, point_id: &str) -> EngineResult<Option<VectorPoint>>;
+    async fn get(&self, collection: &str, point_id: &PointId) -> EngineResult<Option<VectorPoint>>;
 
     /// Number of live points in a collection.
     async fn count(&self, collection: &str) -> EngineResult<u64>;
@@ -1362,7 +1369,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> EngineResult<Pin<Box<dyn Stream<Item = EngineResult<VectorPoint>> + Send>>> {
-        let mut offset: Option<String> = None;
+        let mut offset: Option<PointId> = None;
         let collection = collection.to_string();
         let mut all_points: Vec<VectorPoint> = Vec::new();
         loop {
@@ -1370,7 +1377,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
                 .scroll(
                     &collection,
                     batch_size,
-                    offset.as_deref(),
+                    offset.as_ref(),
                     with_payload,
                     with_vector,
                 )
@@ -1499,16 +1506,16 @@ impl VectorEngine for LocalVectorEngine {
             .map_err(VectorEngineError::from)
     }
 
-    async fn delete(&self, collection: &str, point_id: &str) -> EngineResult<()> {
+    async fn delete(&self, collection: &str, point_id: &PointId) -> EngineResult<()> {
         let collection = collection.to_string();
-        let point_id = point_id.to_string();
+        let point_id = point_id.clone();
         tokio::task::block_in_place(|| self.delete(&collection, &point_id))
             .map_err(VectorEngineError::from)
     }
 
-    async fn delete_batch(&self, collection: &str, point_ids: &[&str]) -> EngineResult<()> {
+    async fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> EngineResult<()> {
         let collection = collection.to_string();
-        let ids: Vec<String> = point_ids.iter().map(|s| s.to_string()).collect();
+        let ids: Vec<PointId> = point_ids.to_vec();
         tokio::task::block_in_place(|| self.delete_batch(&collection, &ids))
             .map_err(VectorEngineError::from)
     }
@@ -1522,7 +1529,7 @@ impl VectorEngine for LocalVectorEngine {
     async fn set_payload(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         payload: Payload,
     ) -> EngineResult<()> {
         let collection = collection.to_string();
@@ -1538,7 +1545,7 @@ impl VectorEngine for LocalVectorEngine {
     async fn set_payload_fields(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         fields: Payload,
     ) -> EngineResult<()> {
         let collection = collection.to_string();
@@ -1554,7 +1561,7 @@ impl VectorEngine for LocalVectorEngine {
     async fn delete_payload(
         &self,
         collection: &str,
-        point_ids: Vec<String>,
+        point_ids: Vec<PointId>,
         keys: Vec<String>,
     ) -> EngineResult<()> {
         let collection = collection.to_string();
@@ -1571,17 +1578,17 @@ impl VectorEngine for LocalVectorEngine {
         &self,
         collection: &str,
         limit: usize,
-        offset: Option<&str>,
+        offset: Option<&PointId>,
         with_payload: Option<bool>,
         with_vector: Option<bool>,
-    ) -> EngineResult<(Vec<VectorPoint>, Option<String>)> {
+    ) -> EngineResult<(Vec<VectorPoint>, Option<PointId>)> {
         let collection = collection.to_string();
-        let offset = offset.map(String::from);
+        let offset = offset.cloned();
         tokio::task::block_in_place(|| {
             self.scroll(
                 &collection,
                 limit,
-                offset.as_deref(),
+                offset.as_ref(),
                 with_payload,
                 with_vector,
             )
@@ -1599,9 +1606,9 @@ impl VectorEngine for LocalVectorEngine {
             .map_err(VectorEngineError::from)
     }
 
-    async fn get(&self, collection: &str, point_id: &str) -> EngineResult<Option<VectorPoint>> {
+    async fn get(&self, collection: &str, point_id: &PointId) -> EngineResult<Option<VectorPoint>> {
         let collection = collection.to_string();
-        let point_id = point_id.to_string();
+        let point_id = point_id.clone();
         tokio::task::block_in_place(|| self.get(&collection, &point_id))
             .map_err(VectorEngineError::from)
     }
@@ -1652,9 +1659,9 @@ mod tests {
         }
         // 3/10 live-slot ratio crosses the 20% threshold: the mutation path
         // must enqueue a background compaction without blocking.
-        engine.delete("col", "0").unwrap();
-        engine.delete("col", "1").unwrap();
-        engine.delete("col", "2").unwrap();
+        engine.delete("col", &PointId::from("0")).unwrap();
+        engine.delete("col", &PointId::from("1")).unwrap();
+        engine.delete("col", &PointId::from("2")).unwrap();
 
         let store = engine.store("col").unwrap();
         // Deletes are visible the moment they return, so the caller never
@@ -1665,7 +1672,7 @@ mod tests {
         // background worker touches.
         assert_eq!(store.count(), 7);
         for id in 0..3u64 {
-            assert!(engine.get("col", &id.to_string()).unwrap().is_none());
+            assert!(engine.get("col", &PointId::from(id)).unwrap().is_none());
         }
 
         // The maintenance worker drains the queue promptly; poll briefly so
@@ -1692,9 +1699,12 @@ mod tests {
         let reopened = LocalVectorEngine::open(&root).unwrap();
         assert!(reopened.collection_exists("col_a"));
         assert_eq!(reopened.count("col_a").unwrap(), 2);
-        let got = reopened.get("col_a", "1").unwrap().unwrap();
+        let got = reopened.get("col_a", &PointId::from("1")).unwrap().unwrap();
         assert_eq!(got.vector, point(1, 4).vector);
-        assert!(reopened.get("col_a", "99").unwrap().is_none());
+        assert!(reopened
+            .get("col_a", &PointId::from("99"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1753,9 +1763,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(engine.count("live").unwrap(), 1);
-        let got = engine.get("live", "2").unwrap().unwrap();
+        let got = engine.get("live", &PointId::from("2")).unwrap().unwrap();
         assert_eq!(got.vector, point(2, 4).vector);
-        assert!(engine.get("live", "1").unwrap().is_none());
+        assert!(engine.get("live", &PointId::from("1")).unwrap().is_none());
         assert_eq!(engine.count("live.old-2").unwrap(), 1);
         // Scratch and backups serve no reads through discovery names.
         assert!(!engine
@@ -1826,7 +1836,7 @@ mod tests {
         let restored = engine.restore_promote_backup("live").unwrap();
         assert_eq!(restored, "live.old-2");
         assert_eq!(engine.count("live").unwrap(), 1);
-        let got = engine.get("live", "1").unwrap().unwrap();
+        let got = engine.get("live", &PointId::from("1")).unwrap().unwrap();
         assert_eq!(got.vector, point(1, 4).vector);
 
         let err = engine.restore_promote_backup("live").unwrap_err();
@@ -1920,10 +1930,10 @@ mod tests {
         engine.create_collection("col", &config(4)).unwrap();
         engine.upsert("col", point(1, 4)).unwrap();
         engine.upsert("col", point(2, 4)).unwrap();
-        engine.delete("col", "1").unwrap();
+        engine.delete("col", &PointId::from("1")).unwrap();
         assert_eq!(engine.count("col").unwrap(), 1);
-        assert!(engine.get("col", "1").unwrap().is_none());
-        engine.delete("col", "99").unwrap();
+        assert!(engine.get("col", &PointId::from("1")).unwrap().is_none());
+        engine.delete("col", &PointId::from("99")).unwrap();
         assert_eq!(engine.count("col").unwrap(), 1);
     }
 
@@ -1942,9 +1952,9 @@ mod tests {
         let deleted = engine.delete_by_filter("col", &filter).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(engine.count("col").unwrap(), 1);
-        assert!(engine.get("col", "2").unwrap().is_some());
-        assert!(engine.get("col", "1").unwrap().is_none());
-        assert!(engine.get("col", "3").unwrap().is_none());
+        assert!(engine.get("col", &PointId::from("2")).unwrap().is_some());
+        assert!(engine.get("col", &PointId::from("1")).unwrap().is_none());
+        assert!(engine.get("col", &PointId::from("3")).unwrap().is_none());
     }
 
     #[test]
@@ -1974,14 +1984,14 @@ mod tests {
             },
             TxnOp::Delete {
                 collection: "col_a".to_string(),
-                point_id: "42".to_string(),
+                point_id: PointId::from("42"),
             },
         ];
         engine.apply_txn(ops).unwrap();
 
         assert_eq!(engine.count("col_a").unwrap(), 1);
         assert_eq!(engine.count("col_b").unwrap(), 1);
-        assert!(engine.get("col_b", "1").unwrap().is_some());
+        assert!(engine.get("col_b", &PointId::from("1")).unwrap().is_some());
 
         // Replaying the same txn id is idempotent.
         engine
@@ -2039,11 +2049,11 @@ mod tests {
                 }])
                 .unwrap();
             engine.upsert("col", point(2, 4)).unwrap();
-            engine.delete("col", "2").unwrap();
+            engine.delete("col", &PointId::from("2")).unwrap();
         }
         let reopened = LocalVectorEngine::open(&root).unwrap();
         assert_eq!(reopened.count("col").unwrap(), 1);
-        assert!(reopened.get("col", "1").unwrap().is_some());
-        assert!(reopened.get("col", "2").unwrap().is_none());
+        assert!(reopened.get("col", &PointId::from("1")).unwrap().is_some());
+        assert!(reopened.get("col", &PointId::from("2")).unwrap().is_none());
     }
 }

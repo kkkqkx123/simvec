@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::thread;
 
 use simvec::{
-    CollectionConfig, DistanceMetric, FilterCondition, IvfConfig, LocalVectorEngine, SearchQuery,
-    VectorFilter, VectorPoint,
+    CollectionConfig, DistanceMetric, FilterCondition, IndexKind, IvfConfig, LocalVectorEngine,
+    PointId, SearchQuery, VectorFilter, VectorPoint,
 };
 
 const DIM: usize = 8;
@@ -83,7 +83,7 @@ fn promote_search_rebuild_roundtrip() {
 
         let info = engine.collection_info("col").unwrap();
         let index = info.index.expect("index info present");
-        assert_eq!(index.index_kind, 1);
+        assert_eq!(index.index_kind, IndexKind::Ivf);
         assert_eq!(index.lists, 4);
 
         // Filtered search across the whole collection still returns rows.
@@ -131,7 +131,7 @@ fn index_persists_across_restart() {
         "published index must survive restart via index.bin"
     );
     let info = reopened.collection_info("col").unwrap();
-    assert_eq!(info.index.unwrap().index_kind, 1);
+    assert_eq!(info.index.unwrap().index_kind, IndexKind::Ivf);
 }
 
 #[test]
@@ -187,8 +187,8 @@ fn compact_invalidates_index_and_rebuild_restores() {
 
     // Delete one point per blob: below the 20% tombstone threshold, so the
     // delete does not auto-compact.
-    engine.delete("col", "p0").unwrap();
-    engine.delete("col", "p20").unwrap();
+    engine.delete("col", &PointId::from("p0")).unwrap();
+    engine.delete("col", &PointId::from("p20")).unwrap();
     assert!(engine.has_index("col"));
 
     engine.compact_collection("col").unwrap();
