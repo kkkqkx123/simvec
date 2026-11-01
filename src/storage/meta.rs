@@ -8,15 +8,16 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
-use crate::types::{DistanceMetric, HnswConfig, IndexType, IvfConfig, QuantizationConfig};
+use crate::types::{DistanceMetric, IndexConfig, QuantizationConfig};
 
 /// Current on-disk format version.
 ///
 /// Version 2 adds `quantization_config` for Scalar/Binary/Product quantization
 /// support. Version 3 adds `max_points`, the optional live-point admission
-/// cap. The store is pre-stable, so breaking format changes are applied
+/// cap. Version 4 merges the index tier fields into a single `index` enum.
+/// The store is pre-stable, so breaking format changes are applied
 /// directly and older files are rejected on open.
-pub(crate) const FORMAT_VERSION: u32 = 3;
+pub(crate) const FORMAT_VERSION: u32 = 4;
 
 /// Default number of slots per `vectors.bin` segment.
 pub(crate) const SEGMENT_SLOTS_DEFAULT: u32 = 8192;
@@ -28,15 +29,9 @@ pub struct Meta {
     pub collection: String,
     pub vector_size: usize,
     pub distance: DistanceMetric,
-    /// ANN tier selection in force for this collection (`HNSW` by default;
-    /// `FLAT` keeps the collection on exact scan permanently).
-    pub index_type: IndexType,
-    /// Effective HNSW configuration (engine defaults already applied) when
-    /// `index_type == HNSW`.
-    pub hnsw_config: Option<HnswConfig>,
-    /// Effective IVF configuration when `index_type == IVF`. `None` = exact
-    /// scan only.
-    pub ivf_config: Option<IvfConfig>,
+    /// ANN tier selection in force for this collection. The three variants
+    /// are mutually exclusive; `Ivf(None)` behaves as exact scan until trained.
+    pub index: IndexConfig,
     /// Quantization configuration. `None` or `enabled=false` means exact f32
     /// storage only. Persisted atomically with the rest of the meta via
     /// `tmp+rename` so a crash cannot leave a half-written quant state.
@@ -74,9 +69,7 @@ impl Meta {
             collection: collection.to_string(),
             vector_size,
             distance,
-            index_type: IndexType::HNSW,
-            hnsw_config: None,
-            ivf_config: None,
+            index: IndexConfig::default(),
             quantization_config: None,
             segment_slots,
             slot_capacity: segment_slots as u64,

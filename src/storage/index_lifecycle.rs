@@ -24,7 +24,7 @@ use super::CollectionStore;
 use crate::error::Result;
 use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
 use crate::metrics::IndexTier;
-use crate::types::{HnswConfig, IndexInfo, IndexKind, IndexType, IvfConfig};
+use crate::types::{HnswConfig, IndexConfig, IndexInfo, IndexKind, IvfConfig};
 
 /// A published ANN index; `None` = exact scan. Both tiers are derived
 /// structures over `vectors.bin` and swap in atomically.
@@ -54,11 +54,26 @@ impl CollectionStore {
     /// runtime configuration takes precedence. Applies both to future builds
     /// and to any published index, so a rehydrated index immediately honors
     /// the runtime config.
-    pub fn set_ivf_config(&self, config: IvfConfig) {
-        self.inner.write().ivf_config = Some(config.clone());
+    pub fn set_ivf_config(&self, config: IvfConfig) -> Result<()> {
+        config.validate()?;
+        let mut inner = self.inner.write();
+        match &mut inner.meta.index {
+            IndexConfig::Ivf(slot) => {
+                *slot = Some(config.clone());
+                inner.ivf_config = Some(config.clone());
+                inner.meta.save(&self.dir)?;
+            }
+            _ => {
+                return Err(crate::error::VectorSearchError::InvalidConfig(
+                    "ivf config requires the IVF tier".to_string(),
+                ));
+            }
+        }
+        drop(inner);
         if let Some(PublishedIndex::Ivf(index)) = self.index.load().as_ref() {
             index.set_config(config);
         }
+        Ok(())
     }
 
     /// Supply the HNSW configuration after open. Unlike the IVF counterpart
@@ -68,8 +83,15 @@ impl CollectionStore {
     pub fn set_hnsw_config(&self, config: HnswConfig) -> Result<()> {
         config.validate()?;
         let mut inner = self.inner.write();
-        inner.meta.hnsw_config = Some(config);
-        inner.meta.save(&self.dir)
+        match &mut inner.meta.index {
+            IndexConfig::Hnsw(slot) => {
+                *slot = config;
+                inner.meta.save(&self.dir)
+            }
+            _ => Err(crate::error::VectorSearchError::InvalidConfig(
+                "hnsw config requires the HNSW tier".to_string(),
+            )),
+        }
     }
 
     /// Rehydrate the persisted ANN tier matching the collection's index type
@@ -77,10 +99,10 @@ impl CollectionStore {
     /// to exact scan. Slots appended after the build (WAL replay) land in
     /// `pending` so approximate searches still see them.
     pub(super) fn load_index(&self) -> Result<()> {
-        match self.inner.read().meta.index_type {
-            IndexType::IVF => self.load_ivf(),
-            IndexType::HNSW => self.load_hnsw(),
-            IndexType::FLAT => Ok(()),
+        match self.inner.read().meta.index {
+            IndexConfig::Ivf(_) => self.load_ivf(),
+            IndexConfig::Hnsw(_) => self.load_hnsw(),
+            IndexConfig::Flat => Ok(()),
         }
     }
 
@@ -150,13 +172,10 @@ impl CollectionStore {
             self.metrics.record_index_load_fallback();
             return Ok(());
         }
-        let config = self
-            .inner
-            .read()
-            .meta
-            .hnsw_config
-            .clone()
-            .unwrap_or_default();
+        let config = match &self.inner.read().meta.index {
+            IndexConfig::Hnsw(cfg) => cfg.clone(),
+            _ => HnswConfig::default(),
+        };
         let covered = data.nodes.len();
         let index = match HnswIndex::from_persisted(data, &config) {
             Ok(mut index) => {
@@ -233,7 +252,7 @@ impl CollectionStore {
     }
 
     /// Build and publish the configured ANN tier from the current live set.
-    /// Dispatches on the collection's `index_type`; returns whether a usable
+    /// Dispatches on the collection's `index`; returns whether a usable
     /// index is now published. When quantization is configured this also
     /// ensures `quant.bin` is trained before the index is built, under the
     /// same `build_mutex` so slot numbers stay stable.
@@ -264,21 +283,11 @@ impl CollectionStore {
                 }
             }
         }
-        let inner = self.inner.read();
-        let kind = inner.meta.index_type;
-        let ivf_config = inner.ivf_config.clone();
-        let hnsw_config = inner.meta.hnsw_config.clone();
-        drop(inner);
-        match kind {
-            IndexType::HNSW => match hnsw_config {
-                Some(config) => self.build_hnsw_index(config),
-                None => Ok(false),
-            },
-            IndexType::IVF => match ivf_config {
-                Some(config) => self.build_ivf_index(config),
-                None => Ok(false),
-            },
-            IndexType::FLAT => Ok(false),
+        let index = self.inner.read().meta.index.clone();
+        match index {
+            IndexConfig::Hnsw(config) => self.build_hnsw_index(config),
+            IndexConfig::Ivf(Some(config)) => self.build_ivf_index(config),
+            IndexConfig::Ivf(None) | IndexConfig::Flat => Ok(false),
         }
     }
 
@@ -603,17 +612,21 @@ impl CollectionStore {
     }
 
     pub(crate) fn ivf_config_opt(&self) -> Option<IvfConfig> {
-        self.inner.read().ivf_config.clone()
+        let inner = self.inner.read();
+        if !matches!(inner.meta.index, IndexConfig::Ivf(_)) {
+            return None;
+        }
+        inner.ivf_config.clone()
     }
 
     /// Effective HNSW configuration, or `None` when the collection is not an
     /// HNSW collection.
     pub(crate) fn hnsw_config_opt(&self) -> Option<HnswConfig> {
         let inner = self.inner.read();
-        if inner.meta.index_type != IndexType::HNSW {
-            return None;
+        match &inner.meta.index {
+            IndexConfig::Hnsw(cfg) => Some(cfg.clone()),
+            _ => None,
         }
-        inner.meta.hnsw_config.clone()
     }
 
     /// Measure the current drift ratio of the published IVF index.
@@ -686,7 +699,7 @@ impl CollectionStore {
                 // Nothing published: report a placeholder when an ANN tier is
                 // configured, `None` for permanent exact-scan collections.
                 let inner = self.inner.read();
-                if inner.meta.index_type == IndexType::FLAT {
+                if matches!(inner.meta.index, IndexConfig::Flat) {
                     None
                 } else {
                     Some(IndexInfo {

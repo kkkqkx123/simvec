@@ -115,7 +115,6 @@ fn test_prefilter_bitmap_high_selectivity_recall() {
         dir.path().join("col"),
         "col",
         &config(DistanceMetric::Cosine, DIM)
-            .with_index_type(simvec::types::IndexType::HNSW)
             .with_hnsw(hnsw_config()),
     )
     .unwrap();

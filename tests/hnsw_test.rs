@@ -50,7 +50,6 @@ fn engine_with_hnsw(path: &std::path::Path, n_per_blob: usize) -> LocalVectorEng
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(hnsw_config()),
         )
         .unwrap();
@@ -214,7 +213,6 @@ fn promotion_after_full_scan_threshold() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(cfg),
         )
         .unwrap();
@@ -344,7 +342,6 @@ fn stale_ratio_triggers_background_rebuild() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(cfg),
         )
         .unwrap();
@@ -409,7 +406,6 @@ fn scan_limit_config_controls_iterative_expansion() {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(HnswConfig {
                     iterative_max_rounds: Some(1),
                     max_scan_tuples: Some(64),
@@ -439,7 +435,6 @@ fn scan_limit_config_controls_iterative_expansion() {
         .create_collection(
             "bad",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(simvec::IndexType::HNSW)
                 .with_hnsw(HnswConfig {
                     max_scan_tuples: Some(0),
                     ..hnsw_config()

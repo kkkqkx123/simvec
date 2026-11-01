@@ -20,7 +20,7 @@ use std::time::Instant;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use simvec::{CollectionConfig, DistanceMetric, HnswConfig, IndexType, LocalVectorEngine};
+use simvec::{CollectionConfig, DistanceMetric, HnswConfig, LocalVectorEngine};
 
 #[path = "quick.rs"]
 mod quick;
@@ -51,7 +51,6 @@ fn build_once(threads: Option<usize>, n: usize) -> std::time::Duration {
         .create_collection(
             "col",
             &CollectionConfig::new(DIM, DistanceMetric::Euclid)
-                .with_index_type(IndexType::HNSW)
                 .with_hnsw(hnsw),
         )
         .unwrap();

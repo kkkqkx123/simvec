@@ -36,23 +36,9 @@ pub enum DistanceMetric {
     Manhattan,
 }
 
-impl DistanceMetric {
-    /// Whether the remote qdrant engine natively supports this metric.
-    pub fn is_supported_by_qdrant(&self) -> bool {
-        matches!(
-            self,
-            Self::Cosine | Self::Euclid | Self::Dot | Self::Manhattan
-        )
-    }
 
-    /// Inverse of [`DistanceMetric::is_supported_by_qdrant`].
-    #[doc(hidden)]
-    pub fn requires_custom_implementation(&self) -> bool {
-        false
-    }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HnswConfig {
     /// Maximum connections per layer above the ground layer; the ground
     /// layer uses `2 * m`. Mirrors pgvector's `m` reloption.
@@ -379,7 +365,7 @@ impl QuantizationConfig {
 /// at any time without affecting correctness (the exact scan stays the
 /// source of truth). Every field has a conservative default so that automatic
 /// promotion never happens unless explicitly enabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IvfConfig {
     /// Number of clusters; `None` = auto (`sqrt(live)` clamped to [1, 4096]).
     pub lists: Option<u32>,
@@ -460,18 +446,45 @@ impl IvfConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Index tier selection for a collection.
+///
+/// The three variants are mutually exclusive: selecting one tier resets
+/// any configuration belonging to another tier, so cross-tier residue is
+/// unrepresentable. `Ivf(None)` means the IVF tier is selected but not
+/// yet trained, which behaves as exact scan until a build publishes lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IndexConfig {
+    Flat,
+    Hnsw(HnswConfig),
+    Ivf(Option<IvfConfig>),
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self::Hnsw(HnswConfig::default())
+    }
+}
+
+impl IndexConfig {
+    pub fn index_type(&self) -> IndexType {
+        match self {
+            Self::Flat => IndexType::FLAT,
+            Self::Hnsw(_) => IndexType::HNSW,
+            Self::Ivf(_) => IndexType::IVF,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionConfig {
     pub vector_size: usize,
     pub distance: DistanceMetric,
-    pub index_type: Option<IndexType>,
-    pub hnsw_config: Option<HnswConfig>,
+    pub index: IndexConfig,
     pub quantization_config: Option<QuantizationConfig>,
     pub replication_factor: Option<usize>,
     pub write_consistency_factor: Option<usize>,
     pub on_disk_payload: Option<bool>,
     pub shard_number: Option<usize>,
-    pub ivf_config: Option<IvfConfig>,
     /// Optional admission cap on live points. When set, an upsert that would
     /// grow the live set past this limit fails with
     /// [`VectorSearchError::CapacityExceeded`](crate::error::VectorSearchError::CapacityExceeded)
@@ -485,33 +498,37 @@ impl CollectionConfig {
         Self {
             vector_size,
             distance,
-            index_type: None,
-            hnsw_config: None,
+            index: IndexConfig::default(),
             quantization_config: None,
             replication_factor: None,
             write_consistency_factor: None,
             on_disk_payload: None,
             shard_number: None,
-            ivf_config: None,
             max_points: None,
         }
     }
 
     pub fn with_ivf(mut self, ivf_config: IvfConfig) -> Self {
-        self.index_type = Some(IndexType::IVF);
-        self.ivf_config = Some(ivf_config);
+        self.index = IndexConfig::Ivf(Some(ivf_config));
         self
     }
 
     pub fn with_index_type(mut self, index_type: IndexType) -> Self {
-        self.index_type = Some(index_type);
+        self.index = match index_type {
+            IndexType::HNSW => IndexConfig::Hnsw(HnswConfig::default()),
+            IndexType::IVF => IndexConfig::Ivf(None),
+            IndexType::FLAT => IndexConfig::Flat,
+        };
         self
     }
 
     pub fn with_hnsw(mut self, hnsw_config: HnswConfig) -> Self {
-        self.index_type = Some(IndexType::HNSW);
-        self.hnsw_config = Some(hnsw_config);
+        self.index = IndexConfig::Hnsw(hnsw_config);
         self
+    }
+
+    pub fn index_type(&self) -> IndexType {
+        self.index.index_type()
     }
 
     pub fn with_quantization(mut self, quantization_config: QuantizationConfig) -> Self {
@@ -988,26 +1005,6 @@ impl From<Vec<SearchQuery>> for BatchSearchQuery {
     }
 }
 
-/// Validate that a distance metric is supported by all backends.
-///
-/// This is the canonical validation used by both the API layer and
-/// sync layer to reject unsupported metrics at index-creation time.
-pub fn validate_distance_metric(distance: DistanceMetric) -> std::result::Result<(), String> {
-    if matches!(
-        distance,
-        DistanceMetric::Cosine
-            | DistanceMetric::Euclid
-            | DistanceMetric::Dot
-            | DistanceMetric::Manhattan
-    ) {
-        Ok(())
-    } else {
-        Err(format!(
-            "distance metric {distance:?} is not supported; supported metrics: Cosine, Euclid, Dot, Manhattan"
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,22 +1068,6 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let deserialized: PointId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, deserialized);
-    }
-
-    #[test]
-    fn test_distance_metric_supported() {
-        assert!(DistanceMetric::Cosine.is_supported_by_qdrant());
-        assert!(DistanceMetric::Euclid.is_supported_by_qdrant());
-        assert!(DistanceMetric::Dot.is_supported_by_qdrant());
-        assert!(DistanceMetric::Manhattan.is_supported_by_qdrant());
-    }
-
-    #[test]
-    fn test_distance_metric_custom_implementation() {
-        assert!(!DistanceMetric::Cosine.requires_custom_implementation());
-        assert!(!DistanceMetric::Euclid.requires_custom_implementation());
-        assert!(!DistanceMetric::Dot.requires_custom_implementation());
-        assert!(!DistanceMetric::Manhattan.requires_custom_implementation());
     }
 
     #[test]
@@ -1181,15 +1162,45 @@ mod tests {
     fn test_collection_config_with_index_type() {
         let cfg =
             CollectionConfig::new(384, DistanceMetric::Euclid).with_index_type(IndexType::FLAT);
-        assert_eq!(cfg.index_type, Some(IndexType::FLAT));
+        assert_eq!(cfg.index, IndexConfig::Flat);
+        assert_eq!(cfg.index_type(), IndexType::FLAT);
     }
 
     #[test]
     fn test_collection_config_with_hnsw() {
         let hnsw = HnswConfig::new(32, 200);
-        let cfg = CollectionConfig::new(128, DistanceMetric::Dot).with_hnsw(hnsw);
-        assert_eq!(cfg.index_type, Some(IndexType::HNSW));
-        assert!(cfg.hnsw_config.is_some());
+        let cfg = CollectionConfig::new(128, DistanceMetric::Dot).with_hnsw(hnsw.clone());
+        assert_eq!(cfg.index, IndexConfig::Hnsw(hnsw));
+        assert_eq!(cfg.index_type(), IndexType::HNSW);
+    }
+
+    #[test]
+    fn test_collection_config_tier_switch_resets() {
+        let cfg = CollectionConfig::new(128, DistanceMetric::Cosine)
+            .with_hnsw(HnswConfig::new(32, 200))
+            .with_index_type(IndexType::FLAT);
+        assert_eq!(cfg.index, IndexConfig::Flat);
+        let cfg = cfg.with_index_type(IndexType::IVF);
+        assert_eq!(cfg.index, IndexConfig::Ivf(None));
+        let ivf = IvfConfig::default();
+        let cfg = cfg.with_ivf(ivf.clone());
+        assert_eq!(cfg.index, IndexConfig::Ivf(Some(ivf)));
+        let cfg = cfg.with_index_type(IndexType::HNSW);
+        assert_eq!(cfg.index, IndexConfig::Hnsw(HnswConfig::default()));
+    }
+
+    #[test]
+    fn test_collection_config_serde_roundtrip() {
+        for cfg in [
+            CollectionConfig::new(64, DistanceMetric::Cosine),
+            CollectionConfig::new(64, DistanceMetric::Cosine).with_index_type(IndexType::FLAT),
+            CollectionConfig::new(64, DistanceMetric::Cosine).with_index_type(IndexType::IVF),
+            CollectionConfig::new(64, DistanceMetric::Cosine).with_ivf(IvfConfig::default()),
+        ] {
+            let json = serde_json::to_string(&cfg).expect("serialize");
+            let back: CollectionConfig = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(cfg, back);
+        }
     }
 
     #[test]

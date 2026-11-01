@@ -23,7 +23,7 @@ use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
 use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexType, IvfConfig, Payload,
+    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig, Payload,
     PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
 };
 
@@ -215,24 +215,22 @@ impl LocalVectorEngine {
     /// [`VectorSearchError::CollectionAlreadyExists`] if it already exists.
     pub fn create_collection(&self, name: &str, config: &CollectionConfig) -> Result<()> {
         let mut effective = config.clone();
-        match effective.index_type.unwrap_or(IndexType::HNSW) {
-            IndexType::HNSW => {
-                if effective.hnsw_config.is_none() {
+        match &mut effective.index {
+            IndexConfig::Hnsw(cfg) => {
+                if *cfg == HnswConfig::default() {
                     if let Some(default) = &*self.default_hnsw.read() {
-                        effective.hnsw_config = Some(default.clone());
+                        *cfg = default.clone();
                     }
                 }
-                effective.ivf_config = None;
             }
-            IndexType::IVF => {
-                if effective.ivf_config.is_none() {
+            IndexConfig::Ivf(opt) => {
+                if opt.is_none() {
                     if let Some(default) = &*self.default_ivf.read() {
-                        effective.ivf_config = Some(default.clone());
+                        *opt = Some(default.clone());
                     }
                 }
-                effective.hnsw_config = None;
             }
-            IndexType::FLAT => {}
+            IndexConfig::Flat => {}
         }
         // Apply default quantization when caller did not specify one (per-collection
         // TOML defaults or global quantization settings).
@@ -251,7 +249,7 @@ impl LocalVectorEngine {
     pub fn set_default_ivf_config(&self, config: IvfConfig) {
         *self.default_ivf.write() = Some(config.clone());
         for store in self.collections.read().values() {
-            store.set_ivf_config(config.clone());
+            let _ = store.set_ivf_config(config.clone());
         }
     }
 
@@ -547,9 +545,7 @@ impl LocalVectorEngine {
         Ok(collections.get(name).map(|store| {
             let meta = store.meta();
             let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
-            config.index_type = Some(meta.index_type);
-            config.hnsw_config = meta.hnsw_config.clone();
-            config.ivf_config = meta.ivf_config.clone();
+            config.index = meta.index.clone();
             config.quantization_config = meta.quantization_config.clone();
             config.max_points = meta.max_points;
             config
@@ -566,9 +562,7 @@ impl LocalVectorEngine {
         let live = store.count();
         let segments = (meta.next_slot as usize).div_ceil(meta.segment_slots as usize);
         let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
-        config.index_type = Some(meta.index_type);
-        config.hnsw_config = meta.hnsw_config.clone();
-        config.ivf_config = meta.ivf_config.clone();
+        config.index = meta.index.clone();
         config.quantization_config = meta.quantization_config.clone();
         config.max_points = meta.max_points;
         Ok(CollectionInfo {
@@ -1038,7 +1032,7 @@ fn maintenance_loop(
                 {
                     let stores = collections.read().clone();
                     for store in stores.values() {
-                        if let IndexType::HNSW = store.meta().index_type {
+                        if matches!(store.meta().index, IndexConfig::Hnsw(_)) {
                             store.drain_pending_hnsw();
                         }
                     }
@@ -1072,10 +1066,10 @@ fn maintenance_sweep(
         }
 
         let meta = store.meta();
-        match meta.index_type {
-            IndexType::FLAT => continue,
-            IndexType::IVF => sweep_ivf(&name, &store, jobs, in_flight),
-            IndexType::HNSW => sweep_hnsw(&name, &store, jobs, in_flight),
+        match meta.index {
+            IndexConfig::Flat => continue,
+            IndexConfig::Ivf(_) => sweep_ivf(&name, &store, jobs, in_flight),
+            IndexConfig::Hnsw(_) => sweep_hnsw(&name, &store, jobs, in_flight),
         }
     }
 }
@@ -1440,13 +1434,7 @@ impl VectorEngine for LocalVectorEngine {
         let store = collections.get(name)?;
         let meta = store.meta();
         let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
-        if let Some(hnsw) = &meta.hnsw_config {
-            config = config
-                .with_index_type(IndexType::HNSW)
-                .with_hnsw(hnsw.clone());
-        } else if let Some(ivf) = &meta.ivf_config {
-            config = config.with_index_type(IndexType::IVF).with_ivf(ivf.clone());
-        }
+        config.index = meta.index.clone();
         if meta.quantization_config.is_some() {
             config.quantization_config = meta.quantization_config.clone();
         }

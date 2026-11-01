@@ -69,8 +69,8 @@ use self::vectors::Vectors;
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::types::{
-    CollectionConfig, DistanceMetric, IndexType, IvfConfig, Payload, PointId, QuantizationConfig,
-    VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId,
+    QuantizationConfig, VectorPoint,
 };
 
 /// Tombstone ratio above which deletes trigger compaction.
@@ -104,8 +104,8 @@ struct StoreInner {
     /// replayed at open, so a replayed record can never collide with a new
     /// one.
     next_lsn: u64,
-    /// IVF configuration for `IndexType::IVF` collections. Persisted in
-    /// `meta.bin`; the engine may still override it at runtime via
+    /// IVF configuration for `Ivf` collections. Mirrors the persisted
+    /// `meta.index`; the engine may still override it at runtime via
     /// [`CollectionStore::set_ivf_config`].
     ivf_config: Option<IvfConfig>,
     /// Last measured drift ratio, exposed via `CollectionInfo`.
@@ -236,18 +236,10 @@ impl CollectionStore {
         ) {
             return Err(VectorSearchError::UnsupportedMetric(config.distance));
         }
-        if matches!(
-            config.index_type.unwrap_or(IndexType::HNSW),
-            IndexType::HNSW
-        ) {
-            if let Some(hnsw) = &config.hnsw_config {
-                hnsw.validate()?;
-            }
-        }
-        if config.index_type == Some(IndexType::IVF) {
-            if let Some(ivf) = &config.ivf_config {
-                ivf.validate()?;
-            }
+        match &config.index {
+            IndexConfig::Hnsw(hnsw) => hnsw.validate()?,
+            IndexConfig::Ivf(Some(ivf)) => ivf.validate()?,
+            IndexConfig::Ivf(None) | IndexConfig::Flat => {}
         }
         if let Some(qc) = &config.quantization_config {
             qc.validate(config.vector_size)?;
@@ -272,22 +264,8 @@ impl CollectionStore {
             config.distance,
             segment_slots,
         );
-        // HNSW is the default ANN tier; FLAT keeps exact scan only.
-        meta.index_type = config.index_type.unwrap_or(IndexType::HNSW);
-        match meta.index_type {
-            IndexType::HNSW => {
-                meta.hnsw_config = Some(config.hnsw_config.clone().unwrap_or_default());
-                meta.ivf_config = None;
-            }
-            IndexType::IVF => {
-                meta.ivf_config = config.ivf_config.clone();
-                meta.hnsw_config = None;
-            }
-            IndexType::FLAT => {
-                meta.ivf_config = None;
-                meta.hnsw_config = None;
-            }
-        }
+        // The tier enum makes cross-tier residue unrepresentable.
+        meta.index = config.index.clone();
         // Persist quantization config alongside other tier settings.
         meta.quantization_config = config.quantization_config.clone();
         // Persist the admission cap so it survives reopen.
@@ -332,7 +310,10 @@ impl CollectionStore {
                 reverse: HashMap::new(),
                 reserved: HashMap::new(),
                 next_lsn: 1,
-                ivf_config: config.ivf_config.clone(),
+                ivf_config: match &config.index {
+                    IndexConfig::Ivf(opt) => opt.clone(),
+                    _ => None,
+                },
                 last_drift_ratio: None,
                 filter_bitmap: FilterBitmap::with_capacity(slot_capacity as usize),
                 payload_indexes: PayloadIndexManager::new(),
@@ -435,7 +416,10 @@ impl CollectionStore {
             dir: dir.to_path_buf(),
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
-                ivf_config: meta.ivf_config.clone(),
+                ivf_config: match &meta.index {
+                    IndexConfig::Ivf(opt) => opt.clone(),
+                    _ => None,
+                },
                 meta,
                 reverse,
                 reserved: HashMap::new(),
@@ -980,6 +964,11 @@ impl CollectionStore {
         field: &str,
         schema: crate::types::PayloadSchemaType,
     ) -> Result<()> {
+        if field == "_id" {
+            return Err(VectorSearchError::InvalidConfig(
+                "payload index on reserved field '_id' is not allowed".to_string(),
+            ));
+        }
         let mut inner = self.inner.write();
         let capacity = inner.meta.slot_capacity as usize;
         inner.payload_indexes.declare(field, schema, capacity)?;
@@ -1181,7 +1170,7 @@ impl CollectionStore {
         // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.
         total += meta.slot_capacity * 20;
         // HNSW graph: Arc node per slot plus per-layer adjacency up to 2*m.
-        if let Some(hnsw) = &meta.hnsw_config {
+        if let IndexConfig::Hnsw(hnsw) = &meta.index {
             let per_node = 64 + (2 * hnsw.m as u64 + 1) * 4;
             total += meta.next_slot * per_node;
         }

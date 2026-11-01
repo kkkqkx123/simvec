@@ -336,7 +336,6 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_ivf");
     let cfg = CollectionConfig::new(4, DistanceMetric::Cosine)
-        .with_index_type(simvec::types::IndexType::IVF)
         .with_ivf(simvec::types::IvfConfig {
             lists: Some(2),
             min_build_points: 1,
