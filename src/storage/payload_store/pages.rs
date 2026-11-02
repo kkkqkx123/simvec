@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+#[cfg(not(unix))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
