@@ -329,6 +329,14 @@ pub enum ConditionType {
     Contains {
         value: String,
     },
+    /// String prefix over the field value; arrays match on any string element.
+    StartsWith {
+        prefix: String,
+    },
+    /// Negation of one nested condition for OR branches.
+    Not {
+        condition: Box<FilterCondition>,
+    },
 }
 
 /// Numeric range bounds; absent bounds are open.

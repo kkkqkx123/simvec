@@ -15,6 +15,11 @@ use crate::types::{
 };
 
 /// Evaluate a whole filter for a point.
+///
+/// Group semantics: every `must` condition holds, no `must_not` condition
+/// holds, a non-empty `should` group needs at least one hit, and a
+/// `min_should` clause needs at least `min_count` hits. All present groups
+/// combine with AND; an empty filter matches every point.
 pub fn matches(filter: &VectorFilter, id: &PointId, payload: Option<&Payload>) -> Result<bool> {
     if let Some(must) = &filter.must {
         for condition in must {
@@ -32,13 +37,16 @@ pub fn matches(filter: &VectorFilter, id: &PointId, payload: Option<&Payload>) -
     }
     match (&filter.should, &filter.min_should) {
         (Some(should), Some(min)) => {
-            let matched = should
-                .iter()
-                .filter(|c| eval_condition(c, id, payload).unwrap_or(false))
-                .count();
-            Ok(matched >= min.min_count)
+            let should_ok = should.is_empty()
+                || should
+                    .iter()
+                    .any(|c| eval_condition(c, id, payload).unwrap_or(false));
+            Ok(should_ok && eval_min_should(min, id, payload)?)
         }
         (Some(should), None) => {
+            if should.is_empty() {
+                return Ok(true);
+            }
             for condition in should {
                 if eval_condition(condition, id, payload)? {
                     return Ok(true);
@@ -137,6 +145,20 @@ fn eval_condition(
                 _ => false,
             })
         }
+        ConditionType::StartsWith { prefix } => {
+            let Some(v) = get_field(payload, &condition.field) else {
+                return Ok(false);
+            };
+            Ok(match v {
+                Value::Array(items) => items.iter().any(|item| match item {
+                    Value::String(s) => s.starts_with(prefix.as_str()),
+                    _ => false,
+                }),
+                Value::String(s) => s.starts_with(prefix.as_str()),
+                _ => false,
+            })
+        }
+        ConditionType::Not { condition: inner } => Ok(!eval_condition(inner, id, payload)?),
     }
 }
 
@@ -536,6 +558,89 @@ mod tests {
         // empty filter matches everything
         assert!(matches(&VectorFilter::new(), &id(), None).unwrap());
         assert!(matches(&VectorFilter::new(), &id(), Some(&p)).unwrap());
+    }
+
+    #[test]
+    fn test_starts_with_and_not() {
+        let p = payload(&[("city", json!("berlin")), ("lang", json!("en"))]);
+        let f = VectorFilter::new().must(FilterCondition::new(
+            "city",
+            ConditionType::StartsWith {
+                prefix: "ber".to_string(),
+            },
+        ));
+        assert!(eval(&f, &p));
+        let f = VectorFilter::new().must(FilterCondition::new(
+            "city",
+            ConditionType::StartsWith {
+                prefix: "erl".to_string(),
+            },
+        ));
+        assert!(!eval(&f, &p));
+        // numeric payloads never match a prefix
+        let p2 = payload(&[("page", json!(42))]);
+        let f = VectorFilter::new().must(FilterCondition::new(
+            "page",
+            ConditionType::StartsWith {
+                prefix: "4".to_string(),
+            },
+        ));
+        assert!(!eval(&f, &p2));
+        // negation wrapper for OR branches
+        let f = VectorFilter::new().should(FilterCondition::new(
+            "lang",
+            ConditionType::Not {
+                condition: Box::new(FilterCondition::match_value("lang", "zh")),
+            },
+        ));
+        assert!(eval(&f, &p));
+        let f = VectorFilter::new().should(FilterCondition::new(
+            "lang",
+            ConditionType::Not {
+                condition: Box::new(FilterCondition::match_value("lang", "en")),
+            },
+        ));
+        assert!(!eval(&f, &p));
+    }
+
+    #[test]
+    fn test_should_and_min_should_combine_with_and() {
+        let p = payload(&[("color", json!("red")), ("size", json!(42))]);
+        // both groups present: each group is checked independently
+        let f = VectorFilter {
+            must: None,
+            must_not: None,
+            should: Some(vec![FilterCondition::match_value("color", "red")]),
+            min_should: Some(MinShouldCondition {
+                conditions: vec![
+                    FilterCondition::match_value("size", "nope"),
+                    FilterCondition::match_value("color", "nope"),
+                ],
+                min_count: 1,
+            }),
+        };
+        assert!(!eval(&f, &p));
+        let f = VectorFilter {
+            must: None,
+            must_not: None,
+            should: Some(vec![FilterCondition::match_value("color", "red")]),
+            min_should: Some(MinShouldCondition {
+                conditions: vec![
+                    FilterCondition::match_value("size", "42"),
+                    FilterCondition::match_value("color", "nope"),
+                ],
+                min_count: 1,
+            }),
+        };
+        assert!(eval(&f, &p));
+        // empty should group constrains nothing
+        let f = VectorFilter {
+            must: None,
+            must_not: None,
+            should: Some(vec![]),
+            min_should: None,
+        };
+        assert!(eval(&f, &p));
     }
 
     #[test]
