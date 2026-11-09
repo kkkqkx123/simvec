@@ -1,0 +1,27 @@
+{
+  "name": "simvec-wasm",
+  "version": "0.1.0",
+  "description": "Browser binding for the simvec in-memory vector engine (wasm-pack output, zero native dependencies)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./persist": {
+      "types": "./src/persist.d.ts",
+      "default": "./src/persist.js"
+    },
+    "./errors": {
+      "types": "./src/errors.d.ts",
+      "default": "./src/errors.js"
+    }
+  },
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir pkg -- --features wasm",
+    "test": "node --test tests/"
+  }
+}

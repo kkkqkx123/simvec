@@ -948,6 +948,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "utoipa",
+ "wasm-bindgen",
 ]
 
 [[package]]
