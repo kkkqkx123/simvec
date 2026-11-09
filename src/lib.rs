@@ -1,6 +1,6 @@
 //! Local vector search engine.
 //!
-//! Exact-scan storage and search. Leaf crate: does not depend on any
+//! HNSW-first ANN search with exact-scan fallback. Leaf crate: does not depend on any
 //! host project crate and does not pull in the qdrant networking stack.
 
 pub mod distance;
@@ -18,3 +18,6 @@ pub use error::VectorEngineError;
 pub use error::{EngineResult, Result, VectorSearchError};
 pub use metrics::{IndexTier, Metrics, MetricsSnapshot, SearchPath, SearchRetry};
 pub use types::*;
+
+#[cfg(feature = "c_api")]
+pub mod c_api;

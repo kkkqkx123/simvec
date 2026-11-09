@@ -2,7 +2,7 @@
 name = "simvec"
 version = "0.1.0"
 edition = "2021"
-description = "Local vector search engine: exact scan, mmap storage, WAL"
+description = "Local vector search engine: HNSW-first ANN search, mmap storage, WAL"
 license = "Apache-2.0"
 repository = "https://github.com/kkkqkx123/simvec"
 homepage = "https://github.com/kkkqkx123/simvec"
@@ -11,8 +11,12 @@ autobenches = false
 [lib]
 name = "simvec"
 path = "src/lib.rs"
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
+# C ABI surface (`src/c_api`) plus `include/simvec.h` regeneration support.
+# Off by default so plain Rust consumers keep a dependency-free rlib build.
+c_api = []
 # Compile in adjacency/list write-lock wait instrumentation. Off by
 # default so the hot mutation paths carry no timing overhead; enable for
 # lock-contention investigations (metrics flow through MetricsSnapshot).

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simvec"
+version = "0.1.0"
+description = "Python ctypes binding for the simvec local vector engine (bring your own libsimvec)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["simvec*"]

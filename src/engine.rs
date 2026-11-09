@@ -350,6 +350,11 @@ impl LocalVectorEngine {
     /// Unloaded directories (rebuild temps, publish backups skipped at open)
     /// are removed from the filesystem directly, so recovery can delete
     /// scratch state without opening it first.
+    ///
+    /// The entry is unregistered before the directory is removed, then this
+    /// waits (bounded) for already-queued maintenance jobs of the collection
+    /// to finish: the worker holds its own handle and could otherwise still
+    /// be writing derived files while the directory is torn down.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
         let dir = {
             let mut collections = self.collections.write();
@@ -361,8 +366,35 @@ impl LocalVectorEngine {
         if !dir.exists() {
             return Err(VectorSearchError::CollectionNotFound(name.to_string()));
         }
+        self.wait_for_collection_jobs(name);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// Block until background maintenance jobs already queued for `name`
+    /// finish, so directory teardown never races derived-file writes.
+    /// Bounded: a stuck worker only delays the removal, and any residual
+    /// failure still surfaces as an error instead of being hidden.
+    fn wait_for_collection_jobs(&self, name: &str) {
+        let keys = [
+            name.to_string(),
+            format!("compact:{name}"),
+            format!("checkpoint:{name}"),
+            format!("drain:{name}"),
+        ];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            {
+                let guard = self.in_flight.lock();
+                if keys.iter().all(|key| !guard.contains(key)) {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Names of all physical collections on disk, including loaded ones plus
