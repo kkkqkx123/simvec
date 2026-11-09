@@ -13,3 +13,6 @@ license = { text = "Apache-2.0" }
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["simvec*"]
+
+[tool.setuptools.package-data]
+simvec = ["py.typed", "*.pyi"]

@@ -2,6 +2,7 @@
 
 use std::ffi::{c_char, c_int};
 
+use crate::types::{HnswConfig, IvfConfig, QuantizationConfig};
 use crate::LocalVectorEngine;
 
 use super::error::{
@@ -107,5 +108,170 @@ pub unsafe extern "C" fn simvec_last_error(
         }
         let _ = code;
         simvec_error_code_t::SIMVEC_OK as c_int
+    })
+}
+
+/// Set the engine-wide default HNSW config from JSON.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `config_json` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_set_default_hnsw_config(
+    engine: *mut simvec_engine_t,
+    config_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let raw = match input_str(config_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid config string".to_string()),
+        };
+        let config: HnswConfig = match super::error::parse_input_json(raw) {
+            Ok(config) => config,
+            Err(code) => return handle.fail_code(code, "invalid config JSON".to_string()),
+        };
+        handle.engine.set_default_hnsw_config(config);
+        handle.ok()
+    })
+}
+
+/// Read the engine-wide default HNSW config as JSON, or JSON null when unset.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_get_default_hnsw_config(
+    engine: *mut simvec_engine_t,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        match serde_json::to_string(&handle.engine.default_hnsw_config()) {
+            Ok(body) => {
+                let emit = emit_json(out, &body);
+                if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                    handle.ok()
+                } else {
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "failed to hand out default config".to_string(),
+                    )
+                }
+            }
+            Err(err) => handle.fail_code(
+                simvec_error_code_t::SIMVEC_INTERNAL,
+                format!("failed to serialize default config: {err}"),
+            ),
+        }
+    })
+}
+
+/// Set the engine-wide default IVF config from JSON.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `config_json` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_set_default_ivf_config(
+    engine: *mut simvec_engine_t,
+    config_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let raw = match input_str(config_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid config string".to_string()),
+        };
+        let config: IvfConfig = match super::error::parse_input_json(raw) {
+            Ok(config) => config,
+            Err(code) => return handle.fail_code(code, "invalid config JSON".to_string()),
+        };
+        handle.engine.set_default_ivf_config(config);
+        handle.ok()
+    })
+}
+
+/// Read the engine-wide default IVF config as JSON, or JSON null when unset.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_get_default_ivf_config(
+    engine: *mut simvec_engine_t,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        match serde_json::to_string(&handle.engine.default_ivf_config()) {
+            Ok(body) => {
+                let emit = emit_json(out, &body);
+                if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                    handle.ok()
+                } else {
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "failed to hand out default config".to_string(),
+                    )
+                }
+            }
+            Err(err) => handle.fail_code(
+                simvec_error_code_t::SIMVEC_INTERNAL,
+                format!("failed to serialize default config: {err}"),
+            ),
+        }
+    })
+}
+
+/// Set the engine-wide default quantization config from JSON.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `config_json` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_set_default_quantization_config(
+    engine: *mut simvec_engine_t,
+    config_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let raw = match input_str(config_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid config string".to_string()),
+        };
+        let config: QuantizationConfig = match super::error::parse_input_json(raw) {
+            Ok(config) => config,
+            Err(code) => return handle.fail_code(code, "invalid config JSON".to_string()),
+        };
+        handle.engine.set_default_quantization_config(config);
+        handle.ok()
+    })
+}
+
+/// Read the engine-wide default quantization config as JSON, or JSON null when unset.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_get_default_quantization_config(
+    engine: *mut simvec_engine_t,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        match serde_json::to_string(&handle.engine.default_quantization_config()) {
+            Ok(body) => {
+                let emit = emit_json(out, &body);
+                if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                    handle.ok()
+                } else {
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "failed to hand out default config".to_string(),
+                    )
+                }
+            }
+            Err(err) => handle.fail_code(
+                simvec_error_code_t::SIMVEC_INTERNAL,
+                format!("failed to serialize default config: {err}"),
+            ),
+        }
     })
 }

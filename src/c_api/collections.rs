@@ -211,3 +211,145 @@ pub unsafe extern "C" fn simvec_collection_config(
         }
     })
 }
+
+/// Promote a temp collection over a live name, keeping a backup suffix copy.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `live`, `temp` and `backup_suffix` must be valid null-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_promote_temp_collection(
+    engine: *mut simvec_engine_t,
+    live: *const c_char,
+    temp: *const c_char,
+    backup_suffix: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let live = match input_str(live) {
+            Ok(live) => live,
+            Err(code) => return handle.fail_code(code, "invalid live name".to_string()),
+        };
+        let temp = match input_str(temp) {
+            Ok(temp) => temp,
+            Err(code) => return handle.fail_code(code, "invalid temp name".to_string()),
+        };
+        let backup_suffix = match input_str(backup_suffix) {
+            Ok(suffix) => suffix,
+            Err(code) => return handle.fail_code(code, "invalid backup suffix".to_string()),
+        };
+        match handle.engine.promote_temp_collection(live, temp, backup_suffix) {
+            Ok(()) => handle.ok(),
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
+/// Restore the newest promote backup over a live name; `*out` takes the backup name.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `live` must be a valid null-terminated UTF-8 string.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_restore_promote_backup(
+    engine: *mut simvec_engine_t,
+    live: *const c_char,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let live = match input_str(live) {
+            Ok(live) => live,
+            Err(code) => return handle.fail_code(code, "invalid live name".to_string()),
+        };
+        match handle.engine.restore_promote_backup(live) {
+            Ok(backup) => match serde_json::to_string(&backup) {
+                Ok(body) => {
+                    let emit = emit_json(out, &body);
+                    if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                        handle.ok()
+                    } else {
+                        handle.fail_code(
+                            simvec_error_code_t::SIMVEC_ERROR,
+                            "failed to hand out backup name".to_string(),
+                        )
+                    }
+                }
+                Err(err) => handle.fail_code(
+                    simvec_error_code_t::SIMVEC_INTERNAL,
+                    format!("failed to serialize backup name: {err}"),
+                ),
+            },
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
+/// List temp rebuild collections as a JSON array of strings.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_list_temp_collections(
+    engine: *mut simvec_engine_t,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let names = handle.engine.list_temp_collections();
+        match serde_json::to_string(&names) {
+            Ok(body) => {
+                let emit = emit_json(out, &body);
+                if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                    handle.ok()
+                } else {
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "failed to hand out temp list".to_string(),
+                    )
+                }
+            }
+            Err(err) => handle.fail_code(
+                simvec_error_code_t::SIMVEC_INTERNAL,
+                format!("failed to serialize temp list: {err}"),
+            ),
+        }
+    })
+}
+
+/// List promote backups of one live collection as a JSON array of strings.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `live` must be a valid null-terminated UTF-8 string.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_list_old_backups(
+    engine: *mut simvec_engine_t,
+    live: *const c_char,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let live = match input_str(live) {
+            Ok(live) => live,
+            Err(code) => return handle.fail_code(code, "invalid live name".to_string()),
+        };
+        let names = handle.engine.list_old_backups_for(live);
+        match serde_json::to_string(&names) {
+            Ok(body) => {
+                let emit = emit_json(out, &body);
+                if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                    handle.ok()
+                } else {
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "failed to hand out backup list".to_string(),
+                    )
+                }
+            }
+            Err(err) => handle.fail_code(
+                simvec_error_code_t::SIMVEC_INTERNAL,
+                format!("failed to serialize backup list: {err}"),
+            ),
+        }
+    })
+}

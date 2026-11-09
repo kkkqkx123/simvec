@@ -3,7 +3,7 @@
 use std::ffi::{c_char, c_int};
 
 use crate::types::PointId;
-use crate::{Payload, PayloadSchemaType, VectorFilter, VectorPoint};
+use crate::{Payload, PayloadSchemaType, TxnOp, VectorFilter, VectorPoint};
 
 use super::error::{
     emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json,
@@ -422,6 +422,98 @@ pub unsafe extern "C" fn simvec_delete_payload_index(
                 *out = i32::from(existed);
                 handle.ok()
             }
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
+/// Set one payload field on a point, preserving all other keys.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection`, `id` and `key` must be valid null-terminated UTF-8 strings.
+/// - `value_json` must be a valid null-terminated UTF-8 string holding any JSON value.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_set_payload_field(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+    id: *const c_char,
+    key: *const c_char,
+    value_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        let id = match input_str(id) {
+            Ok(id) => id,
+            Err(code) => return handle.fail_code(code, "invalid point id".to_string()),
+        };
+        let key = match input_str(key) {
+            Ok(key) => key,
+            Err(code) => return handle.fail_code(code, "invalid field name".to_string()),
+        };
+        let raw = match input_str(value_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid value string".to_string()),
+        };
+        let value: serde_json::Value = match parse_input_json(raw) {
+            Ok(value) => value,
+            Err(code) => return handle.fail_code(code, "invalid value JSON".to_string()),
+        };
+        match handle.engine.set_payload_field(
+            collection,
+            &PointId::from(id),
+            key.to_string(),
+            value,
+        ) {
+            Ok(()) => handle.ok(),
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
+/// One transaction operation as carried by `simvec_apply_txn` JSON.
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")] 
+enum TxnOpDto {
+    Upsert { collection: String, point: VectorPoint },
+    Delete { collection: String, id: String },
+}
+
+/// Commit a JSON array of upsert/delete operations grouped per collection.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `ops_json` must be a valid null-terminated UTF-8 string holding a JSON
+///   array of `{op: upsert|delete, ...}` objects.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_apply_txn(
+    engine: *mut simvec_engine_t,
+    ops_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let raw = match input_str(ops_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid ops string".to_string()),
+        };
+        let ops: Vec<TxnOpDto> = match parse_input_json(raw) {
+            Ok(ops) => ops,
+            Err(code) => return handle.fail_code(code, "invalid ops JSON".to_string()),
+        };
+        let ops: Vec<TxnOp> = ops
+            .into_iter()
+            .map(|item| match item {
+                TxnOpDto::Upsert { collection, point } => TxnOp::Upsert { collection, point },
+                TxnOpDto::Delete { collection, id } => TxnOp::Delete {
+                    collection,
+                    point_id: PointId::from(id.as_str()),
+                },
+            })
+            .collect();
+        match handle.engine.apply_txn(ops) {
+            Ok(()) => handle.ok(),
             Err(err) => handle.fail(&err),
         }
     })

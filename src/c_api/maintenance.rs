@@ -149,6 +149,28 @@ pub unsafe extern "C" fn simvec_drop_index(
     })
 }
 
+/// Drop published index structures through the dedicated published-index path.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_drop_published_index(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        match handle.engine.drop_published_index(collection) {
+            Ok(()) => handle.ok(),
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
 /// Reclaim tombstoned slots; `*out` takes the live point count.
 ///
 /// # Safety

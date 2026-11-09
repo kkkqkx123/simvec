@@ -48,6 +48,8 @@ describe("simvec js binding smoke", () => {
     assert.equal(engine.get("docs", "1").payload.lang, "en");
     engine.mergePayload("docs", "1", { topic: "intro" });
     assert.equal(engine.get("docs", "1").payload.topic, "intro");
+    engine.setPayloadField("docs", "1", "level", 3);
+    assert.equal(engine.get("docs", "1").payload.level, 3);
     engine.deletePayloadKeys("docs", "1", ["topic"]);
     assert.equal(engine.get("docs", "1").payload.topic, undefined);
 
@@ -71,8 +73,11 @@ describe("simvec js binding smoke", () => {
     engine.buildIndex("docs");
     engine.buildQuantization("docs");
     engine.drainPending("docs");
+    engine.dropPublishedIndex("docs");
     engine.dropIndex("docs");
     engine.runMaintenanceSweep();
+    assert.equal(typeof engine.lastCode, "number");
+    assert.equal(typeof engine.lastMessage, "string");
 
     engine.delete("docs", "2");
     assert.equal(engine.count("docs"), 1);
@@ -82,12 +87,18 @@ describe("simvec js binding smoke", () => {
     assert.equal(engine.collectionExists("docs"), false);
   });
 
-  it("covers batch deletes, filtered deletes and compaction", () => {
+  it("covers transactions, batch deletes, filtered deletes and compaction", () => {
     engine.createCollection("batch", { vector_size: 3, distance: "Cosine", index: "Flat" });
     engine.upsertBatch("batch", [
       { id: "a", vector: [1, 0, 0], payload: { color: "red" } },
       { id: "b", vector: [0, 1, 0], payload: { color: "blue" } },
       { id: "c", vector: [0, 0, 1], payload: { color: "red" } },
+    ]);
+    assert.equal(engine.count("batch"), 3);
+
+    engine.applyTxn([
+      { op: "upsert", collection: "batch", point: { id: "d", vector: [1, 1, 0] } },
+      { op: "delete", collection: "batch", id: "d" },
     ]);
     assert.equal(engine.count("batch"), 3);
 
@@ -103,5 +114,40 @@ describe("simvec js binding smoke", () => {
 
     engine.deleteCollection("batch");
     assert.throws(() => engine.get("batch", "b"), NotFoundError);
+  });
+
+  it("covers promote lifecycle and default configs", () => {
+    engine.createCollection("live", { vector_size: 2, distance: "Cosine", index: "Flat" });
+    engine.upsert("live", "1", [1, 0]);
+    engine.createCollection("live.rebuild-7", { vector_size: 2, distance: "Cosine", index: "Flat" });
+    engine.upsert("live.rebuild-7", "2", [0, 1]);
+    assert.deepEqual(engine.listTempCollections(), ["live.rebuild-7"]);
+
+    engine.promoteTempCollection("live", "live.rebuild-7", ".old-7");
+    assert.deepEqual(engine.get("live", "2").vector, [0, 1]);
+    assert.deepEqual(engine.listOldBackups("live"), ["live.old-7"]);
+    assert.equal(engine.restorePromoteBackup("live"), "live.old-7");
+    assert.deepEqual(engine.get("live", "1").vector, [1, 0]);
+    engine.deleteCollection("live");
+
+    assert.equal(engine.getDefaultHnswConfig(), null);
+    assert.equal(engine.getDefaultIvfConfig(), null);
+    assert.equal(engine.getDefaultQuantizationConfig(), null);
+    engine.setDefaultHnswConfig({ m: 8, ef_construct: 32 });
+    engine.setDefaultIvfConfig({
+      lists: null,
+      min_build_points: 1000,
+      sample_limit: 1024,
+      kmeans_max_iter: 10,
+      drift_threshold: 0.1,
+      drift_check_interval: 1000,
+      default_nprobe: 4,
+      auto_promotion: false,
+      max_probes: null,
+    });
+    engine.setDefaultQuantizationConfig({ quant_type: { Binary: { always_ram: true } } });
+    assert.equal(engine.getDefaultHnswConfig().m, 8);
+    assert.equal(typeof engine.getDefaultIvfConfig(), "object");
+    assert.equal(typeof engine.getDefaultQuantizationConfig(), "object");
   });
 });

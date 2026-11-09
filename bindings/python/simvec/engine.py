@@ -73,7 +73,6 @@ class Engine:
             message = _take_string(raw)
             errors.raise_for_code(code, message)
         self._handle = handle
-        self._arrays = []
 
     def close(self):
         """Close the engine; safe to call more than once."""
@@ -137,9 +136,25 @@ class Engine:
 
     # -- writes --
 
+    @property
+    def last_code(self):
+        """Most recent status code recorded on the native handle."""
+        if self._handle is None:
+            return errors.SIMVEC_MISUSE
+        return _lib.simvec_errcode(self._handle)
+
+    @property
+    def last_message(self):
+        """Most recent error text recorded on the native handle."""
+        if self._handle is None:
+            return "engine is closed"
+        out = ctypes.c_void_p()
+        if _lib.simvec_last_error(self._handle, ctypes.byref(out)) != errors.SIMVEC_OK:
+            return ""
+        return _take_string(out)
+
     def upsert(self, collection, point_id, vector, payload=None):
         data, size = _vector_array(vector)
-        self._arrays.append(data)
         _check(
             _lib.simvec_upsert(
                 self._handle,
@@ -220,6 +235,24 @@ class Engine:
             self._handle,
         )
 
+    def set_payload_field(self, collection, point_id, key, value):
+        _check(
+            _lib.simvec_set_payload_field(
+                self._handle,
+                _encode_str(collection),
+                _encode_str(str(point_id)),
+                _encode_str(key),
+                _encode_json(value),
+            ),
+            self._handle,
+        )
+
+    def apply_txn(self, ops):
+        _check(
+            _lib.simvec_apply_txn(self._handle, _encode_json(ops)),
+            self._handle,
+        )
+
     def create_payload_index(self, collection, field, schema):
         _check(
             _lib.simvec_create_payload_index(
@@ -261,7 +294,6 @@ class Engine:
     def search_vector(self, collection, vector, limit, query_filter=None,
                       score_threshold=-1.0, with_payload=True, with_vector=False):
         data, size = _vector_array(vector)
-        self._arrays.append(data)
         out = ctypes.c_void_p()
         _check(
             _lib.simvec_search_vector(
@@ -326,8 +358,50 @@ class Engine:
         )
         return bool(out.value)
 
+    def build_quantization(self, collection):
+        out = ctypes.c_int()
+        _check(
+            _lib.simvec_build_quantization(
+                self._handle, _encode_str(collection), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return bool(out.value)
+
+    def has_index(self, collection):
+        out = ctypes.c_int()
+        _check(
+            _lib.simvec_has_index(
+                self._handle, _encode_str(collection), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return bool(out.value)
+
+    def has_quantization(self, collection):
+        out = ctypes.c_int()
+        _check(
+            _lib.simvec_has_quantization(
+                self._handle, _encode_str(collection), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return bool(out.value)
+
     def drop_index(self, collection):
         _check(_lib.simvec_drop_index(self._handle, _encode_str(collection)), self._handle)
+
+    def drop_published_index(self, collection):
+        _check(
+            _lib.simvec_drop_published_index(self._handle, _encode_str(collection)),
+            self._handle,
+        )
+
+    def drain_pending(self, collection):
+        _check(
+            _lib.simvec_drain_pending(self._handle, _encode_str(collection)),
+            self._handle,
+        )
 
     def compact(self, collection):
         out = ctypes.c_uint64()
@@ -349,3 +423,84 @@ class Engine:
 
     def run_maintenance_sweep(self):
         _check(_lib.simvec_run_maintenance_sweep(self._handle), self._handle)
+
+    def promote_temp_collection(self, live, temp, backup_suffix):
+        _check(
+            _lib.simvec_promote_temp_collection(
+                self._handle,
+                _encode_str(live),
+                _encode_str(temp),
+                _encode_str(backup_suffix),
+            ),
+            self._handle,
+        )
+
+    def restore_promote_backup(self, live):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_restore_promote_backup(
+                self._handle, _encode_str(live), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def list_temp_collections(self):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_list_temp_collections(self._handle, ctypes.byref(out)),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def list_old_backups(self, live):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_list_old_backups(
+                self._handle, _encode_str(live), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def set_default_hnsw_config(self, config):
+        _check(
+            _lib.simvec_set_default_hnsw_config(self._handle, _encode_json(config)),
+            self._handle,
+        )
+
+    def get_default_hnsw_config(self):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_get_default_hnsw_config(self._handle, ctypes.byref(out)),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def set_default_ivf_config(self, config):
+        _check(
+            _lib.simvec_set_default_ivf_config(self._handle, _encode_json(config)),
+            self._handle,
+        )
+
+    def get_default_ivf_config(self):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_get_default_ivf_config(self._handle, ctypes.byref(out)),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def set_default_quantization_config(self, config):
+        _check(
+            _lib.simvec_set_default_quantization_config(self._handle, _encode_json(config)),
+            self._handle,
+        )
+
+    def get_default_quantization_config(self):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_get_default_quantization_config(self._handle, ctypes.byref(out)),
+            self._handle,
+        )
+        return _take_json(out)

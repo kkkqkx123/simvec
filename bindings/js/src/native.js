@@ -67,6 +67,11 @@ const DEFINITIONS = {
     arguments: ["pointer", "string", "pointer"],
     return: "int32",
   },
+  simvec_set_payload_field: {
+    arguments: ["pointer", "string", "string", "string", "string"],
+    return: "int32",
+  },
+  simvec_apply_txn: { arguments: ["pointer", "string"], return: "int32" },
   simvec_search: {
     arguments: ["pointer", "string", "string", "pointer"],
     return: "int32",
@@ -97,6 +102,7 @@ const DEFINITIONS = {
   simvec_has_index: { arguments: ["pointer", "string", "pointer"], return: "int32" },
   simvec_has_quantization: { arguments: ["pointer", "string", "pointer"], return: "int32" },
   simvec_drop_index: { arguments: ["pointer", "string"], return: "int32" },
+  simvec_drop_published_index: { arguments: ["pointer", "string"], return: "int32" },
   simvec_compact: { arguments: ["pointer", "string", "pointer"], return: "int32" },
   simvec_drain_pending: { arguments: ["pointer", "string"], return: "int32" },
   simvec_collection_metrics: {
@@ -104,6 +110,31 @@ const DEFINITIONS = {
     return: "int32",
   },
   simvec_run_maintenance_sweep: { arguments: ["pointer"], return: "int32" },
+  simvec_promote_temp_collection: {
+    arguments: ["pointer", "string", "string", "string"],
+    return: "int32",
+  },
+  simvec_restore_promote_backup: {
+    arguments: ["pointer", "string", "pointer"],
+    return: "int32",
+  },
+  simvec_list_temp_collections: { arguments: ["pointer", "pointer"], return: "int32" },
+  simvec_list_old_backups: {
+    arguments: ["pointer", "string", "pointer"],
+    return: "int32",
+  },
+  simvec_set_default_hnsw_config: { arguments: ["pointer", "string"], return: "int32" },
+  simvec_get_default_hnsw_config: { arguments: ["pointer", "pointer"], return: "int32" },
+  simvec_set_default_ivf_config: { arguments: ["pointer", "string"], return: "int32" },
+  simvec_get_default_ivf_config: { arguments: ["pointer", "pointer"], return: "int32" },
+  simvec_set_default_quantization_config: {
+    arguments: ["pointer", "string"],
+    return: "int32",
+  },
+  simvec_get_default_quantization_config: {
+    arguments: ["pointer", "pointer"],
+    return: "int32",
+  },
 };
 
 function loadLibrary() {

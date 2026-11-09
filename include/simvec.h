@@ -174,6 +174,39 @@ int simvec_collection_metrics(struct simvec_engine_t *engine, const char *collec
 
 int simvec_run_maintenance_sweep(struct simvec_engine_t *engine);
 
+int simvec_set_payload_field(struct simvec_engine_t *engine,
+                              const char *collection,
+                              const char *id,
+                              const char *key,
+                              const char *value_json);
+
+int simvec_apply_txn(struct simvec_engine_t *engine, const char *ops_json);
+
+int simvec_drop_published_index(struct simvec_engine_t *engine, const char *collection);
+
+int simvec_promote_temp_collection(struct simvec_engine_t *engine,
+                                     const char *live,
+                                     const char *temp,
+                                     const char *backup_suffix);
+
+int simvec_restore_promote_backup(struct simvec_engine_t *engine, const char *live, char **out);
+
+int simvec_list_temp_collections(struct simvec_engine_t *engine, char **out);
+
+int simvec_list_old_backups(struct simvec_engine_t *engine, const char *live, char **out);
+
+int simvec_set_default_hnsw_config(struct simvec_engine_t *engine, const char *config_json);
+
+int simvec_get_default_hnsw_config(struct simvec_engine_t *engine, char **out);
+
+int simvec_set_default_ivf_config(struct simvec_engine_t *engine, const char *config_json);
+
+int simvec_get_default_ivf_config(struct simvec_engine_t *engine, char **out);
+
+int simvec_set_default_quantization_config(struct simvec_engine_t *engine, const char *config_json);
+
+int simvec_get_default_quantization_config(struct simvec_engine_t *engine, char **out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

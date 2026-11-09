@@ -107,6 +107,24 @@ export class Engine {
     this._closed = true;
   }
 
+  get lastCode() {
+    if (this._closed || this._handle === null) {
+      return 20;
+    }
+    return functions.simvec_errcode(this._handle);
+  }
+
+  get lastMessage() {
+    if (this._closed || this._handle === null) {
+      return "engine is closed";
+    }
+    const out = outPointer();
+    if (functions.simvec_last_error(this._handle, out) !== SIMVEC_OK) {
+      return "";
+    }
+    return takeString(readPointer(out));
+  }
+
   [Symbol.dispose]() {
     this.close();
   }
@@ -224,6 +242,25 @@ export class Engine {
       ),
       handle,
     );
+  }
+
+  setPayloadField(collection, id, key, value) {
+    const handle = this._requireOpen();
+    check(
+      functions.simvec_set_payload_field(
+        handle,
+        String(collection),
+        String(id),
+        String(key),
+        encodeJson(value),
+      ),
+      handle,
+    );
+  }
+
+  applyTxn(ops) {
+    const handle = this._requireOpen();
+    check(functions.simvec_apply_txn(handle, encodeJson(ops)), handle);
   }
 
   deletePayloadKeys(collection, id, keys) {
@@ -374,6 +411,11 @@ export class Engine {
     check(functions.simvec_drop_index(handle, String(collection)), handle);
   }
 
+  dropPublishedIndex(collection) {
+    const handle = this._requireOpen();
+    check(functions.simvec_drop_published_index(handle, String(collection)), handle);
+  }
+
   compact(collection) {
     const handle = this._requireOpen();
     const out = outPointer();
@@ -396,5 +438,81 @@ export class Engine {
   runMaintenanceSweep() {
     const handle = this._requireOpen();
     check(functions.simvec_run_maintenance_sweep(handle), handle);
+  }
+
+  promoteTempCollection(live, temp, backupSuffix) {
+    const handle = this._requireOpen();
+    check(
+      functions.simvec_promote_temp_collection(
+        handle,
+        String(live),
+        String(temp),
+        String(backupSuffix),
+      ),
+      handle,
+    );
+  }
+
+  restorePromoteBackup(live) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(
+      functions.simvec_restore_promote_backup(handle, String(live), out),
+      handle,
+    );
+    return takeJson(readPointer(out));
+  }
+
+  listTempCollections() {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_list_temp_collections(handle, out), handle);
+    return takeJson(readPointer(out));
+  }
+
+  listOldBackups(live) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_list_old_backups(handle, String(live), out), handle);
+    return takeJson(readPointer(out));
+  }
+
+  setDefaultHnswConfig(config) {
+    const handle = this._requireOpen();
+    check(functions.simvec_set_default_hnsw_config(handle, encodeJson(config)), handle);
+  }
+
+  getDefaultHnswConfig() {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_get_default_hnsw_config(handle, out), handle);
+    return takeJson(readPointer(out));
+  }
+
+  setDefaultIvfConfig(config) {
+    const handle = this._requireOpen();
+    check(functions.simvec_set_default_ivf_config(handle, encodeJson(config)), handle);
+  }
+
+  getDefaultIvfConfig() {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_get_default_ivf_config(handle, out), handle);
+    return takeJson(readPointer(out));
+  }
+
+  setDefaultQuantizationConfig(config) {
+    const handle = this._requireOpen();
+    check(
+      functions.simvec_set_default_quantization_config(handle, encodeJson(config)),
+      handle,
+    );
+  }
+
+  getDefaultQuantizationConfig() {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_get_default_quantization_config(handle, out), handle);
+    return takeJson(readPointer(out));
   }
 }

@@ -97,6 +97,10 @@ _lib.simvec_delete_payload_index.argtypes = [
 _lib.simvec_delete_payload_index.restype = ctypes.c_int
 _lib.simvec_list_payload_indexes.argtypes = [_engine_p, _c_str, _c_out_str]
 _lib.simvec_list_payload_indexes.restype = ctypes.c_int
+_lib.simvec_set_payload_field.argtypes = [_engine_p, _c_str, _c_str, _c_str, _c_str]
+_lib.simvec_set_payload_field.restype = ctypes.c_int
+_lib.simvec_apply_txn.argtypes = [_engine_p, _c_str]
+_lib.simvec_apply_txn.restype = ctypes.c_int
 
 _lib.simvec_search.argtypes = [_engine_p, _c_str, _c_str, _c_out_str]
 _lib.simvec_search.restype = ctypes.c_int
@@ -138,6 +142,8 @@ _lib.simvec_has_quantization.argtypes = [_engine_p, _c_str, ctypes.POINTER(ctype
 _lib.simvec_has_quantization.restype = ctypes.c_int
 _lib.simvec_drop_index.argtypes = [_engine_p, _c_str]
 _lib.simvec_drop_index.restype = ctypes.c_int
+_lib.simvec_drop_published_index.argtypes = [_engine_p, _c_str]
+_lib.simvec_drop_published_index.restype = ctypes.c_int
 _lib.simvec_compact.argtypes = [_engine_p, _c_str, ctypes.POINTER(ctypes.c_uint64)]
 _lib.simvec_compact.restype = ctypes.c_int
 _lib.simvec_drain_pending.argtypes = [_engine_p, _c_str]
@@ -146,6 +152,26 @@ _lib.simvec_collection_metrics.argtypes = [_engine_p, _c_str, _c_out_str]
 _lib.simvec_collection_metrics.restype = ctypes.c_int
 _lib.simvec_run_maintenance_sweep.argtypes = [_engine_p]
 _lib.simvec_run_maintenance_sweep.restype = ctypes.c_int
+_lib.simvec_promote_temp_collection.argtypes = [_engine_p, _c_str, _c_str, _c_str]
+_lib.simvec_promote_temp_collection.restype = ctypes.c_int
+_lib.simvec_restore_promote_backup.argtypes = [_engine_p, _c_str, _c_out_str]
+_lib.simvec_restore_promote_backup.restype = ctypes.c_int
+_lib.simvec_list_temp_collections.argtypes = [_engine_p, _c_out_str]
+_lib.simvec_list_temp_collections.restype = ctypes.c_int
+_lib.simvec_list_old_backups.argtypes = [_engine_p, _c_str, _c_out_str]
+_lib.simvec_list_old_backups.restype = ctypes.c_int
+_lib.simvec_set_default_hnsw_config.argtypes = [_engine_p, _c_str]
+_lib.simvec_set_default_hnsw_config.restype = ctypes.c_int
+_lib.simvec_get_default_hnsw_config.argtypes = [_engine_p, _c_out_str]
+_lib.simvec_get_default_hnsw_config.restype = ctypes.c_int
+_lib.simvec_set_default_ivf_config.argtypes = [_engine_p, _c_str]
+_lib.simvec_set_default_ivf_config.restype = ctypes.c_int
+_lib.simvec_get_default_ivf_config.argtypes = [_engine_p, _c_out_str]
+_lib.simvec_get_default_ivf_config.restype = ctypes.c_int
+_lib.simvec_set_default_quantization_config.argtypes = [_engine_p, _c_str]
+_lib.simvec_set_default_quantization_config.restype = ctypes.c_int
+_lib.simvec_get_default_quantization_config.argtypes = [_engine_p, _c_out_str]
+_lib.simvec_get_default_quantization_config.restype = ctypes.c_int
 
 
 def lib():
