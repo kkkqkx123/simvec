@@ -1,0 +1,34 @@
+#!/bin/sh
+# Resolve the prebuilt libsimvec location and generate src/Makevars.
+# SIMVEC_LIB may name the library file explicitly; otherwise the workspace
+# target/debug and target/release outputs next to this checkout are used.
+set -eu
+
+pkg_dir=$(dirname "$0")
+root=$(cd "$pkg_dir/../.." && pwd)
+
+lib_file=${SIMVEC_LIB:-}
+if [ -z "$lib_file" ]; then
+  for profile in debug release; do
+    for name in libsimvec.so libsimvec.dylib simvec.dll; do
+      candidate="$root/target/$profile/$name"
+      if [ -f "$candidate" ]; then
+        lib_file=$candidate
+        break 2
+      fi
+    done
+  done
+fi
+
+if [ -z "$lib_file" ] || [ ! -f "$lib_file" ]; then
+  echo "configure: libsimvec not found; set SIMVEC_LIB or run cargo build --features c_api first." >&2
+  exit 1
+fi
+
+lib_dir=$(dirname "$lib_file")
+
+sed -e "s|@SIMVEC_INCLUDE@|$root/include|g" \
+    -e "s|@SIMVEC_LIBDIR@|$lib_dir|g" \
+    "$pkg_dir/src/Makevars.in" > "$pkg_dir/src/Makevars"
+
+echo "configure: using libsimvec at $lib_file"

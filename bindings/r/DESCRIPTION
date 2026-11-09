@@ -1,0 +1,12 @@
+Package: simvec
+Version: 0.1.0
+Title: Local Vector Search Engine Binding
+Description: Thin R binding over the simvec C API (bring your own
+    libsimvec). Covers collections, writes, payloads, transactions,
+    retrieval, maintenance, and engine default configs with the same
+    semantics as the Python, JavaScript, and Go bindings.
+Authors@R: person("simvec contributors", email = "simvec-maintainers@example.com", role = c("aut", "cre"))
+License: Apache-2.0
+Encoding: UTF-8
+Imports: jsonlite
+SystemRequirements: C toolchain; libsimvec built with the c_api feature
