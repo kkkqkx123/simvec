@@ -93,11 +93,13 @@ Cosine 在计算时实时求范数，而不是写入时归一化：`vectors.bin`
 | `lock-metrics` | 关闭 | 编译进邻接表 / 链表写锁等待埋点；指标经 `MetricsSnapshot` 输出 |
 | `simd_portable` | 关闭 | 可移植 `std::simd` 内核（stable Rust 尚不可用）；目前作为占位实现委托给 `naive`，待 `std::simd` 稳定 |
 
-## C API 与 Python 绑定
+## C API、Python 与 JavaScript 绑定
 
 `c_api` cargo 特性在同一引擎之上暴露稳定的 C ABI：所有入口返回整型状态码，入参一律借用，分配的出参统一用 `simvec_free_string` 释放；配置、查询、过滤器、payload 与检索结果以 JSON 穿越 FFI，直接复用 Rust 侧的 serde 结构。手写的 `include/simvec.h` 与 cbindgen 输出保持对齐（`build.rs` 在 cbindgen 可用时重生成）；用 `cargo build --features c_api` 构建，默认构建仍是纯 Rust rlib。
 
 `bindings/python` 是该 C API 上的纯 Python ctypes 封装，不含任何原生代码：先构建 Rust 动态库，再通过 `SIMVEC_LIB` 指向它（否则回退到 checkout 旁的 `target/debug` / `target/release`）。配置、过滤器、payload 与查询都是普通 dict，向量接受任意浮点序列并以连续 float32 数组传递，`Engine` 把非零状态码映射为类型化异常。在 `bindings/python` 下用 `SIMVEC_LIB=/path/to/libsimvec.so python -m pytest tests -q` 运行烟囱测试。
+
+`bindings/js` 是同构的零依赖 JavaScript 封装：经 Node.js 内建 `node:ffi` 模块调用 C API（Node 22+，需 `--experimental-ffi`），同样经 `SIMVEC_LIB` 解析 `libsimvec` 并回退到 `target/debug` / `target/release`，对外提供驼峰命名的 `Engine` 类与类型化错误。在 `bindings/js` 下用 `SIMVEC_LIB=/path/to/libsimvec.so node --experimental-ffi --test tests/` 运行烟囱测试。
 
 ## 测试与基准
 

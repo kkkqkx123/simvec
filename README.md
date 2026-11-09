@@ -93,11 +93,13 @@ Cosine computes norms on the fly rather than normalizing at insert time: `vector
 | `lock-metrics` | off | Compile in adjacency/list write-lock wait instrumentation; metrics flow through `MetricsSnapshot` |
 | `simd_portable` | off | Portable `std::simd` kernel (unstable on stable Rust); currently delegates to `naive` as a placeholder until `std::simd` stabilizes |
 
-## C API and Python bindings
+## C API, Python and JavaScript bindings
 
 The `c_api` cargo feature exposes a stable C ABI over the same engine: every entry point returns an integer status code, inputs are borrowed, allocated outputs are released with `simvec_free_string`, and configs, queries, filters, payloads and results cross the boundary as JSON reusing the Rust serde shapes. The hand-maintained `include/simvec.h` mirrors the cbindgen output (`build.rs` regenerates it when cbindgen is available); build with `cargo build --features c_api`, default builds stay a plain Rust rlib.
 
 `bindings/python` is a pure-Python ctypes wrapper over that C API and ships no native code: build the Rust dynamic library first and point the wrapper at it via `SIMVEC_LIB` (falling back to `target/debug` / `target/release` next to the checkout). Configs, filters, payloads and queries are plain dicts, vectors accept any float sequence sent as contiguous float32 arrays, and `Engine` maps nonzero status codes to typed exceptions. Run the smoke tests with `SIMVEC_LIB=/path/to/libsimvec.so python -m pytest tests -q` from `bindings/python`.
+
+`bindings/js` is the same shape in JavaScript with zero dependencies: it calls the C API through the Node.js built-in `node:ffi` module (Node 22+, run with `--experimental-ffi`), resolves `libsimvec` via `SIMVEC_LIB` with the same `target/debug` / `target/release` fallback, and exposes an `Engine` class with camelCase methods and typed errors. Run the smoke tests with `SIMVEC_LIB=/path/to/libsimvec.so node --experimental-ffi --test tests/` from `bindings/js`.
 
 ## Testing and benchmarks
 

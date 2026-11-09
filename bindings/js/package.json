@@ -1,0 +1,17 @@
+{
+  "name": "simvec",
+  "version": "0.1.0",
+  "description": "JavaScript binding for the simvec local vector engine (bring your own libsimvec, zero dependencies)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --experimental-ffi --test tests/"
+  }
+}
