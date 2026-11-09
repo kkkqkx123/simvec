@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::distance::{distance, to_score};
 use crate::error::{Result, VectorSearchError};
@@ -105,13 +106,24 @@ impl MemoryCollection {
 #[derive(Debug, Default)]
 pub struct MemoryEngine {
     collections: RwLock<HashMap<String, MemoryCollection>>,
+    revision: AtomicU64,
 }
 
 impl MemoryEngine {
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Monotonic counter advanced by every state-changing mutation.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
     /// Create an empty engine with no collections.
     pub fn new() -> Self {
         Self {
             collections: RwLock::new(HashMap::new()),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -158,6 +170,7 @@ impl MemoryEngine {
                 payload_indexes: Vec::new(),
             },
         );
+        self.bump_revision();
         Ok(())
     }
 
@@ -166,10 +179,11 @@ impl MemoryEngine {
         let mut guard = self.collections.write().map_err(|_| {
             VectorSearchError::Internal("memory engine lock poisoned".to_string())
         })?;
-        guard
-            .remove(name)
-            .map(|_| ())
-            .ok_or_else(|| VectorSearchError::CollectionNotFound(name.to_string()))
+        if guard.remove(name).is_none() {
+            return Err(VectorSearchError::CollectionNotFound(name.to_string()));
+        }
+        self.bump_revision();
+        Ok(())
     }
 
     /// Whether a collection exists.
@@ -246,6 +260,7 @@ impl MemoryEngine {
                 }
             }
             c.points.insert(point.id.clone(), point);
+            self.bump_revision();
             Ok(())
         })
     }
@@ -261,7 +276,9 @@ impl MemoryEngine {
     /// Delete a point by id. Deleting a missing id is a no-op.
     pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
         self.with_collection_mut(collection, |c| {
-            c.points.remove(point_id);
+            if c.points.remove(point_id).is_some() {
+                self.bump_revision();
+            }
             Ok(())
         })
     }
@@ -269,8 +286,14 @@ impl MemoryEngine {
     /// Delete a batch of points.
     pub fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> Result<()> {
         self.with_collection_mut(collection, |c| {
+            let mut removed = false;
             for id in point_ids {
-                c.points.remove(id);
+                if c.points.remove(id).is_some() {
+                    removed = true;
+                }
+            }
+            if removed {
+                self.bump_revision();
             }
             Ok(())
         })
@@ -289,11 +312,15 @@ impl MemoryEngine {
             for id in doomed {
                 c.points.remove(&id);
             }
+            if count > 0 {
+                self.bump_revision();
+            }
             Ok(count)
         })
     }
 
     /// Exact-scan search. Scores follow the crate-wide higher-is-better contract.
+    /// Kernel dispatch degrades to the scalar baseline on wasm32.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         self.with_collection(collection, |c| {
             if query.vector.len() != c.config.vector_size {
@@ -405,6 +432,7 @@ impl MemoryEngine {
                 .get_mut(point_id)
                 .ok_or_else(|| VectorSearchError::InvalidPointId(point_id.to_string()))?;
             point.payload = Some(payload);
+            self.bump_revision();
             Ok(())
         })
     }
@@ -439,6 +467,7 @@ impl MemoryEngine {
             for (k, v) in fields {
                 payload.insert(k, v);
             }
+            self.bump_revision();
             Ok(())
         })
     }
@@ -456,8 +485,14 @@ impl MemoryEngine {
                 .get_mut(point_id)
                 .ok_or_else(|| VectorSearchError::InvalidPointId(point_id.to_string()))?;
             if let Some(payload) = point.payload.as_mut() {
+                let mut removed = false;
                 for k in keys {
-                    payload.remove(&k);
+                    if payload.remove(&k).is_some() {
+                        removed = true;
+                    }
+                }
+                if removed {
+                    self.bump_revision();
                 }
             }
             Ok(())
@@ -475,6 +510,7 @@ impl MemoryEngine {
         self.with_collection_mut(collection, |c| {
             if !c.payload_indexes.iter().any(|(f, _)| f == field) {
                 c.payload_indexes.push((field.to_string(), schema));
+                self.bump_revision();
             }
             Ok(())
         })
@@ -485,7 +521,11 @@ impl MemoryEngine {
         self.with_collection_mut(collection, |c| {
             let before = c.payload_indexes.len();
             c.payload_indexes.retain(|(f, _)| f != field);
-            Ok(c.payload_indexes.len() != before)
+            let removed = c.payload_indexes.len() != before;
+            if removed {
+                self.bump_revision();
+            }
+            Ok(removed)
         })
     }
 
@@ -533,10 +573,13 @@ impl MemoryEngine {
         })?;
         let mut collections: Vec<MemorySnapshotCollection> = Vec::with_capacity(guard.len());
         for (name, collection) in guard.iter() {
+            let mut points: Vec<VectorPoint> =
+                collection.points.values().cloned().collect();
+            points.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
             collections.push(MemorySnapshotCollection {
                 name: name.clone(),
                 config: collection.config.clone(),
-                points: collection.points.values().cloned().collect(),
+                points,
                 payload_indexes: collection.payload_indexes.clone(),
             });
         }
@@ -545,6 +588,60 @@ impl MemoryEngine {
             version: 1,
             collections,
         })
+    }
+
+    /// Export one collection as a snapshot entry.
+    pub fn export_collection(&self, name: &str) -> Result<MemorySnapshotCollection> {
+        self.with_collection(name, |c| {
+            let mut points: Vec<VectorPoint> = c.points.values().cloned().collect();
+            points.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+            Ok(MemorySnapshotCollection {
+                name: name.to_string(),
+                config: c.config.clone(),
+                points,
+                payload_indexes: c.payload_indexes.clone(),
+            })
+        })
+    }
+
+    /// Insert or replace one collection from a snapshot entry.
+    pub fn import_collection(&self, entry: MemorySnapshotCollection) -> Result<()> {
+        validate_name(&entry.name)?;
+        if entry.config.vector_size == 0 {
+            return Err(VectorSearchError::InvalidVectorDimension {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        for point in &entry.points {
+            validate_point(&entry.config, point)?;
+        }
+        if let Some(cap) = entry.config.max_points {
+            if entry.points.len() as u64 > cap {
+                return Err(VectorSearchError::CapacityExceeded {
+                    collection: entry.name,
+                    max_points: cap,
+                    requested: entry.points.len() as u64,
+                });
+            }
+        }
+        let mut points = HashMap::with_capacity(entry.points.len());
+        for point in entry.points {
+            points.insert(point.id.clone(), point);
+        }
+        let mut guard = self.collections.write().map_err(|_| {
+            VectorSearchError::Internal("memory engine lock poisoned".to_string())
+        })?;
+        guard.insert(
+            entry.name,
+            MemoryCollection {
+                config: entry.config,
+                points,
+                payload_indexes: entry.payload_indexes,
+            },
+        );
+        self.bump_revision();
+        Ok(())
     }
 
     /// Replace the whole engine from a snapshot after validating every entry.
@@ -596,6 +693,7 @@ impl MemoryEngine {
             VectorSearchError::Internal("memory engine lock poisoned".to_string())
         })?;
         *guard = staged;
+        self.bump_revision();
         Ok(())
     }
 
@@ -605,13 +703,13 @@ impl MemoryEngine {
     }
 
     /// Whether an index is published. Always false in memory form.
-    pub fn has_index(&self, collection: &str) -> bool {
-        self.collection_exists(collection) && false
+    pub fn has_index(&self, _collection: &str) -> bool {
+        false
     }
 
-    /// Drop the published index. No-op in memory form.
-    pub fn drop_index(&self, _collection: &str) -> Result<()> {
-        Ok(())
+    /// Drop the published index. No-op in memory form; still rejects unknown collections.
+    pub fn drop_index(&self, collection: &str) -> Result<()> {
+        self.with_collection(collection, |_| Ok(()))
     }
 
     /// Drop the published index alias with explicit naming.
@@ -729,5 +827,55 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, VectorSearchError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn memory_revision_advances_on_change_only() {
+        let engine = MemoryEngine::new();
+        assert_eq!(engine.revision(), 0);
+        let config = CollectionConfig::new(2, DistanceMetric::Dot);
+        engine.create_collection("docs", &config).unwrap();
+        let after_create = engine.revision();
+        assert!(after_create > 0);
+        engine.search("docs", &SearchQuery::new(vec![1.0, 0.0], 10)).unwrap();
+        assert_eq!(engine.revision(), after_create);
+        engine.delete("docs", &PointId::from("missing")).unwrap();
+        assert_eq!(engine.revision(), after_create);
+        engine
+            .upsert("docs", VectorPoint::new("a", vec![1.0, 0.0]))
+            .unwrap();
+        assert!(engine.revision() > after_create);
+    }
+
+    #[test]
+    fn memory_collection_snapshot_roundtrip() {
+        let engine = engine_with_points();
+        let entry = engine.export_collection("docs").unwrap();
+        assert_eq!(entry.name, "docs");
+        assert_eq!(entry.points.len(), 2);
+        let restored = MemoryEngine::new();
+        restored.import_collection(entry).unwrap();
+        assert_eq!(restored.count("docs").unwrap(), 2);
+        assert!(restored.export_snapshot().unwrap().version == 1);
+    }
+
+    #[test]
+    fn memory_export_orders_points_by_id() {
+        let engine = MemoryEngine::new();
+        let config = CollectionConfig::new(2, DistanceMetric::Dot);
+        engine.create_collection("docs", &config).unwrap();
+        engine
+            .upsert("docs", VectorPoint::new("b", vec![0.0, 1.0]))
+            .unwrap();
+        engine
+            .upsert("docs", VectorPoint::new("a", vec![1.0, 0.0]))
+            .unwrap();
+        let snapshot = engine.export_snapshot().unwrap();
+        let ids: Vec<String> = snapshot.collections[0]
+            .points
+            .iter()
+            .map(|p| p.id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
     }
 }

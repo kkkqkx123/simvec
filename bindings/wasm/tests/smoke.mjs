@@ -57,9 +57,31 @@ test("wasm binding requires a wasm-pack build", async () => {
   restored.importSnapshot(snapshot);
   assert.equal(restored.count("docs"), 2);
 
+  const before = engine.revision();
+  engine.upsert("docs", "rev-check", [1, 0]);
+  assert.ok(engine.revision() > before);
+  const entry = engine.exportCollection("docs");
+  assert.equal(entry.name, "docs");
+  const shard = await Engine.create();
+  shard.createCollection("docs", { vector_size: 2, distance: "Dot" });
+  shard.importCollection(entry);
+  assert.equal(shard.count("docs"), engine.count("docs"));
+  shard.close();
+
+  assert.throws(() => restored.importSnapshot({ version: 999, collections: [] }), /\[simvec:16\]/);
+  assert.throws(() => restored.importSnapshot("not json"), /\[simvec:20\]/);
+  assert.equal(restored.count("docs"), 2);
+
+  const { saveSnapshotToOpfs, loadSnapshotToOpfs } = await import("../src/persist.js");
+  await assert.rejects(saveSnapshotToOpfs(engine), /OPFS/);
+  await assert.rejects(loadSnapshotToOpfs(engine), /OPFS/);
+
   assert.throws(() => engine.get("docs", "missing"), /\[simvec:12\]/);
+  engine.close();
   engine.close();
   assert.equal(engine.closed, true);
   assert.throws(() => engine.count("docs"), /\[simvec:20\]/);
   restored.close();
+  restored.close();
+  assert.equal(restored.closed, true);
 });

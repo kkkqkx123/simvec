@@ -4,6 +4,10 @@ Browser binding for the simvec in-memory engine. Pure WebAssembly with no
 native dynamic library and no filesystem: collections live for the page
 session and disappear on reload unless the caller persists a snapshot.
 
+Search is single-threaded linear exact scan for small and medium
+collections; large collections stay server-side. There are no background
+threads, no memory-mapped files, and no parallel runtime in this form.
+
 Built from the same crate with the `wasm` feature. Complex values cross
 as JSON text reusing the Rust serde shapes, vectors cross as
 single-precision arrays. Scores follow the crate-wide higher-is-better
@@ -12,9 +16,12 @@ native bindings with matching typed classes.
 
 ## Build
 
-Run `npm run build` inside this directory. It calls `wasm-pack` against
-the workspace root with the `wasm` feature and emits `pkg/`. The Rust
-side needs the `wasm32-unknown-unknown` target installed.
+Run `npm run build` inside this directory. It builds the workspace-root
+crate (`../..`) with the `wasm` feature and emits `bindings/wasm/pkg/`
+(`src/index.js` loads `../pkg/simvec.js`). The Rust side needs the
+`wasm32-unknown-unknown` target installed. The npm package ships pure
+JS only; `pkg/` is built by the caller and is not embedded in the
+published package.
 
 ## Use
 
@@ -46,6 +53,18 @@ and engine-default configuration groups are not exposed here.
 The engine holds no file handle and runs no background sync. Callers
 persist explicitly with `exportSnapshot` and `importSnapshot`. The
 optional `persist.js` helper writes the snapshot to the browser
-persistent directory and reads it back. Missing platform interfaces fall
+persistent directory and reads it back. Writes go through a temp file
+with read-back verification plus move when the host supports it,
+falling back to verified direct overwrite. The previous good snapshot
+is retained as a `.bak` file. Missing platform interfaces fall
 back to an explicit error with the snapshot kept in memory only.
 Snapshot version is fixed at one with no history compatibility.
+
+`revision` advances on every state-changing mutation so callers can
+skip unchanged saves. `exportCollection` and `importCollection` persist
+one collection without touching the others. `saveCollectionsToOpfs`
+and `loadCollectionsFromOpfs` store one file per collection plus a
+manifest under a directory. `snapshotExists`, `removeSnapshot`,
+`estimateOpfsQuota`, `requestOpfsPersistence`, and `createOpfsAutoSave`
+cover existence checks, cleanup, quota, and debounced saves with page
+hide flushing.

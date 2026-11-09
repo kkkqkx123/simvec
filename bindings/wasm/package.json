@@ -21,7 +21,7 @@
     }
   },
   "scripts": {
-    "build": "wasm-pack build --target web --out-dir pkg -- --features wasm",
+    "build": "wasm-pack build ../.. --target web --out-dir pkg -- --features wasm",
     "test": "node --test tests/"
   }
 }

@@ -1,4 +1,4 @@
-import init, { WasmEngine } from "../../pkg/simvec.js";
+import init, { WasmEngine } from "../pkg/simvec.js";
 import { MisuseError, raiseForWasm } from "./errors.js";
 
 let started = null;
@@ -300,5 +300,21 @@ export class Engine {
     const handle = this._requireOpen();
     const text = typeof snapshot === "string" ? snapshot : JSON.stringify(snapshot);
     callWasm(() => handle.import_snapshot(text));
+  }
+
+  revision() {
+    const handle = this._requireOpen();
+    return callWasm(() => handle.revision());
+  }
+
+  exportCollection(name) {
+    const handle = this._requireOpen();
+    return parseWasmJson(() => handle.export_collection(String(name)));
+  }
+
+  importCollection(snapshot) {
+    const handle = this._requireOpen();
+    const text = typeof snapshot === "string" ? snapshot : JSON.stringify(snapshot);
+    callWasm(() => handle.import_collection(text));
   }
 }

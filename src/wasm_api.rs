@@ -7,10 +7,9 @@
 use wasm_bindgen::prelude::*;
 
 use crate::error::VectorSearchError;
-use crate::memory_engine::{MemoryEngine, MemoryTxnOp};
+use crate::memory_engine::{MemoryEngine, MemorySnapshotCollection, MemoryTxnOp};
 use crate::types::{CollectionConfig, Payload, PayloadSchemaType, PointId, SearchQuery, VectorPoint};
 
-const CODE_OK: i32 = 0;
 const CODE_INTERNAL: i32 = 2;
 const CODE_NOMEM: i32 = 7;
 const CODE_IOERR: i32 = 10;
@@ -411,6 +410,11 @@ impl WasmEngine {
         serde_json::to_string(&snapshot).map_err(err_to_js)
     }
 
+    /// Monotonic revision advanced by every state-changing mutation.
+    pub fn revision(&self) -> f64 {
+        self.inner.revision() as f64
+    }
+
     /// Export the whole engine as a versioned JSON snapshot.
     pub fn export_snapshot(&self) -> Result<String, JsValue> {
         let snapshot = self.inner.export_snapshot().map_err(engine_err_to_js)?;
@@ -423,8 +427,21 @@ impl WasmEngine {
         self.inner.import_snapshot(snapshot).map_err(engine_err_to_js)
     }
 
-    /// Last error code placeholder for binding parity. Memory calls throw directly.
-    pub fn errcode(&self) -> i32 {
-        CODE_OK
+    /// Export one collection as a JSON snapshot entry.
+    pub fn export_collection(&self, name: &str) -> Result<String, JsValue> {
+        let entry = self
+            .inner
+            .export_collection(name)
+            .map_err(engine_err_to_js)?;
+        serde_json::to_string(&entry).map_err(err_to_js)
     }
+
+    /// Insert or replace one collection from a snapshot entry.
+    pub fn import_collection(&self, collection_json: &str) -> Result<(), JsValue> {
+        let entry: MemorySnapshotCollection = parse_input_json(collection_json)?;
+        self.inner
+            .import_collection(entry)
+            .map_err(engine_err_to_js)
+    }
+
 }

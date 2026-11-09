@@ -56,4 +56,7 @@ export declare class Engine {
   runMaintenanceSweep(): void;
   exportSnapshot(): unknown;
   importSnapshot(snapshot: unknown): void;
+  revision(): number;
+  exportCollection(name: string): unknown;
+  importCollection(snapshot: unknown): void;
 }
