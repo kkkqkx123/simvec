@@ -19,10 +19,7 @@ use super::types::simvec_engine_t;
 ///   handle, on failure it is set to null. Open-time diagnostics are kept in
 ///   thread-local storage readable with `simvec_last_error_text`.
 #[no_mangle]
-pub unsafe extern "C" fn simvec_open(
-    path: *const c_char,
-    out: *mut *mut simvec_engine_t,
-) -> c_int {
+pub unsafe extern "C" fn simvec_open(path: *const c_char, out: *mut *mut simvec_engine_t) -> c_int {
     if out.is_null() {
         return simvec_error_code_t::SIMVEC_MISUSE as c_int;
     }

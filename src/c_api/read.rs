@@ -6,8 +6,7 @@ use crate::types::PointId;
 use crate::{SearchQuery, VectorFilter};
 
 use super::error::{
-    emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json,
-    simvec_error_code_t,
+    emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json, simvec_error_code_t,
 };
 use super::types::simvec_engine_t;
 

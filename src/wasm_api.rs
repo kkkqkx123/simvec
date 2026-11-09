@@ -8,7 +8,9 @@ use wasm_bindgen::prelude::*;
 
 use crate::error::VectorSearchError;
 use crate::memory_engine::{MemoryEngine, MemorySnapshotCollection, MemoryTxnOp};
-use crate::types::{CollectionConfig, Payload, PayloadSchemaType, PointId, SearchQuery, VectorPoint};
+use crate::types::{
+    CollectionConfig, Payload, PayloadSchemaType, PointId, SearchQuery, VectorPoint,
+};
 
 const CODE_INTERNAL: i32 = 2;
 const CODE_NOMEM: i32 = 7;
@@ -56,7 +58,10 @@ fn engine_err_to_js(err: VectorSearchError) -> JsValue {
 }
 
 fn input_err_to_js(err: impl ToString) -> JsValue {
-    JsValue::from_str(&format!("[simvec:{CODE_MISUSE}] {err}", err = err.to_string()))
+    JsValue::from_str(&format!(
+        "[simvec:{CODE_MISUSE}] {err}",
+        err = err.to_string()
+    ))
 }
 
 fn parse_input_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, JsValue> {
@@ -81,8 +86,14 @@ fn parse_schema_type(raw: &str) -> Option<PayloadSchemaType> {
 #[derive(serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum TxnOpDto {
-    Upsert { collection: String, point: VectorPoint },
-    Delete { collection: String, id: String },
+    Upsert {
+        collection: String,
+        point: VectorPoint,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
 }
 
 /// Browser engine handle. One instance owns all its collections.
@@ -102,7 +113,11 @@ impl WasmEngine {
     }
 
     /// Create a collection from a JSON-encoded configuration.
-    pub fn create_collection(&self, name: &str, config_json: Option<String>) -> Result<(), JsValue> {
+    pub fn create_collection(
+        &self,
+        name: &str,
+        config_json: Option<String>,
+    ) -> Result<(), JsValue> {
         let config: CollectionConfig = match config_json {
             Some(raw) => parse_input_json(&raw)?,
             None => CollectionConfig::default(),
@@ -158,7 +173,9 @@ impl WasmEngine {
         if let Some(payload) = payload {
             point = point.with_payload(payload);
         }
-        self.inner.upsert(collection, point).map_err(engine_err_to_js)
+        self.inner
+            .upsert(collection, point)
+            .map_err(engine_err_to_js)
     }
 
     /// Upsert a batch from a JSON array of points.
@@ -214,7 +231,10 @@ impl WasmEngine {
     /// Search with a JSON-encoded query. Returns results as a JSON string.
     pub fn search(&self, collection: &str, query_json: &str) -> Result<String, JsValue> {
         let query: SearchQuery = parse_input_json(query_json)?;
-        let results = self.inner.search(collection, &query).map_err(engine_err_to_js)?;
+        let results = self
+            .inner
+            .search(collection, &query)
+            .map_err(engine_err_to_js)?;
         serde_json::to_string(&results).map_err(err_to_js)
     }
 
@@ -325,9 +345,8 @@ impl WasmEngine {
         field: &str,
         schema: &str,
     ) -> Result<(), JsValue> {
-        let schema_type = parse_schema_type(schema).ok_or_else(|| {
-            input_err_to_js(format!("unknown payload schema: {schema}"))
-        })?;
+        let schema_type = parse_schema_type(schema)
+            .ok_or_else(|| input_err_to_js(format!("unknown payload schema: {schema}")))?;
         self.inner
             .create_payload_index(collection, field, schema_type)
             .map_err(engine_err_to_js)
@@ -424,7 +443,9 @@ impl WasmEngine {
     /// Replace the whole engine from a snapshot after validating every entry.
     pub fn import_snapshot(&self, snapshot_json: &str) -> Result<(), JsValue> {
         let snapshot = parse_input_json(snapshot_json)?;
-        self.inner.import_snapshot(snapshot).map_err(engine_err_to_js)
+        self.inner
+            .import_snapshot(snapshot)
+            .map_err(engine_err_to_js)
     }
 
     /// Export one collection as a JSON snapshot entry.
@@ -443,5 +464,4 @@ impl WasmEngine {
             .import_collection(entry)
             .map_err(engine_err_to_js)
     }
-
 }

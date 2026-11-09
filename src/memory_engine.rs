@@ -6,15 +6,15 @@
 //! same JSON shapes work on both forms.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::distance::{distance, to_score};
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, DistanceMetric, Payload,
-    PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+    CollectionConfig, CollectionInfo, CollectionStatus, DistanceMetric, Payload, PayloadSchemaType,
+    PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
 };
 
 fn validate_name(name: &str) -> Result<()> {
@@ -156,9 +156,10 @@ impl MemoryEngine {
         ) {
             return Err(VectorSearchError::UnsupportedMetric(config.distance));
         }
-        let mut guard = self.collections.write().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .collections
+            .write()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         if guard.contains_key(name) {
             return Err(VectorSearchError::CollectionAlreadyExists(name.to_string()));
         }
@@ -176,9 +177,10 @@ impl MemoryEngine {
 
     /// Drop a collection and all its points.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
-        let mut guard = self.collections.write().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .collections
+            .write()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         if guard.remove(name).is_none() {
             return Err(VectorSearchError::CollectionNotFound(name.to_string()));
         }
@@ -199,9 +201,10 @@ impl MemoryEngine {
         name: &str,
         f: impl FnOnce(&MemoryCollection) -> Result<R>,
     ) -> Result<R> {
-        let guard = self.collections.read().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let guard = self
+            .collections
+            .read()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         let collection = guard
             .get(name)
             .ok_or_else(|| VectorSearchError::CollectionNotFound(name.to_string()))?;
@@ -213,9 +216,10 @@ impl MemoryEngine {
         name: &str,
         f: impl FnOnce(&mut MemoryCollection) -> Result<R>,
     ) -> Result<R> {
-        let mut guard = self.collections.write().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .collections
+            .write()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         let collection = guard
             .get_mut(name)
             .ok_or_else(|| VectorSearchError::CollectionNotFound(name.to_string()))?;
@@ -425,7 +429,12 @@ impl MemoryEngine {
     }
 
     /// Replace the payload for a single point.
-    pub fn set_payload(&self, collection: &str, point_id: &PointId, payload: Payload) -> Result<()> {
+    pub fn set_payload(
+        &self,
+        collection: &str,
+        point_id: &PointId,
+        payload: Payload,
+    ) -> Result<()> {
         self.with_collection_mut(collection, |c| {
             let point = c
                 .points
@@ -542,8 +551,7 @@ impl MemoryEngine {
         let mut grouped: HashMap<String, Vec<MemoryTxnOp>> = HashMap::new();
         for op in ops {
             match &op {
-                MemoryTxnOp::Upsert { collection, .. }
-                | MemoryTxnOp::Delete { collection, .. } => {
+                MemoryTxnOp::Upsert { collection, .. } | MemoryTxnOp::Delete { collection, .. } => {
                     grouped.entry(collection.clone()).or_default().push(op);
                 }
             }
@@ -568,13 +576,13 @@ impl MemoryEngine {
 
     /// Export the whole engine as a versioned snapshot value.
     pub fn export_snapshot(&self) -> Result<MemorySnapshot> {
-        let guard = self.collections.read().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let guard = self
+            .collections
+            .read()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         let mut collections: Vec<MemorySnapshotCollection> = Vec::with_capacity(guard.len());
         for (name, collection) in guard.iter() {
-            let mut points: Vec<VectorPoint> =
-                collection.points.values().cloned().collect();
+            let mut points: Vec<VectorPoint> = collection.points.values().cloned().collect();
             points.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
             collections.push(MemorySnapshotCollection {
                 name: name.clone(),
@@ -629,9 +637,10 @@ impl MemoryEngine {
         for point in entry.points {
             points.insert(point.id.clone(), point);
         }
-        let mut guard = self.collections.write().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .collections
+            .write()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         guard.insert(
             entry.name,
             MemoryCollection {
@@ -689,9 +698,10 @@ impl MemoryEngine {
                 },
             );
         }
-        let mut guard = self.collections.write().map_err(|_| {
-            VectorSearchError::Internal("memory engine lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .collections
+            .write()
+            .map_err(|_| VectorSearchError::Internal("memory engine lock poisoned".to_string()))?;
         *guard = staged;
         self.bump_revision();
         Ok(())
@@ -728,12 +738,10 @@ impl MemoryEngine {
     }
 
     /// Drain pending slots. No-op in memory form.
-    pub fn drain_pending(&self, _collection: &str) {
-    }
+    pub fn drain_pending(&self, _collection: &str) {}
 
     /// Global maintenance sweep. No-op in memory form.
-    pub fn run_maintenance_sweep(&self) {
-    }
+    pub fn run_maintenance_sweep(&self) {}
 
     /// Reclaim space. Points are removed eagerly, so this returns the live count.
     pub fn compact(&self, collection: &str) -> Result<u64> {
@@ -837,7 +845,9 @@ mod tests {
         engine.create_collection("docs", &config).unwrap();
         let after_create = engine.revision();
         assert!(after_create > 0);
-        engine.search("docs", &SearchQuery::new(vec![1.0, 0.0], 10)).unwrap();
+        engine
+            .search("docs", &SearchQuery::new(vec![1.0, 0.0], 10))
+            .unwrap();
         assert_eq!(engine.revision(), after_create);
         engine.delete("docs", &PointId::from("missing")).unwrap();
         assert_eq!(engine.revision(), after_create);

@@ -47,10 +47,7 @@ unsafe fn close_engine(handle: *mut simvec_engine_t) {
 #[test]
 fn null_arguments_report_misuse() {
     unsafe {
-        assert_eq!(
-            engine::simvec_open(ptr::null(), ptr::null_mut()),
-            MISUSE
-        );
+        assert_eq!(engine::simvec_open(ptr::null(), ptr::null_mut()), MISUSE);
         assert_eq!(engine::simvec_close(ptr::null_mut()), MISUSE);
         engine::simvec_free_string(ptr::null_mut());
         assert_eq!(engine::simvec_errcode(ptr::null_mut()), MISUSE);
@@ -177,10 +174,7 @@ fn lifecycle_round_trip() {
             Some("1")
         );
 
-        assert_eq!(
-            write::simvec_delete(handle, name.as_ptr(), id.as_ptr()),
-            OK
-        );
+        assert_eq!(write::simvec_delete(handle, name.as_ptr(), id.as_ptr()), OK);
         assert_eq!(read::simvec_count(handle, name.as_ptr(), &mut count), OK);
         assert_eq!(count, 0);
 
@@ -259,10 +253,7 @@ fn advanced_paths_round_trip() {
             OK
         );
         let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(
-            engine::simvec_get_default_hnsw_config(handle, &mut out),
-            OK
-        );
+        assert_eq!(engine::simvec_get_default_hnsw_config(handle, &mut out), OK);
         let body: serde_json::Value =
             serde_json::from_str(&take_string(out)).expect("default hnsw");
         assert_eq!(body.get("m").and_then(|m| m.as_u64()), Some(8));
@@ -301,11 +292,7 @@ fn advanced_paths_round_trip() {
         assert_eq!(backups.as_array().map(Vec::len), Some(1));
         let mut restored_out: *mut c_char = ptr::null_mut();
         assert_eq!(
-            collections::simvec_restore_promote_backup(
-                handle,
-                live.as_ptr(),
-                &mut restored_out
-            ),
+            collections::simvec_restore_promote_backup(handle, live.as_ptr(), &mut restored_out),
             OK
         );
         let restored: String =

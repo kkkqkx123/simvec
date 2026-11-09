@@ -237,7 +237,10 @@ pub unsafe extern "C" fn simvec_promote_temp_collection(
             Ok(suffix) => suffix,
             Err(code) => return handle.fail_code(code, "invalid backup suffix".to_string()),
         };
-        match handle.engine.promote_temp_collection(live, temp, backup_suffix) {
+        match handle
+            .engine
+            .promote_temp_collection(live, temp, backup_suffix)
+        {
             Ok(()) => handle.ok(),
             Err(err) => handle.fail(&err),
         }

@@ -6,8 +6,7 @@ use crate::types::PointId;
 use crate::{Payload, PayloadSchemaType, TxnOp, VectorFilter, VectorPoint};
 
 use super::error::{
-    emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json,
-    simvec_error_code_t,
+    emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json, simvec_error_code_t,
 };
 use super::types::simvec_engine_t;
 
@@ -476,10 +475,16 @@ pub unsafe extern "C" fn simvec_set_payload_field(
 
 /// One transaction operation as carried by `simvec_apply_txn` JSON.
 #[derive(serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")] 
+#[serde(tag = "op", rename_all = "snake_case")]
 enum TxnOpDto {
-    Upsert { collection: String, point: VectorPoint },
-    Delete { collection: String, id: String },
+    Upsert {
+        collection: String,
+        point: VectorPoint,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
 }
 
 /// Commit a JSON array of upsert/delete operations grouped per collection.
