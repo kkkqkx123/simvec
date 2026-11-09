@@ -92,14 +92,50 @@ Cosine computes norms on the fly rather than normalizing at insert time: `vector
 |---------|---------|-------------|
 | `lock-metrics` | off | Compile in adjacency/list write-lock wait instrumentation; metrics flow through `MetricsSnapshot` |
 | `simd_portable` | off | Portable `std::simd` kernel (unstable on stable Rust); currently delegates to `naive` as a placeholder until `std::simd` stabilizes |
+| `wasm` | off | Browser in-memory engine via wasm-bindgen (`bindings/wasm`); no storage, index, or threading changes on the native path |
 
-## C API, Python and JavaScript bindings
+## C API and language bindings
 
 The `c_api` cargo feature exposes a stable C ABI over the same engine: every entry point returns an integer status code, inputs are borrowed, allocated outputs are released with `simvec_free_string`, and configs, queries, filters, payloads and results cross the boundary as JSON reusing the Rust serde shapes. The hand-maintained `include/simvec.h` mirrors the cbindgen output (`build.rs` regenerates it when cbindgen is available); build with `cargo build --features c_api`, default builds stay a plain Rust rlib.
 
 `bindings/python` is a pure-Python ctypes wrapper over that C API and ships no native code: build the Rust dynamic library first and point the wrapper at it via `SIMVEC_LIB` (falling back to `target/debug` / `target/release` next to the checkout). Configs, filters, payloads and queries are plain dicts, vectors accept any float sequence sent as contiguous float32 arrays, and `Engine` maps nonzero status codes to typed exceptions. Run the smoke tests with `SIMVEC_LIB=/path/to/libsimvec.so python -m pytest tests -q` from `bindings/python`.
 
 `bindings/js` is the same shape in JavaScript with zero dependencies: it calls the C API through the Node.js built-in `node:ffi` module (Node 22+, run with `--experimental-ffi`), resolves `libsimvec` via `SIMVEC_LIB` with the same `target/debug` / `target/release` fallback, and exposes an `Engine` class with camelCase methods and typed errors. Run the smoke tests with `SIMVEC_LIB=/path/to/libsimvec.so node --experimental-ffi --test tests/` from `bindings/js`.
+
+`bindings/go` is a thin cgo wrapper over the same C API and ships no native code: build the Rust dynamic library first, then build or test the Go module against it (a C toolchain with cgo enabled is required). Configs, filters, payloads and queries are plain maps or serializable values encoded to the JSON shapes the Rust side already understands; vectors are `[]float32` slices crossing the boundary as contiguous arrays, with the `Float32s` helper for `[]float64` callers (narrowing conversion); point ids are strings. Method names follow Go exported camel case and map one-to-one onto the C API; seven status codes return typed errors wrapping `SimvecError`, the rest return the base with the numeric code kept in the message. `Engine` instances are safe for concurrent use except that `Close` must not run concurrently with in-flight calls. Build and test with:
+
+```sh
+cargo build --features c_api
+cd bindings/go && go test ./...
+```
+
+Override the library location with `CGO_CFLAGS`, `CGO_LDFLAGS`, or `LD_LIBRARY_PATH` instead of relying on the default search paths.
+
+`bindings/java` is a JNI wrapper over the same C API and ships no native code: build the Rust dynamic library and the JNI bridge first, then build or test the Java package against them (a C toolchain with the JDK headers is required for the bridge). The loader resolves the bridge by checking the `simvec.jni.lib` system property first, then the `SIMVEC_JNI_LIB` environment variable, then the `target/debug` and `target/release` outputs under the workspace root, and finally `java.library.path`; when `SIMVEC_LIB` names an explicit Rust library path, that file is preloaded so the bridge resolves against it. Configs, filters, payloads and queries are plain maps or lists encoded to the JSON shapes the Rust side already understands; vectors are `float[]` slices crossing the boundary as contiguous arrays, with `double[]` overloads copying with narrowing conversion; point ids are strings. Method names follow Java camel case and map one-to-one onto the C API; seven status codes throw typed subclasses of `SimvecError`, the rest throw the base with the numeric code kept in the message and in `getCode()`. `Engine` instances are safe for concurrent use (every method is synchronized). Build and test with:
+
+```sh
+cargo build --features c_api
+sh bindings/java/scripts/build-native.sh
+cd bindings/java && mvn test
+```
+
+`bindings/r` is an R package over the same C API and ships no native code: build the Rust dynamic library first, then install the R package against it (a C toolchain is required). `configure` resolves the library by checking the `SIMVEC_LIB` environment variable first (naming the library file explicitly), then the `target/debug` and `target/release` outputs under the workspace root. Configs, filters, payloads and queries are plain lists serialized with jsonlite to the JSON shapes the Rust side already understands; vectors are numeric vectors crossing the boundary as contiguous float32 arrays with narrowing conversion; point ids are strings; counts cross as doubles. Function names are snake case `simvec_*` and map one-to-one onto the C API; seven status codes signal typed conditions carrying the `simvec_error` base class, the rest signal the base with the numeric code kept in the message and in the `code` field. Engines are environments holding one external pointer. Build, install and smoke-test with:
+
+```sh
+cargo build --features c_api
+R CMD INSTALL bindings/r
+Rscript bindings/r/tests/smoke.R
+```
+
+`bindings/wasm` is a browser in-memory engine built from the same crate with the `wasm` feature: pure WebAssembly with no native dynamic library and no filesystem, so collections live for the page session and disappear on reload unless the caller persists a snapshot. Search is single-threaded linear exact scan; index building, quantization, compaction and maintenance are compatible no-ops that always report not-effective; publish, backup and engine-default configuration groups are not exposed. Build with `npm run build` inside `bindings/wasm` (the Rust side needs the `wasm32-unknown-unknown` target installed); the npm package ships pure JS only and `pkg/` is built by the caller. Persistence is explicit via `exportSnapshot` / `importSnapshot`, with the optional `persist.js` helper covering OPFS writes (temp file with read-back verification plus move when supported, falling back to verified direct overwrite, retaining the previous good snapshot as `.bak`), existence checks, cleanup, quota, persistence permission and debounced auto-save with page-hide flushing. Run the smoke flow with `node tests/smoke.mjs` after building. Basic usage:
+
+```js
+const engine = await Engine.create();
+engine.createCollection("docs", { vector_size: 2, distance: "Dot" });
+engine.upsert("docs", "a", [1, 0], { color: "red" });
+const hits = engine.searchVector("docs", [1, 0], 10);
+engine.close();
+```
 
 ## Testing and benchmarks
 
