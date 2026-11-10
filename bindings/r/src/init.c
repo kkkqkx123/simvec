@@ -34,8 +34,11 @@ SEXP C_simvec_search_vector(SEXP r_handle, SEXP r_collection, SEXP r_vector,
                             SEXP r_with_payload, SEXP r_with_vector);
 SEXP C_simvec_get(SEXP r_handle, SEXP r_collection, SEXP r_id);
 SEXP C_simvec_count(SEXP r_handle, SEXP r_collection);
+SEXP C_simvec_count_by_filter(SEXP r_handle, SEXP r_collection, SEXP r_filter);
 SEXP C_simvec_scroll(SEXP r_handle, SEXP r_collection, SEXP r_limit, SEXP r_offset,
                      SEXP r_with_payload, SEXP r_with_vector);
+SEXP C_simvec_scroll_by_filter(SEXP r_handle, SEXP r_collection, SEXP r_limit, SEXP r_offset,
+                               SEXP r_filter, SEXP r_with_payload, SEXP r_with_vector);
 SEXP C_simvec_build_index(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_build_quantization(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_has_index(SEXP r_handle, SEXP r_collection);
@@ -88,7 +91,9 @@ static const R_CallMethodDef call_defs[] = {
     {"C_simvec_search_vector", (DL_FUNC)&C_simvec_search_vector, 8},
     {"C_simvec_get", (DL_FUNC)&C_simvec_get, 3},
     {"C_simvec_count", (DL_FUNC)&C_simvec_count, 2},
+    {"C_simvec_count_by_filter", (DL_FUNC)&C_simvec_count_by_filter, 3},
     {"C_simvec_scroll", (DL_FUNC)&C_simvec_scroll, 6},
+    {"C_simvec_scroll_by_filter", (DL_FUNC)&C_simvec_scroll_by_filter, 7},
     {"C_simvec_build_index", (DL_FUNC)&C_simvec_build_index, 2},
     {"C_simvec_build_quantization", (DL_FUNC)&C_simvec_build_quantization, 2},
     {"C_simvec_has_index", (DL_FUNC)&C_simvec_has_index, 2},

@@ -481,6 +481,44 @@ JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nScroll(JNIEnv *env, jclass cls,
     return rc;
 }
 
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nCountByFilter(JNIEnv *env, jclass cls,
+                                                               jlong handle,
+                                                               jbyteArray collection,
+                                                               jbyteArray filter,
+                                                               jlongArray out) {
+    (void)cls;
+    ACQUIRE(c_collection, collection);
+    ACQUIRE(c_filter, filter);
+    uint64_t count = 0;
+    int rc = simvec_count_by_filter(to_engine(handle), c_collection, c_filter, &count);
+    RELEASE(c_collection);
+    RELEASE(c_filter);
+    emit_long(env, out, count);
+    return rc;
+}
+
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nScrollByFilter(JNIEnv *env, jclass cls,
+                                                                jlong handle,
+                                                                jbyteArray collection,
+                                                                jlong limit, jbyteArray offset,
+                                                                jbyteArray filter,
+                                                                jboolean with_payload,
+                                                                jboolean with_vector,
+                                                                jobjectArray out) {
+    (void)cls;
+    ACQUIRE(c_collection, collection);
+    ACQUIRE(c_offset, offset);
+    ACQUIRE(c_filter, filter);
+    char *s = NULL;
+    int rc = simvec_scroll_by_filter(to_engine(handle), c_collection, (uint64_t)limit, c_offset,
+                                     c_filter, with_payload ? 1 : 0, with_vector ? 1 : 0, &s);
+    RELEASE(c_collection);
+    RELEASE(c_offset);
+    RELEASE(c_filter);
+    emit_bytes(env, out, s);
+    return rc;
+}
+
 JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nBuildIndex(JNIEnv *env, jclass cls,
                                                              jlong handle, jbyteArray collection,
                                                              jintArray out) {

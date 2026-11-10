@@ -258,6 +258,16 @@ impl WasmEngine {
         Ok(count as f64)
     }
 
+    /// Live points matching a JSON-encoded filter as a host number. Pure read.
+    pub fn count_by_filter(&self, collection: &str, filter_json: &str) -> Result<f64, JsValue> {
+        let filter = parse_input_json(filter_json)?;
+        let count = self
+            .inner
+            .count_by_filter(collection, &filter)
+            .map_err(engine_err_to_js)?;
+        Ok(count as f64)
+    }
+
     /// Paginated scan as a JSON object with points and the next offset.
     pub fn scroll(
         &self,
@@ -272,6 +282,37 @@ impl WasmEngine {
             .inner
             .scroll(
                 collection,
+                limit as usize,
+                offset_id.as_ref(),
+                Some(with_payload),
+                Some(with_vector),
+            )
+            .map_err(engine_err_to_js)?;
+        let body = serde_json::json!({
+            "points": points,
+            "next_offset": next.map(|id| id.to_string()),
+        });
+        serde_json::to_string(&body).map_err(err_to_js)
+    }
+
+    /// Filtered paginated scan as a JSON object with points and the next offset.
+    /// `limit` counts only matching points; page until an empty page.
+    pub fn scroll_by_filter(
+        &self,
+        collection: &str,
+        filter_json: &str,
+        limit: u32,
+        offset: Option<String>,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<String, JsValue> {
+        let filter = parse_input_json(filter_json)?;
+        let offset_id = offset.as_deref().map(PointId::from);
+        let (points, next) = self
+            .inner
+            .scroll_by_filter(
+                collection,
+                &filter,
                 limit as usize,
                 offset_id.as_ref(),
                 Some(with_payload),

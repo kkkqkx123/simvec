@@ -187,6 +187,168 @@ fn lifecycle_round_trip() {
 }
 
 #[test]
+fn filtered_count_scroll_round_trip() {
+    unsafe {
+        let handle = open_engine();
+        let name = cstr("docs");
+        let config = cstr(r#"{"vector_size":4,"distance":"Cosine","index":"Flat"}"#);
+        assert_eq!(
+            collections::simvec_create_collection(handle, name.as_ptr(), config.as_ptr()),
+            OK
+        );
+        for (id, version) in [("1", "v1"), ("2", "v1"), ("3", "v2")] {
+            let id_c = cstr(id);
+            let vector = [1.0f32, 0.0, 0.0, 0.0];
+            let payload =
+                cstr(&format!(r#"{{"version":"{version}"}}"#));
+            assert_eq!(
+                write::simvec_upsert(
+                    handle,
+                    name.as_ptr(),
+                    id_c.as_ptr(),
+                    vector.as_ptr(),
+                    vector.len(),
+                    payload.as_ptr()
+                ),
+                OK
+            );
+        }
+
+        let filter = cstr(r#"{"must":[{"field":"version","condition":{"Match":{"value":"v1"}}}]}"#);
+        let mut count: u64 = 0;
+        assert_eq!(
+            read::simvec_count_by_filter(
+                handle,
+                name.as_ptr(),
+                filter.as_ptr(),
+                &mut count
+            ),
+            OK
+        );
+        assert_eq!(count, 2);
+
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            read::simvec_scroll_by_filter(
+                handle,
+                name.as_ptr(),
+                1,
+                ptr::null(),
+                filter.as_ptr(),
+                1,
+                0,
+                &mut out
+            ),
+            OK
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(&take_string(out)).expect("first page");
+        assert_eq!(first.get("points").map(|p| p.as_array().map(Vec::len)), Some(Some(1)));
+        let cursor = first
+            .get("next_offset")
+            .and_then(|v| v.as_str())
+            .expect("cursor");
+        let cursor_c = cstr(cursor);
+        let mut tail_out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            read::simvec_scroll_by_filter(
+                handle,
+                name.as_ptr(),
+                10,
+                cursor_c.as_ptr(),
+                filter.as_ptr(),
+                1,
+                0,
+                &mut tail_out
+            ),
+            OK
+        );
+        let tail: serde_json::Value =
+            serde_json::from_str(&take_string(tail_out)).expect("tail page");
+        assert_eq!(tail.get("points").map(|p| p.as_array().map(Vec::len)), Some(Some(1)));
+
+        // Misuse: null out, null filter, malformed JSON.
+        let mut bad_count: u64 = 0;
+        assert_eq!(
+            read::simvec_count_by_filter(
+                handle,
+                name.as_ptr(),
+                ptr::null(),
+                &mut bad_count
+            ),
+            MISUSE
+        );
+        assert_eq!(
+            read::simvec_count_by_filter(
+                handle,
+                name.as_ptr(),
+                filter.as_ptr(),
+                ptr::null_mut()
+            ),
+            MISUSE
+        );
+        let bad = cstr("{not json");
+        assert_eq!(
+            read::simvec_count_by_filter(
+                handle,
+                name.as_ptr(),
+                bad.as_ptr(),
+                &mut bad_count
+            ),
+            MISUSE
+        );
+        let mut bad_out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            read::simvec_scroll_by_filter(
+                handle,
+                name.as_ptr(),
+                10,
+                ptr::null(),
+                bad.as_ptr(),
+                1,
+                0,
+                &mut bad_out
+            ),
+            MISUSE
+        );
+        assert!(bad_out.is_null());
+
+        // Not-found: unknown collection reports NOTFOUND for both entries.
+        let ghost = cstr("ghost");
+        assert_eq!(
+            read::simvec_count_by_filter(
+                handle,
+                ghost.as_ptr(),
+                filter.as_ptr(),
+                &mut bad_count
+            ),
+            NOTFOUND
+        );
+        let mut ghost_out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            read::simvec_scroll_by_filter(
+                handle,
+                ghost.as_ptr(),
+                10,
+                ptr::null(),
+                filter.as_ptr(),
+                1,
+                0,
+                &mut ghost_out
+            ),
+            NOTFOUND
+        );
+        assert!(ghost_out.is_null());
+
+        assert_eq!(
+            collections::simvec_delete_collection(handle, name.as_ptr()),
+            OK
+        );
+        close_engine(handle);
+    }
+}
+
+#[test]
 fn advanced_paths_round_trip() {
     unsafe {
         let handle = open_engine();

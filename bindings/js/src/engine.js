@@ -360,6 +360,16 @@ export class Engine {
     return Number(out.readBigUInt64LE(0));
   }
 
+  countByFilter(collection, filter) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(
+      functions.simvec_count_by_filter(handle, String(collection), encodeJson(filter), out),
+      handle,
+    );
+    return Number(out.readBigUInt64LE(0));
+  }
+
   scroll(collection, limit, offset = null, withPayload = true, withVector = false) {
     const handle = this._requireOpen();
     const out = outPointer();
@@ -369,6 +379,25 @@ export class Engine {
         String(collection),
         BigInt(limit),
         offset === null || offset === undefined ? null : String(offset),
+        withPayload ? 1 : 0,
+        withVector ? 1 : 0,
+        out,
+      ),
+      handle,
+    );
+    return takeJson(readPointer(out));
+  }
+
+  scrollByFilter(collection, filter, limit, offset = null, withPayload = true, withVector = false) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(
+      functions.simvec_scroll_by_filter(
+        handle,
+        String(collection),
+        BigInt(limit),
+        offset === null || offset === undefined ? null : String(offset),
+        encodeJson(filter),
         withPayload ? 1 : 0,
         withVector ? 1 : 0,
         out,

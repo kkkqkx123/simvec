@@ -653,30 +653,43 @@ impl CollectionStore {
         self.apply_txn(ops)
     }
 
+    /// Slot-ordered ids of every live point matching `filter`.
+    ///
+    /// Shared match stage for filtered count, filtered scroll and filtered
+    /// delete: single full scan over live slots, tombstones skipped, payload
+    /// read followed by post-filter verdict. Pure read path, no log writes.
+    fn filter_match_ids(&self, filter: &crate::types::VectorFilter) -> Result<Vec<PointId>> {
+        let inner = self.inner.read();
+        let tombstones = self.tombstones.load();
+        let keysnap = self.keys.snapshot();
+        let mut point_ids = Vec::new();
+        for slot in 0..inner.meta.next_slot as usize {
+            if tombstones.bit(slot) {
+                continue;
+            }
+            let key = Keys::read_key(&keysnap, slot)?.ok_or_else(|| {
+                VectorSearchError::CorruptData(format!("slot {slot} has no key"))
+            })?;
+            let id = PointId::from(key);
+            let payload = self.read_payload_at(slot as u32)?;
+            if crate::filter::matches(filter, &id, payload.as_ref())? {
+                point_ids.push(id);
+            }
+        }
+        Ok(point_ids)
+    }
+
+    /// Number of live points matching `filter`. Pure read, no log writes
+    /// and no maintenance side effects.
+    pub fn count_by_filter(&self, filter: &crate::types::VectorFilter) -> Result<u64> {
+        Ok(self.filter_match_ids(filter)?.len() as u64)
+    }
+
     /// Delete every live point matching `filter`. Returns the number of
     /// deleted points. Runs as a single WAL-backed batch so recovery replays
     /// the filter match deterministically.
     pub fn delete_by_filter(&self, filter: &crate::types::VectorFilter) -> Result<u64> {
-        let point_ids: Vec<PointId> = {
-            let inner = self.inner.read();
-            let tombstones = self.tombstones.load();
-            let keysnap = self.keys.snapshot();
-            let mut point_ids = Vec::new();
-            for slot in 0..inner.meta.next_slot as usize {
-                if tombstones.bit(slot) {
-                    continue;
-                }
-                let key = Keys::read_key(&keysnap, slot)?.ok_or_else(|| {
-                    VectorSearchError::CorruptData(format!("slot {slot} has no key"))
-                })?;
-                let id = PointId::from(key);
-                let payload = self.read_payload_at(slot as u32)?;
-                if crate::filter::matches(filter, &id, payload.as_ref())? {
-                    point_ids.push(id);
-                }
-            }
-            point_ids
-        };
+        let point_ids = self.filter_match_ids(filter)?;
         if point_ids.is_empty() {
             return Ok(0);
         }
@@ -1053,6 +1066,77 @@ impl CollectionStore {
             } else {
                 None
             };
+            let vector = if include_vector {
+                Some(
+                    Vectors::read_slot(&vsnap, slot as u64, inner.meta.segment_slots, dim)
+                        .ok_or_else(|| {
+                            VectorSearchError::CorruptData(format!(
+                                "slot {slot} out of vectors.bin range"
+                            ))
+                        })?
+                        .to_vec(),
+                )
+            } else {
+                None
+            };
+            last_id = Some(id.clone());
+            results.push(VectorPoint {
+                id,
+                vector: vector.unwrap_or_default(),
+                payload,
+            });
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok((results, last_id))
+    }
+
+    /// Paginated scan over live points matching `filter`, in slot order.
+    ///
+    /// Cursor semantics match [`CollectionStore::scroll`]: iteration starts
+    /// after `offset`, `limit` counts only matching points, and the returned
+    /// cursor is the last matching id (use as the next `offset`). A short
+    /// page does not imply exhaustion when a filter is present: keep paging
+    /// until an empty page appears. Unfiltered callers keep using `scroll`.
+    pub fn scroll_by_filter(
+        &self,
+        filter: &crate::types::VectorFilter,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        let inner = self.inner.read();
+        let tombstones = self.tombstones.load();
+        let keysnap = self.keys.snapshot();
+        let vsnap = self.vectors.snapshot();
+        let dim = inner.meta.vector_size;
+        let include_payload = with_payload.unwrap_or(true);
+        let include_vector = with_vector.unwrap_or(false);
+
+        let mut skip = offset.is_some();
+        let mut results = Vec::with_capacity(limit);
+        let mut last_id: Option<PointId> = None;
+
+        for slot in 0..inner.meta.next_slot as usize {
+            if tombstones.bit(slot) {
+                continue;
+            }
+            let key = Keys::read_key(&keysnap, slot)?
+                .ok_or_else(|| VectorSearchError::CorruptData(format!("slot {slot} has no key")))?;
+            let id = PointId::from(key);
+            if skip {
+                if Some(&id) == offset {
+                    skip = false;
+                }
+                continue;
+            }
+            let payload = self.read_payload_at(slot as u32)?;
+            if !crate::filter::matches(filter, &id, payload.as_ref())? {
+                continue;
+            }
+            let payload = if include_payload { payload } else { None };
             let vector = if include_vector {
                 Some(
                     Vectors::read_slot(&vsnap, slot as u64, inner.meta.segment_slots, dim)

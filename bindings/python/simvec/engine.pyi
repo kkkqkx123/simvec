@@ -43,9 +43,19 @@ class Engine:
     ) -> list[dict[str, Any]]: ...
     def get(self, collection: str, point_id: str | int) -> dict[str, Any]: ...
     def count(self, collection: str) -> int: ...
+    def count_by_filter(self, collection: str, query_filter: dict[str, Any]) -> int: ...
     def scroll(
         self,
         collection: str,
+        limit: int,
+        offset: str | None = ...,
+        with_payload: bool = ...,
+        with_vector: bool = ...,
+    ) -> dict[str, Any]: ...
+    def scroll_by_filter(
+        self,
+        collection: str,
+        query_filter: dict[str, Any],
         limit: int,
         offset: str | None = ...,
         with_payload: bool = ...,

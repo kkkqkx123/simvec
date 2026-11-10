@@ -713,6 +713,28 @@ func (e *Engine) Get(collection, id string) (map[string]any, error) {
 	return point, nil
 }
 
+// CountByFilter returns the number of live points matching a filter. Pure read.
+func (e *Engine) CountByFilter(collection string, filter any) (uint64, error) {
+	raw, err := jsonBytes(filter)
+	if err != nil {
+		return 0, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return 0, newError(CodeMisuse, "engine is closed")
+	}
+	cCollection := cString(collection)
+	defer C.free(unsafe.Pointer(cCollection))
+	cFilter := cString(string(raw))
+	defer C.free(unsafe.Pointer(cFilter))
+	var out C.uint64_t
+	if err := e.fail(C.simvec_count_by_filter(e.handle, cCollection, cFilter, &out)); err != nil {
+		return 0, err
+	}
+	return uint64(out), nil
+}
+
 // Count returns the number of live points in a collection.
 func (e *Engine) Count(collection string) (uint64, error) {
 	e.mu.RLock()
@@ -745,6 +767,43 @@ func (e *Engine) Scroll(collection string, limit uint64, offset *string, withPay
 	}
 	var out *C.char
 	code := C.simvec_scroll(e.handle, cCollection, C.uint64_t(limit), cOffset, boolToInt(withPayload), boolToInt(withVector), &out)
+	if err := e.fail(code); err != nil {
+		return nil, err
+	}
+	var page ScrollPage
+	if err := decodeText(out, &page); err != nil {
+		return nil, err
+	}
+	if page.Points == nil {
+		page.Points = []map[string]any{}
+	}
+	return &page, nil
+}
+
+// ScrollByFilter scans one filtered page. Limit counts only matching points;
+// page until an empty page because a short page does not imply exhaustion.
+// A nil offset starts from the beginning.
+func (e *Engine) ScrollByFilter(collection string, filter any, limit uint64, offset *string, withPayload, withVector bool) (*ScrollPage, error) {
+	raw, err := jsonBytes(filter)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return nil, newError(CodeMisuse, "engine is closed")
+	}
+	cCollection := cString(collection)
+	defer C.free(unsafe.Pointer(cCollection))
+	var cOffset *C.char
+	if offset != nil {
+		cOffset = cString(*offset)
+		defer C.free(unsafe.Pointer(cOffset))
+	}
+	cFilter := cString(string(raw))
+	defer C.free(unsafe.Pointer(cFilter))
+	var out *C.char
+	code := C.simvec_scroll_by_filter(e.handle, cCollection, C.uint64_t(limit), cOffset, cFilter, boolToInt(withPayload), boolToInt(withVector), &out)
 	if err := e.fail(code); err != nil {
 		return nil, err
 	}

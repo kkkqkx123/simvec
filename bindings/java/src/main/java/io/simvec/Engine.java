@@ -307,8 +307,33 @@ public final class Engine implements AutoCloseable {
         return out[0];
     }
 
+    public synchronized long countByFilter(String collection, Object filter) {
+        long h = requireOpen();
+        long[] out = new long[1];
+        check(NativeLib.nCountByFilter(h, utf8(collection), json(filter), out), h);
+        return out[0];
+    }
+
     public synchronized ScrollPage scroll(String collection, long limit) {
         return scroll(collection, limit, null, true, false);
+    }
+
+    public synchronized ScrollPage scrollByFilter(String collection, Object filter, long limit) {
+        return scrollByFilter(collection, filter, limit, null, true, false);
+    }
+
+    public synchronized ScrollPage scrollByFilter(String collection, Object filter, long limit,
+            String offset, boolean withPayload, boolean withVector) {
+        long h = requireOpen();
+        byte[][] out = new byte[1][];
+        check(NativeLib.nScrollByFilter(h, utf8(collection), limit, utf8(offset), json(filter),
+                withPayload, withVector, out), h);
+        Map<String, Object> page = readMap(out[0]);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> points = (List<Map<String, Object>>) page.get("points");
+        Object cursor = page.get("next_offset");
+        return new ScrollPage(points == null ? List.of() : points,
+                cursor == null ? null : String.valueOf(cursor));
     }
 
     public synchronized ScrollPage scroll(String collection, long limit, String offset,

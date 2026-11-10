@@ -551,6 +551,21 @@ SEXP C_simvec_count(SEXP r_handle, SEXP r_collection) {
     RETURN3(0, ScalarReal((double)count), NULL);
 }
 
+SEXP C_simvec_count_by_filter(SEXP r_handle, SEXP r_collection, SEXP r_filter) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(collection, r_collection);
+    NEED_STR(filter, r_filter);
+    uint64_t count = 0;
+    int rc = simvec_count_by_filter(handle, collection, filter, &count);
+    if (rc) {
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, ScalarReal((double)count), NULL);
+}
+
 SEXP C_simvec_scroll(SEXP r_handle, SEXP r_collection, SEXP r_limit, SEXP r_offset,
                      SEXP r_with_payload, SEXP r_with_vector) {
     engine_t *handle = engine_ptr(r_handle);
@@ -564,6 +579,29 @@ SEXP C_simvec_scroll(SEXP r_handle, SEXP r_collection, SEXP r_limit, SEXP r_offs
     int rc = simvec_scroll(handle, collection, limit, offset,
                            asLogical(r_with_payload) ? 1 : 0,
                            asLogical(r_with_vector) ? 1 : 0, &text);
+    if (rc) {
+        if (text) {
+            simvec_free_string(text);
+        }
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, json_payload(text), NULL);
+}
+
+SEXP C_simvec_scroll_by_filter(SEXP r_handle, SEXP r_collection, SEXP r_limit, SEXP r_offset,
+                               SEXP r_filter, SEXP r_with_payload, SEXP r_with_vector) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(collection, r_collection);
+    NEED_STR(offset, r_offset);
+    NEED_STR(filter, r_filter);
+    uint64_t limit = (uint64_t)asReal(r_limit);
+    char *text = NULL;
+    int rc = simvec_scroll_by_filter(handle, collection, limit, offset, filter,
+                                     asLogical(r_with_payload) ? 1 : 0,
+                                     asLogical(r_with_vector) ? 1 : 0, &text);
     if (rc) {
         if (text) {
             simvec_free_string(text);

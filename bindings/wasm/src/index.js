@@ -228,11 +228,30 @@ export class Engine {
     return callWasm(() => handle.count(String(collection)));
   }
 
+  countByFilter(collection, filter) {
+    const handle = this._requireOpen();
+    return callWasm(() => handle.count_by_filter(String(collection), JSON.stringify(filter)));
+  }
+
   scroll(collection, limit, offset = null, withPayload = true, withVector = false) {
     const handle = this._requireOpen();
     return parseWasmJson(() =>
       handle.scroll(
         String(collection),
+        Number(limit),
+        offset === null || offset === undefined ? null : String(offset),
+        Boolean(withPayload),
+        Boolean(withVector),
+      ),
+    );
+  }
+
+  scrollByFilter(collection, filter, limit, offset = null, withPayload = true, withVector = false) {
+    const handle = this._requireOpen();
+    return parseWasmJson(() =>
+      handle.scroll_by_filter(
+        String(collection),
+        JSON.stringify(filter),
         Number(limit),
         offset === null || offset === undefined ? null : String(offset),
         Boolean(withPayload),

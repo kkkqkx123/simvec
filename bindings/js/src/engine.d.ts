@@ -55,7 +55,9 @@ export declare class Engine {
   ): JsonObject[];
   get(collection: string, id: string | number): JsonObject;
   count(collection: string): number;
+  countByFilter(collection: string, filter: JsonObject): number;
   scroll(collection: string, limit: number, offset?: string | null, withPayload?: boolean, withVector?: boolean): ScrollPage;
+  scrollByFilter(collection: string, filter: JsonObject, limit: number, offset?: string | null, withPayload?: boolean, withVector?: boolean): ScrollPage;
   buildIndex(collection: string): boolean;
   buildQuantization(collection: string): boolean;
   hasIndex(collection: string): boolean;

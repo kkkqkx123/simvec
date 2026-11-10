@@ -145,8 +145,13 @@ final class NativeLib {
 
     static native int nCount(long handle, byte[] collection, long[] out);
 
+    static native int nCountByFilter(long handle, byte[] collection, byte[] filterJson, long[] out);
+
     static native int nScroll(long handle, byte[] collection, long limit, byte[] offset,
             boolean withPayload, boolean withVector, byte[][] out);
+
+    static native int nScrollByFilter(long handle, byte[] collection, long limit, byte[] offset,
+            byte[] filterJson, boolean withPayload, boolean withVector, byte[][] out);
 
     static native int nBuildIndex(long handle, byte[] collection, int[] out);
 

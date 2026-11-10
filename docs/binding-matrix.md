@@ -1,6 +1,6 @@
 # 绑定功能矩阵：C API / Python / JavaScript / Go / Java / R / WASM
 
-统计口径：C 侧以 `include/simvec.h` 与 `src/c_api` 对照为准，两者一致，共 50 个导出函数。
+统计口径：C 侧以 `include/simvec.h` 与 `src/c_api` 对照为准，两者一致，共 52 个导出函数。
 Python 侧看 `bindings/python/simvec/engine.py` 的 `Engine` 方法与 `_native.py` 的签名声明。
 JavaScript 侧看 `bindings/js/src/engine.js` 的 `Engine` 方法与 `native.js` 的签名声明。
 Go 侧看 `bindings/go/engine.go` 的 `Engine` 方法。
@@ -76,7 +76,9 @@ WASM 侧看 `bindings/wasm/src/index.js` 的 `Engine` 方法与 `src/wasm_api.rs
 | 向量快捷查询 | `simvec_search_vector` | `search_vector`，含过滤器、分数阈值、载荷与向量开关 | `searchVector`，参数语义相同 | `SearchVector`，参数语义相同 | `searchVector`，参数语义相同 | `simvec_search_vector`，参数语义相同 |
 | 单点读取 | `simvec_get` | `get` | `get` | `Get` | `get` | `simvec_get` |
 | 计数 | `simvec_count` | `count` | `count` | `Count` | `count` | `simvec_count`，以双精度返回 |
+| 过滤计数 | `simvec_count_by_filter` | `count_by_filter`，返回匹配数 | `countByFilter`，返回匹配数 | `CountByFilter`，返回匹配数 | `countByFilter`，返回匹配数 | `simvec_count_by_filter`，以双精度返回匹配数 |
 | 分页扫描 | `simvec_scroll` | `scroll`，偏移量可选 | `scroll`，偏移量可选 | `Scroll`，具名 `ScrollPage` 结构，偏移量可选 | `scroll`，具名 `ScrollPage` 记录，偏移量可选 | `simvec_scroll`，具名列表，偏移量可选 |
+| 过滤分页扫描 | `simvec_scroll_by_filter` | `scroll_by_filter`，`limit` 仅计匹配，短页须翻至空页，游标为最后匹配 | `scrollByFilter`，语义相同 | `ScrollByFilter`，具名 `ScrollPage` 结构，语义相同 | `scrollByFilter`，具名 `ScrollPage` 记录，语义相同 | `simvec_scroll_by_filter`，具名列表，语义相同 |
 
 该分组五端完全对齐，无缺口。
 
@@ -224,7 +226,9 @@ WASM 为浏览器内存形态，与五端本机形态并存。`Rust` 侧是 `Mem
 | 向量快捷查询 | 有，`JS` 侧组装通用查询 | 单一检索入口 |
 | 单点读取 | 有，缺失抛未找到 | 与本机一致 |
 | 计数 | 有，宿主数字 | 同形 |
+| 过滤计数 | 有，宿主数字 | 纯只读，与本机同语义 |
 | 分页扫描 | 有，回点位数组加下一页标记 | 同形 |
+| 过滤分页扫描 | 有，回点位数组加下一页标记 | `limit` 仅计匹配，短页须翻至空页 |
 
 ### 维护与指标
 
@@ -265,7 +269,7 @@ WASM 为浏览器内存形态，与五端本机形态并存。`Rust` 侧是 `Mem
 
 ## Go 绑定对照
 
-Go 绑定（`bindings/go`，cgo 薄封装）与 C API 全量对齐，50 个导出函数逐一映射，
+Go 绑定（`bindings/go`，cgo 薄封装）与 C API 全量对齐，52 个导出函数逐一映射，
 方法命名按 Go 首字母大写驼峰改写，语义与 Python 和 JavaScript 两绑定一致：
 存在性查询返回布尔值，删除载荷索引返回是否命中，构建索引与构建量化返回是否生效，
 过滤删除与压缩返回计数，查询与读取返回解析后的通用结构，默认配置未设置时返回空。
@@ -285,7 +289,7 @@ Go 绑定（`bindings/go`，cgo 薄封装）与 C API 全量对齐，50 个导�
 
 ## Java 绑定对照
 
-Java 绑定（`bindings/java`，JNI 薄封装）与 C API 全量对齐，50 个导出函数逐一映射，
+Java 绑定（`bindings/java`，JNI 薄封装）与 C API 全量对齐，52 个导出函数逐一映射，
 方法命名按 Java 首字母小写驼峰改写，语义与 Python、JavaScript、Go 绑定一致：
 存在性查询返回布尔值，删除载荷索引返回是否命中，构建索引与构建量化返回是否生效，
 过滤删除与压缩返回计数，查询与读取返回解析后的通用结构，默认配置未设置时返回空。

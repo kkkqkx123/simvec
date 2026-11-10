@@ -330,6 +330,19 @@ class Engine:
         )
         return out.value
 
+    def count_by_filter(self, collection, query_filter):
+        out = ctypes.c_uint64()
+        _check(
+            _lib.simvec_count_by_filter(
+                self._handle,
+                _encode_str(collection),
+                _encode_json(query_filter),
+                ctypes.byref(out),
+            ),
+            self._handle,
+        )
+        return out.value
+
     def scroll(self, collection, limit, offset=None, with_payload=True, with_vector=False):
         out = ctypes.c_void_p()
         _check(
@@ -338,6 +351,24 @@ class Engine:
                 _encode_str(collection),
                 limit,
                 _encode_str(offset) if offset is not None else None,
+                int(bool(with_payload)),
+                int(bool(with_vector)),
+                ctypes.byref(out),
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def scroll_by_filter(self, collection, query_filter, limit, offset=None,
+                         with_payload=True, with_vector=False):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_scroll_by_filter(
+                self._handle,
+                _encode_str(collection),
+                limit,
+                _encode_str(offset) if offset is not None else None,
+                _encode_json(query_filter),
                 int(bool(with_payload)),
                 int(bool(with_vector)),
                 ctypes.byref(out),

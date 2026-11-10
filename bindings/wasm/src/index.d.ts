@@ -43,7 +43,9 @@ export declare class Engine {
   ): unknown[];
   get(collection: string, id: string | number): unknown;
   count(collection: string): number;
+  countByFilter(collection: string, filter: unknown): number;
   scroll(collection: string, limit: number, offset?: string | null, withPayload?: boolean, withVector?: boolean): ScrollPage;
+  scrollByFilter(collection: string, filter: unknown, limit: number, offset?: string | null, withPayload?: boolean, withVector?: boolean): ScrollPage;
   buildIndex(collection: string): boolean;
   buildQuantization(collection: string): boolean;
   hasIndex(collection: string): boolean;

@@ -93,8 +93,25 @@ const DEFINITIONS = {
   },
   simvec_get: { arguments: ["pointer", "string", "string", "pointer"], return: "int32" },
   simvec_count: { arguments: ["pointer", "string", "pointer"], return: "int32" },
+  simvec_count_by_filter: {
+    arguments: ["pointer", "string", "string", "pointer"],
+    return: "int32",
+  }
   simvec_scroll: {
     arguments: ["pointer", "string", "uint64", "string", "int32", "int32", "pointer"],
+    return: "int32",
+  },
+  simvec_scroll_by_filter: {
+    arguments: [
+      "pointer",
+      "string",
+      "uint64",
+      "string",
+      "string",
+      "int32",
+      "int32",
+      "pointer",
+    ],
     return: "int32",
   },
   simvec_build_index: { arguments: ["pointer", "string", "pointer"], return: "int32" },

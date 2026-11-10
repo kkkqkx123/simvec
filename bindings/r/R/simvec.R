@@ -291,12 +291,31 @@ simvec_count <- function(engine, collection) {
 }
 
 #' @export
+simvec_count_by_filter <- function(engine, collection, filter) {
+  check_engine(engine)
+  res <- .Call(C_simvec_count_by_filter, engine$ptr,
+    tostring(collection, "collection"), to_json_or_null(filter))
+  as.numeric(payload_or_raise(res))
+}
+
+#' @export
 simvec_scroll <- function(engine, collection, limit, offset = NULL,
                           with_payload = TRUE, with_vector = FALSE) {
   check_engine(engine)
   res <- .Call(C_simvec_scroll, engine$ptr,
     tostring(collection, "collection"), as.numeric(limit),
     tostring(offset, "offset"), isTRUE(with_payload), isTRUE(with_vector))
+  from_json(payload_or_raise(res))
+}
+
+#' @export
+simvec_scroll_by_filter <- function(engine, collection, filter, limit, offset = NULL,
+                                    with_payload = TRUE, with_vector = FALSE) {
+  check_engine(engine)
+  res <- .Call(C_simvec_scroll_by_filter, engine$ptr,
+    tostring(collection, "collection"), as.numeric(limit),
+    tostring(offset, "offset"), to_json_or_null(filter),
+    isTRUE(with_payload), isTRUE(with_vector))
   from_json(payload_or_raise(res))
 }
 

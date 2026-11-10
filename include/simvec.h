@@ -148,6 +148,11 @@ int simvec_get(struct simvec_engine_t *engine,
 
 int simvec_count(struct simvec_engine_t *engine, const char *collection, uint64_t *out);
 
+int simvec_count_by_filter(struct simvec_engine_t *engine,
+                           const char *collection,
+                           const char *filter_json,
+                           uint64_t *out);
+
 int simvec_scroll(struct simvec_engine_t *engine,
                   const char *collection,
                   uint64_t limit,
@@ -155,6 +160,15 @@ int simvec_scroll(struct simvec_engine_t *engine,
                   int with_payload,
                   int with_vector,
                   char **out);
+
+int simvec_scroll_by_filter(struct simvec_engine_t *engine,
+                            const char *collection,
+                            uint64_t limit,
+                            const char *offset,
+                            const char *filter_json,
+                            int with_payload,
+                            int with_vector,
+                            char **out);
 
 int simvec_build_index(struct simvec_engine_t *engine, const char *collection, int *out);
 

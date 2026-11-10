@@ -216,6 +216,52 @@ pub unsafe extern "C" fn simvec_count(
     })
 }
 
+/// Count live points matching a JSON `VectorFilter`; `*out` takes the count.
+///
+/// Pure read: no log writes and no maintenance side effects. A null or
+/// malformed `filter_json` reports misuse; an unknown collection reports
+/// not-found.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection` and `filter_json` must be valid null-terminated UTF-8 strings.
+/// - `out` must be a valid out pointer.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_count_by_filter(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+    filter_json: *const c_char,
+    out: *mut u64,
+) -> c_int {
+    guard(engine, |handle| {
+        if out.is_null() {
+            return handle.fail_code(
+                simvec_error_code_t::SIMVEC_MISUSE,
+                "null out pointer".to_string(),
+            );
+        }
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        let raw = match input_str(filter_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid filter string".to_string()),
+        };
+        let filter: VectorFilter = match parse_input_json(raw) {
+            Ok(filter) => filter,
+            Err(code) => return handle.fail_code(code, "invalid filter JSON".to_string()),
+        };
+        match handle.engine.count_by_filter(collection, &filter) {
+            Ok(count) => {
+                *out = count;
+                handle.ok()
+            }
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
 /// Paginated scan as a JSON object with points and the next offset.
 ///
 /// A null `offset` starts from the beginning. `next_offset` echoes the last
@@ -281,3 +327,80 @@ pub unsafe extern "C" fn simvec_scroll(
         }
     })
 }
+
+/// Filtered paginated scan as a JSON object with points and the next offset.
+///
+/// A null `offset` starts from the beginning. `limit` counts only matching
+/// points and `next_offset` echoes the last matching id. A short page does
+/// not imply exhaustion when a filter is present: page until an empty page.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection` and `filter_json` must be valid null-terminated UTF-8 strings.
+/// - `offset` must be null or a valid null-terminated UTF-8 string.
+/// - `out` must be a valid out pointer freed with `simvec_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_scroll_by_filter(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+    limit: u64,
+    offset: *const c_char,
+    filter_json: *const c_char,
+    with_payload: c_int,
+    with_vector: c_int,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        let raw_offset = match opt_input_str(offset) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid offset string".to_string()),
+        };
+        let offset = raw_offset.map(PointId::from);
+        let raw = match input_str(filter_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid filter string".to_string()),
+        };
+        let filter: VectorFilter = match parse_input_json(raw) {
+            Ok(filter) => filter,
+            Err(code) => return handle.fail_code(code, "invalid filter JSON".to_string()),
+        };
+        match handle.engine.scroll_by_filter(
+            collection,
+            &filter,
+            limit as usize,
+            offset.as_ref(),
+            Some(with_payload != 0),
+            Some(with_vector != 0),
+        ) {
+            Ok((points, next)) => {
+                let body = serde_json::json!({
+                    "points": points,
+                    "next_offset": next.map(|id| id.to_string()),
+                });
+                match serde_json::to_string(&body) {
+                    Ok(body) => {
+                        let emit = emit_json(out, &body);
+                        if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                            handle.ok()
+                        } else {
+                            handle.fail_code(
+                                simvec_error_code_t::SIMVEC_ERROR,
+                                "failed to hand out scroll page".to_string(),
+                            )
+                        }
+                    }
+                    Err(err) => handle.fail_code(
+                        simvec_error_code_t::SIMVEC_INTERNAL,
+                        format!("failed to serialize scroll page: {err}"),
+                    ),
+                }
+            }
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+

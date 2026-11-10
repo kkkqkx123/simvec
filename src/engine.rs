@@ -719,6 +719,11 @@ impl LocalVectorEngine {
         Ok(self.store(collection)?.count())
     }
 
+    /// Number of live points matching `filter`. Pure read.
+    pub fn count_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
+        Ok(self.store(collection)?.count_by_filter(filter)?)
+    }
+
     /// Replace the payload for a single point. The point must exist and not
     /// be tombstoned. The entire payload map is replaced atomically.
     pub fn set_payload(
@@ -807,6 +812,22 @@ impl LocalVectorEngine {
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let store = self.store(collection)?;
         store.scroll(limit, offset, with_payload, with_vector)
+    }
+
+    /// Paginated scan over live points matching `filter`, in slot order.
+    /// `limit` counts only matching points; the cursor is the last match.
+    /// A short page does not imply exhaustion: page until an empty page.
+    pub fn scroll_by_filter(
+        &self,
+        collection: &str,
+        filter: &VectorFilter,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        let store = self.store(collection)?;
+        store.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
     }
 
     /// Commit protocol entry for coordinated transactions.

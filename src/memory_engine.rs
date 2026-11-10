@@ -382,6 +382,19 @@ impl MemoryEngine {
         self.with_collection(collection, |c| Ok(c.live_count()))
     }
 
+    /// Number of live points matching `filter`. Pure read.
+    pub fn count_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
+        self.with_collection(collection, |c| {
+            let mut count = 0u64;
+            for (id, point) in &c.points {
+                if crate::filter::matches(filter, id, point.payload.as_ref())? {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+    }
+
     /// Paginated scan ordered by point id string.
     pub fn scroll(
         &self,
@@ -405,6 +418,58 @@ impl MemoryEngine {
                     continue;
                 }
                 if let Some(point) = c.points.get(id) {
+                    last = Some(id.clone());
+                    results.push(VectorPoint {
+                        id: id.clone(),
+                        vector: if with_vector.unwrap_or(false) {
+                            point.vector.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        payload: if with_payload.unwrap_or(true) {
+                            point.payload.clone()
+                        } else {
+                            None
+                        },
+                    });
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok((results, last))
+        })
+    }
+
+    /// Paginated scan over points matching `filter`, ordered by id string.
+    /// `limit` counts only matching points; the cursor is the last match.
+    /// A short page does not imply exhaustion: page until an empty page.
+    pub fn scroll_by_filter(
+        &self,
+        collection: &str,
+        filter: &VectorFilter,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        self.with_collection(collection, |c| {
+            let mut ids: Vec<&PointId> = c.points.keys().collect();
+            ids.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            let mut skipping = offset.is_some();
+            let mut results = Vec::new();
+            let mut last: Option<PointId> = None;
+            for id in ids {
+                if skipping {
+                    if Some(id) == offset {
+                        skipping = false;
+                    }
+                    continue;
+                }
+                if let Some(point) = c.points.get(id) {
+                    if !crate::filter::matches(filter, id, point.payload.as_ref())? {
+                        continue;
+                    }
                     last = Some(id.clone());
                     results.push(VectorPoint {
                         id: id.clone(),

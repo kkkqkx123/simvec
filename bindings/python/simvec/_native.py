@@ -121,6 +121,13 @@ _lib.simvec_get.argtypes = [_engine_p, _c_str, _c_str, _c_out_str]
 _lib.simvec_get.restype = ctypes.c_int
 _lib.simvec_count.argtypes = [_engine_p, _c_str, ctypes.POINTER(ctypes.c_uint64)]
 _lib.simvec_count.restype = ctypes.c_int
+_lib.simvec_count_by_filter.argtypes = [
+    _engine_p,
+    _c_str,
+    _c_str,
+    ctypes.POINTER(ctypes.c_uint64),
+]
+_lib.simvec_count_by_filter.restype = ctypes.c_int
 _lib.simvec_scroll.argtypes = [
     _engine_p,
     _c_str,
@@ -131,6 +138,17 @@ _lib.simvec_scroll.argtypes = [
     _c_out_str,
 ]
 _lib.simvec_scroll.restype = ctypes.c_int
+_lib.simvec_scroll_by_filter.argtypes = [
+    _engine_p,
+    _c_str,
+    ctypes.c_uint64,
+    _c_str,
+    _c_str,
+    ctypes.c_int,
+    ctypes.c_int,
+    _c_out_str,
+]
+_lib.simvec_scroll_by_filter.restype = ctypes.c_int
 
 _lib.simvec_build_index.argtypes = [_engine_p, _c_str, ctypes.POINTER(ctypes.c_int)]
 _lib.simvec_build_index.restype = ctypes.c_int
