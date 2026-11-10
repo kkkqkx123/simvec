@@ -1376,6 +1376,19 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
         with_vector: Option<bool>,
     ) -> EngineResult<(Vec<VectorPoint>, Option<PointId>)>;
 
+    /// Paginated scan over live points matching the given filter, in slot order.
+    /// Limit counts only matching points and the cursor is the last match.
+    /// A short page does not imply exhaustion with a filter present, page until an empty page.
+    async fn scroll_by_filter(
+        &self,
+        collection: &str,
+        filter: VectorFilter,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> EngineResult<(Vec<VectorPoint>, Option<PointId>)>;
+
     // ---- reads ----
 
     /// Full ANN / exact-scan search.
@@ -1387,6 +1400,13 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
 
     /// Number of live points in a collection.
     async fn count(&self, collection: &str) -> EngineResult<u64>;
+
+    /// Number of live points matching the given filter. Pure read.
+    async fn count_by_filter(
+        &self,
+        collection: &str,
+        filter: VectorFilter,
+    ) -> EngineResult<u64>;
 
     /// Streaming search: yields results one by one as a stream.
     ///
@@ -1433,6 +1453,47 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
             all_points.extend(points);
             offset = next;
             if is_last || offset.is_none() {
+                break;
+            }
+        }
+        let stream = futures::stream::iter(all_points.into_iter().map(Ok));
+        Ok(Box::pin(stream))
+    }
+
+    /// Streaming filtered scroll over points matching the given filter.
+    ///
+    /// Default implementation pages through `scroll_by_filter` and yields
+    /// points one by one. Paging continues until an empty page because a short
+    /// page does not imply exhaustion with a filter present.
+    async fn scroll_by_filter_stream(
+        &self,
+        collection: &str,
+        filter: VectorFilter,
+        batch_size: usize,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> EngineResult<Pin<Box<dyn Stream<Item = EngineResult<VectorPoint>> + Send>>> {
+        let mut offset: Option<PointId> = None;
+        let collection = collection.to_string();
+        let mut all_points: Vec<VectorPoint> = Vec::new();
+        loop {
+            let (points, next) = self
+                .scroll_by_filter(
+                    &collection,
+                    filter.clone(),
+                    batch_size,
+                    offset.as_ref(),
+                    with_payload,
+                    with_vector,
+                )
+                .await?;
+            let empty = points.is_empty();
+            all_points.extend(points);
+            offset = next;
+            if empty {
+                break;
+            }
+            if offset.is_none() {
                 break;
             }
         }
@@ -1637,6 +1698,30 @@ impl VectorEngine for LocalVectorEngine {
         .map_err(VectorEngineError::from)
     }
 
+    async fn scroll_by_filter(
+        &self,
+        collection: &str,
+        filter: VectorFilter,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> EngineResult<(Vec<VectorPoint>, Option<PointId>)> {
+        let collection = collection.to_string();
+        let offset = offset.cloned();
+        tokio::task::block_in_place(|| {
+            self.scroll_by_filter(
+                &collection,
+                &filter,
+                limit,
+                offset.as_ref(),
+                with_payload,
+                with_vector,
+            )
+        })
+        .map_err(VectorEngineError::from)
+    }
+
     async fn search(
         &self,
         collection: &str,
@@ -1657,6 +1742,16 @@ impl VectorEngine for LocalVectorEngine {
     async fn count(&self, collection: &str) -> EngineResult<u64> {
         let collection = collection.to_string();
         tokio::task::block_in_place(|| self.count(&collection)).map_err(VectorEngineError::from)
+    }
+
+    async fn count_by_filter(
+        &self,
+        collection: &str,
+        filter: VectorFilter,
+    ) -> EngineResult<u64> {
+        let collection = collection.to_string();
+        tokio::task::block_in_place(|| self.count_by_filter(&collection, &filter))
+            .map_err(VectorEngineError::from)
     }
 }
 

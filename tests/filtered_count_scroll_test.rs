@@ -354,3 +354,67 @@ fn memory_form_parity_on_counts_and_id_sets() {
         HashSet::from(["0".to_string(), "1".to_string(), "2".to_string()])
     );
 }
+
+#[test]
+fn async_trait_filtered_reads_match_sync() {
+    use futures::StreamExt;
+    use simvec::engine::{LocalVectorEngine, VectorEngine};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LocalVectorEngine::open(dir.path().join("eng")).unwrap();
+    engine.create_collection("docs", &config(4)).unwrap();
+    for i in 0..6u64 {
+        let mut p = unit(i, 4);
+        p.payload = payload(serde_json::json!({"version": if i < 3 { "v1" } else { "v2" }}));
+        engine.upsert("docs", p).unwrap();
+    }
+    let filter = version_filter("v1");
+    futures::executor::block_on(async {
+        let counted = <LocalVectorEngine as VectorEngine>::count_by_filter(&engine, "docs", filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(counted, engine.count_by_filter("docs", &filter).unwrap());
+        let (page, next) =
+            <LocalVectorEngine as VectorEngine>::scroll_by_filter(&engine, "docs", filter.clone(), 2, None, Some(true), Some(false))
+                .await
+                .unwrap();
+        assert_eq!(page.len(), 2);
+        let (tail, _) = <LocalVectorEngine as VectorEngine>::scroll_by_filter(
+            &engine,
+            "docs",
+            filter.clone(),
+            2,
+            next.as_ref(),
+            Some(true),
+            Some(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tail.len(), 1);
+        let mut stream = <LocalVectorEngine as VectorEngine>::scroll_by_filter_stream(
+            &engine,
+            "docs",
+            filter.clone(),
+            2,
+            Some(true),
+            Some(false),
+        )
+        .await
+        .unwrap();
+        let mut streamed = Vec::new();
+        while let Some(item) = stream.next().await {
+            streamed.push(item.unwrap());
+        }
+        assert_eq!(streamed.len(), 3);
+        let mut plain = <LocalVectorEngine as VectorEngine>::scroll_stream(&engine, "docs", 2, Some(true), Some(false))
+            .await
+            .unwrap();
+        let mut plain_points = Vec::new();
+        while let Some(item) = plain.next().await {
+            plain_points.push(item.unwrap());
+        }
+        assert_eq!(plain_points.len(), 6);
+        assert!(<LocalVectorEngine as VectorEngine>::count_by_filter(&engine, "ghost", filter.clone())
+            .await
+            .is_err());
+    });
+}
