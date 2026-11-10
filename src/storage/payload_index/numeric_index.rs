@@ -83,14 +83,34 @@ impl NumericIndex {
         }
     }
 
-    fn eq_mask(&self, target: f64) -> Option<BitVec> {
-        let t = normalize(target)?;
-        let mut mask = BitVec::repeat(false, self.capacity);
+    /// Inclusive slot range holding `t`, or `None` when absent.
+    /// Binary search lands on an arbitrary equal element, so duplicates
+    /// need explicit expansion; otherwise the pre-filter mask would drop
+    /// matching slots and break its conservative contract.
+    fn equal_range(&self, t: f64) -> Option<(usize, usize)> {
         let pos = self
             .sorted
             .binary_search_by(|probe| probe.total_cmp(&t))
             .ok()?;
-        self.set_bit(&mut mask, self.slots[pos]);
+        let mut lo = pos;
+        while lo > 0 && self.sorted[lo - 1] == t {
+            lo -= 1;
+        }
+        let mut hi = pos;
+        while hi + 1 < self.sorted.len() && self.sorted[hi + 1] == t {
+            hi += 1;
+        }
+        Some((lo, hi))
+    }
+
+    fn eq_mask(&self, target: f64) -> Option<BitVec> {
+        let t = normalize(target)?;
+        let mut mask = BitVec::repeat(false, self.capacity);
+        if let Some((lo, hi)) = self.equal_range(t) {
+            for &slot in &self.slots[lo..=hi] {
+                self.set_bit(&mut mask, slot);
+            }
+        }
         Some(mask)
     }
 
@@ -143,8 +163,10 @@ impl NumericIndex {
                 let mut any = false;
                 for t in targets.into_iter().flatten() {
                     any = true;
-                    if let Ok(pos) = self.sorted.binary_search_by(|probe| probe.total_cmp(&t)) {
-                        self.set_bit(&mut mask, self.slots[pos]);
+                    if let Some((lo, hi)) = self.equal_range(t) {
+                        for &slot in &self.slots[lo..=hi] {
+                            self.set_bit(&mut mask, slot);
+                        }
                     }
                 }
                 if !any {
@@ -169,5 +191,27 @@ fn parse_number(value: &str) -> Option<f64> {
     match value.parse::<f64>() {
         Ok(n) if n.is_finite() => Some(n),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn equality_covers_duplicate_values() {
+        let mut idx = NumericIndex::new("version_id", 8);
+        for slot in [0u32, 1, 2] {
+            idx.register_slot(slot, Some(&json!(10)));
+        }
+        idx.register_slot(3, Some(&json!(20)));
+        let mask = idx
+            .bits(&ConditionType::Match {
+                value: "10".to_string(),
+            })
+            .expect("equality always accelerates");
+        assert!(mask[0] && mask[1] && mask[2]);
+        assert!(!mask[3]);
     }
 }
