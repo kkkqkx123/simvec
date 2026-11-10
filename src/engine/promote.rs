@@ -8,12 +8,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use super::*;
+use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
-use crate::types::{CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig, Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint};
+use crate::types::{
+    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
+    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+};
 
 impl LocalVectorEngine {
     /// Atomically promote a temp rebuild collection over its live collection.
@@ -160,4 +163,3 @@ impl LocalVectorEngine {
         }
     }
 }
-

@@ -31,7 +31,6 @@ mod rebuild;
 
 pub(crate) use self::codec::encode_binary_for_query;
 
-
 const QUANT_MAGIC: [u8; 4] = *b"VQMT";
 const QUANT_VERSION: u16 = 1;
 const QUANT_FILE: &str = "quant.bin";
@@ -307,16 +306,7 @@ impl QuantStore {
         }
         Some(&seg[offset..end])
     }
-
-
-
-
-
 }
-
-
-
-
 
 fn segment_bytes(bytes_per_vector: usize, segment_slots: u32) -> u64 {
     bytes_per_vector as u64 * segment_slots as u64

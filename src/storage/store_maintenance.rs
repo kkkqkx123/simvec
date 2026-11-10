@@ -6,24 +6,27 @@ use arc_swap::ArcSwap;
 use bitvec::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
-use super::{StoreInner, CollectionStore};
-use super::{set_applying, is_commit_worker, set_commit_worker, assert_not_applying};
 use super::filter_bitmap::FilterBitmap;
 use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
-use super::payloads::Payloads;
-use super::quant::QuantStore;
-use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
-use super::vectors::Vectors;
-use super::{Wal, WalRecord};
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
 use super::payload_store::PayloadStore;
+use super::payloads::Payloads;
+use super::quant::QuantStore;
+use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
 use super::tombstones::TombstoneBits;
+use super::vectors::Vectors;
+use super::{assert_not_applying, is_commit_worker, set_applying, set_commit_worker};
+use super::{CollectionStore, StoreInner};
+use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig, VectorPoint};
+use crate::types::{
+    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
+    VectorPoint,
+};
 
 use super::store_open::{count_ops, threshold_met};
 use super::*;

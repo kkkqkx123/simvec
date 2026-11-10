@@ -6,24 +6,27 @@ use arc_swap::ArcSwap;
 use bitvec::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
-use super::{StoreInner, CollectionStore};
-use super::{set_applying, is_commit_worker, set_commit_worker, assert_not_applying};
 use super::filter_bitmap::FilterBitmap;
 use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
-use super::payloads::Payloads;
-use super::quant::QuantStore;
-use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
-use super::vectors::Vectors;
-use super::{Wal, WalRecord};
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
 use super::payload_store::PayloadStore;
+use super::payloads::Payloads;
+use super::quant::QuantStore;
+use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
 use super::tombstones::TombstoneBits;
+use super::vectors::Vectors;
+use super::{assert_not_applying, is_commit_worker, set_applying, set_commit_worker};
+use super::{CollectionStore, StoreInner};
+use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig, VectorPoint};
+use crate::types::{
+    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
+    VectorPoint,
+};
 
 use super::store_open::{count_ops, validate_admission_locked, validate_point};
 use super::*;
@@ -147,7 +150,11 @@ impl CollectionStore {
         self.apply_txn(ops)
     }
 
-    pub(super) fn apply_records_locked(&self, inner: &mut StoreInner, ops: &[WalRecord]) -> Result<()> {
+    pub(super) fn apply_records_locked(
+        &self,
+        inner: &mut StoreInner,
+        ops: &[WalRecord],
+    ) -> Result<()> {
         // One bump per batch: compaction compares this counter across its
         // temp-file rewrite phase to prove no write raced it.
         self.mutations.fetch_add(1, AtomicOrdering::Relaxed);
@@ -191,7 +198,11 @@ impl CollectionStore {
         Ok(())
     }
 
-    pub(super) fn apply_upsert_locked(&self, inner: &mut StoreInner, point: &VectorPoint) -> Result<()> {
+    pub(super) fn apply_upsert_locked(
+        &self,
+        inner: &mut StoreInner,
+        point: &VectorPoint,
+    ) -> Result<()> {
         validate_point(&inner.meta, point)?;
         let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
 
@@ -228,7 +239,11 @@ impl CollectionStore {
     /// and this step writes the directory entry that makes the point visible.
     /// Reads never observe an id before this point, because only `reverse`
     /// publishes it.
-    pub(super) fn resolve_upsert_slot_locked(&self, inner: &mut StoreInner, id: &PointId) -> Result<u64> {
+    pub(super) fn resolve_upsert_slot_locked(
+        &self,
+        inner: &mut StoreInner,
+        id: &PointId,
+    ) -> Result<u64> {
         if let Some(slot) = inner.reserved.remove(id) {
             self.init_slot_locked(inner, id, slot)?;
             return Ok(slot as u64);
@@ -243,7 +258,12 @@ impl CollectionStore {
 
     /// Publish one new slot: grow the files if needed, write the id into
     /// `keys.bin`, and record the mapping and the counters.
-    pub(super) fn init_slot_locked(&self, inner: &mut StoreInner, id: &PointId, slot: u32) -> Result<()> {
+    pub(super) fn init_slot_locked(
+        &self,
+        inner: &mut StoreInner,
+        id: &PointId,
+        slot: u32,
+    ) -> Result<()> {
         self.ensure_capacity(inner, slot as u64 + 1)?;
         self.keys.append_key(slot as usize, &id.to_string())?;
         inner.reverse.insert(id.clone(), slot);

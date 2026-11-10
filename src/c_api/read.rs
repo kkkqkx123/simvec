@@ -403,4 +403,3 @@ pub unsafe extern "C" fn simvec_scroll_by_filter(
         }
     })
 }
-

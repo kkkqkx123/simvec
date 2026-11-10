@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use super::*;
+use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use crate::error::{EngineResult, Result, VectorEngineError, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::storage::CollectionStore;
-use crate::types::{CollectionConfig, CollectionInfo, HealthStatus, IndexMetadata, Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint};
+use crate::types::{
+    CollectionConfig, CollectionInfo, HealthStatus, IndexMetadata, Payload, PayloadSchemaType,
+    PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+};
 
 // ---------------------------------------------------------------------------
 // Unified async VectorEngine trait
@@ -165,11 +168,7 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     async fn count(&self, collection: &str) -> EngineResult<u64>;
 
     /// Number of live points matching the given filter. Pure read.
-    async fn count_by_filter(
-        &self,
-        collection: &str,
-        filter: VectorFilter,
-    ) -> EngineResult<u64>;
+    async fn count_by_filter(&self, collection: &str, filter: VectorFilter) -> EngineResult<u64>;
 
     /// Streaming search: yields results one by one as a stream.
     ///
@@ -507,11 +506,7 @@ impl VectorEngine for LocalVectorEngine {
         tokio::task::block_in_place(|| self.count(&collection)).map_err(VectorEngineError::from)
     }
 
-    async fn count_by_filter(
-        &self,
-        collection: &str,
-        filter: VectorFilter,
-    ) -> EngineResult<u64> {
+    async fn count_by_filter(&self, collection: &str, filter: VectorFilter) -> EngineResult<u64> {
         let collection = collection.to_string();
         tokio::task::block_in_place(|| self.count_by_filter(&collection, &filter))
             .map_err(VectorEngineError::from)

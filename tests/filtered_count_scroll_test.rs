@@ -135,23 +135,19 @@ fn filtered_count_covers_condition_kinds() {
     );
     assert_eq!(
         store
-            .count_by_filter(
-                &VectorFilter::new().must(FilterCondition::match_any(
-                    "color",
-                    vec![serde_json::json!("red"), serde_json::json!("green")]
-                ))
-            )
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::match_any(
+                "color",
+                vec![serde_json::json!("red"), serde_json::json!("green")]
+            )))
             .unwrap(),
         8
     );
     assert_eq!(
         store
-            .count_by_filter(
-                &VectorFilter::new().must(FilterCondition::range(
-                    "price",
-                    RangeCondition::new().gte(100.0)
-                ))
-            )
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::range(
+                "price",
+                RangeCondition::new().gte(100.0)
+            )))
             .unwrap(),
         5,
         "v2 prices dominate"
@@ -166,43 +162,36 @@ fn filtered_count_covers_condition_kinds() {
     assert_eq!(
         store
             .count_by_filter(
-                &VectorFilter::new()
-                    .must(FilterCondition::has_id(vec!["0".into(), "10".into()]))
+                &VectorFilter::new().must(FilterCondition::has_id(vec!["0".into(), "10".into()]))
             )
             .unwrap(),
         2
     );
     assert_eq!(
         store
-            .count_by_filter(
-                &VectorFilter::new().must(FilterCondition::values_count(
-                    "tags",
-                    ValuesCountCondition::new().gte(2)
-                ))
-            )
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::values_count(
+                "tags",
+                ValuesCountCondition::new().gte(2)
+            )))
             .unwrap(),
         2,
         "only id 0 and v1 id 0/3 carry two tags"
     );
     assert_eq!(
         store
-            .count_by_filter(
-                &VectorFilter::new().must(FilterCondition::contains("note", "item-1"))
-            )
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::contains("note", "item-1")))
             .unwrap(),
         6,
         "item-1 prefix matches 1, 10..14"
     );
     assert_eq!(
         store
-            .count_by_filter(
-                &VectorFilter::new().must(FilterCondition::new(
-                    "note",
-                    ConditionType::StartsWith {
-                        prefix: "item-1".to_string()
-                    }
-                ))
-            )
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::new(
+                "note",
+                ConditionType::StartsWith {
+                    prefix: "item-1".to_string()
+                }
+            )))
             .unwrap(),
         6
     );
@@ -296,11 +285,10 @@ fn tombstones_excluded_and_delete_count_matches() {
     let dir2 = tempfile::tempdir().unwrap();
     let twin = CollectionStore::create(dir2.path().join("col"), "col", &config(4)).unwrap();
     seed_versions(&twin);
-    twin
-        .apply_ops(&[WalRecord::Delete {
-            point_id: "0".to_string(),
-        }])
-        .unwrap();
+    twin.apply_ops(&[WalRecord::Delete {
+        point_id: "0".to_string(),
+    }])
+    .unwrap();
     let counted = twin.count_by_filter(&version_filter("v2")).unwrap();
     let deleted = twin.delete_by_filter(&version_filter("v2")).unwrap();
     assert_eq!(counted, deleted);
@@ -369,14 +357,22 @@ fn async_trait_filtered_reads_match_sync() {
     }
     let filter = version_filter("v1");
     futures::executor::block_on(async {
-        let counted = <LocalVectorEngine as VectorEngine>::count_by_filter(&engine, "docs", filter.clone())
-            .await
-            .unwrap();
-        assert_eq!(counted, engine.count_by_filter("docs", &filter).unwrap());
-        let (page, next) =
-            <LocalVectorEngine as VectorEngine>::scroll_by_filter(&engine, "docs", filter.clone(), 2, None, Some(true), Some(false))
+        let counted =
+            <LocalVectorEngine as VectorEngine>::count_by_filter(&engine, "docs", filter.clone())
                 .await
                 .unwrap();
+        assert_eq!(counted, engine.count_by_filter("docs", &filter).unwrap());
+        let (page, next) = <LocalVectorEngine as VectorEngine>::scroll_by_filter(
+            &engine,
+            "docs",
+            filter.clone(),
+            2,
+            None,
+            Some(true),
+            Some(false),
+        )
+        .await
+        .unwrap();
         assert_eq!(page.len(), 2);
         let (tail, _) = <LocalVectorEngine as VectorEngine>::scroll_by_filter(
             &engine,
@@ -405,16 +401,26 @@ fn async_trait_filtered_reads_match_sync() {
             streamed.push(item.unwrap());
         }
         assert_eq!(streamed.len(), 3);
-        let mut plain = <LocalVectorEngine as VectorEngine>::scroll_stream(&engine, "docs", 2, Some(true), Some(false))
-            .await
-            .unwrap();
+        let mut plain = <LocalVectorEngine as VectorEngine>::scroll_stream(
+            &engine,
+            "docs",
+            2,
+            Some(true),
+            Some(false),
+        )
+        .await
+        .unwrap();
         let mut plain_points = Vec::new();
         while let Some(item) = plain.next().await {
             plain_points.push(item.unwrap());
         }
         assert_eq!(plain_points.len(), 6);
-        assert!(<LocalVectorEngine as VectorEngine>::count_by_filter(&engine, "ghost", filter.clone())
-            .await
-            .is_err());
+        assert!(<LocalVectorEngine as VectorEngine>::count_by_filter(
+            &engine,
+            "ghost",
+            filter.clone()
+        )
+        .await
+        .is_err());
     });
 }

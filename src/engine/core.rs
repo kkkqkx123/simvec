@@ -8,13 +8,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use super::maintenance::maintenance_loop;
 use super::*;
+use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
-use crate::types::{CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig, Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint};
+use crate::types::{
+    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
+    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+};
 
 impl LocalVectorEngine {
     /// Open (or create) the engine root directory, loading every existing
@@ -55,7 +58,10 @@ impl LocalVectorEngine {
         Ok(Self::assemble(root_dir, collections))
     }
 
-    pub(super) fn assemble(root_dir: PathBuf, collections: HashMap<String, Arc<CollectionStore>>) -> Self {
+    pub(super) fn assemble(
+        root_dir: PathBuf,
+        collections: HashMap<String, Arc<CollectionStore>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<MaintenanceJob>();
         let collections = Arc::new(RwLock::new(collections));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
@@ -272,4 +278,3 @@ impl LocalVectorEngine {
             .ok_or_else(|| VectorSearchError::CollectionNotFound(collection.to_string()))
     }
 }
-

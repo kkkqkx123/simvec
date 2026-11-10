@@ -48,7 +48,6 @@ mod store_payload;
 mod store_read;
 mod store_write;
 
-
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -210,61 +209,9 @@ pub struct CollectionStore {
 }
 
 impl CollectionStore {
-
-
-
-
     // ── Payload routing helpers ────────────────────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ── Payload field indexes ──────────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 impl Drop for CollectionStore {
@@ -272,11 +219,6 @@ impl Drop for CollectionStore {
         self.queue.shutdown();
     }
 }
-
-
-
-
-
 
 impl std::fmt::Debug for CollectionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

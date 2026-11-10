@@ -6,24 +6,27 @@ use arc_swap::ArcSwap;
 use bitvec::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
-use super::{StoreInner, CollectionStore};
-use super::{set_applying, is_commit_worker, set_commit_worker, assert_not_applying};
 use super::filter_bitmap::FilterBitmap;
 use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
-use super::payloads::Payloads;
-use super::quant::QuantStore;
-use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
-use super::vectors::Vectors;
-use super::{Wal, WalRecord};
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
 use super::payload_store::PayloadStore;
+use super::payloads::Payloads;
+use super::quant::QuantStore;
+use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
 use super::tombstones::TombstoneBits;
+use super::vectors::Vectors;
+use super::{assert_not_applying, is_commit_worker, set_applying, set_commit_worker};
+use super::{CollectionStore, StoreInner};
+use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig, VectorPoint};
+use crate::types::{
+    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
+    VectorPoint,
+};
 
 use super::*;
 
@@ -67,7 +70,10 @@ impl CollectionStore {
     /// Shared match stage for filtered count, filtered scroll and filtered
     /// delete: single full scan over live slots, tombstones skipped, payload
     /// read followed by post-filter verdict. Pure read path, no log writes.
-    pub(super) fn filter_match_ids(&self, filter: &crate::types::VectorFilter) -> Result<Vec<PointId>> {
+    pub(super) fn filter_match_ids(
+        &self,
+        filter: &crate::types::VectorFilter,
+    ) -> Result<Vec<PointId>> {
         let inner = self.inner.read();
         let tombstones = self.tombstones.load();
         let keysnap = self.keys.snapshot();
@@ -76,9 +82,8 @@ impl CollectionStore {
             if tombstones.bit(slot) {
                 continue;
             }
-            let key = Keys::read_key(&keysnap, slot)?.ok_or_else(|| {
-                VectorSearchError::CorruptData(format!("slot {slot} has no key"))
-            })?;
+            let key = Keys::read_key(&keysnap, slot)?
+                .ok_or_else(|| VectorSearchError::CorruptData(format!("slot {slot} has no key")))?;
             let id = PointId::from(key);
             let payload = self.read_payload_at(slot as u32)?;
             if crate::filter::matches(filter, &id, payload.as_ref())? {

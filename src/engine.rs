@@ -80,7 +80,6 @@ mod promote;
 
 pub use self::api::VectorEngine;
 
-
 /// The built-in (local) vector engine.
 ///
 /// All operations are synchronous; the sync coordinator serializes
@@ -125,13 +124,9 @@ impl Drop for LocalVectorEngine {
     }
 }
 
-
 /// Background maintenance loop: executes scheduled builds and, on each idle
 /// tick, sweeps collections for post-compaction rebuilds, drift-triggered
 /// rebuilds and exact-scan-to-IVF promotion.
-
-
-
 
 #[cfg(test)]
 #[path = "engine/tests.rs"]

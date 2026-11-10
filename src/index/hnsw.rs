@@ -41,7 +41,6 @@ mod maintain;
 mod persist;
 mod search;
 
-
 /// Default cap on iterative-scan expansion rounds when a filtered search
 /// comes up short and `HnswConfig::iterative_max_rounds` is unset.
 pub(crate) const DEFAULT_ITERATIVE_MAX_ROUNDS: usize = 3;
@@ -378,9 +377,6 @@ impl HnswIndex {
         self.max_scan_tuples
     }
 
-
-
-
     pub(crate) fn node_count(&self) -> usize {
         self.nodes.read().iter().flatten().count()
     }
@@ -393,7 +389,6 @@ impl HnswIndex {
     pub(crate) fn overwrites_since_build(&self) -> u64 {
         self.overwrites_since_build.load(Ordering::Relaxed)
     }
-
 
     pub(crate) fn default_ef(&self) -> usize {
         self.ef_search
@@ -424,17 +419,6 @@ impl HnswIndex {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         crate::distance::distance(self.metric, a, b)
     }
-
-
-
-
-
-
-
-
-
-
-
 }
 
 #[cfg(test)]

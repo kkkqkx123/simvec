@@ -199,8 +199,7 @@ fn filtered_count_scroll_round_trip() {
         for (id, version) in [("1", "v1"), ("2", "v1"), ("3", "v2")] {
             let id_c = cstr(id);
             let vector = [1.0f32, 0.0, 0.0, 0.0];
-            let payload =
-                cstr(&format!(r#"{{"version":"{version}"}}"#));
+            let payload = cstr(&format!(r#"{{"version":"{version}"}}"#));
             assert_eq!(
                 write::simvec_upsert(
                     handle,
@@ -217,12 +216,7 @@ fn filtered_count_scroll_round_trip() {
         let filter = cstr(r#"{"must":[{"field":"version","condition":{"Match":{"value":"v1"}}}]}"#);
         let mut count: u64 = 0;
         assert_eq!(
-            read::simvec_count_by_filter(
-                handle,
-                name.as_ptr(),
-                filter.as_ptr(),
-                &mut count
-            ),
+            read::simvec_count_by_filter(handle, name.as_ptr(), filter.as_ptr(), &mut count),
             OK
         );
         assert_eq!(count, 2);
@@ -241,9 +235,11 @@ fn filtered_count_scroll_round_trip() {
             ),
             OK
         );
-        let first: serde_json::Value =
-            serde_json::from_str(&take_string(out)).expect("first page");
-        assert_eq!(first.get("points").map(|p| p.as_array().map(Vec::len)), Some(Some(1)));
+        let first: serde_json::Value = serde_json::from_str(&take_string(out)).expect("first page");
+        assert_eq!(
+            first.get("points").map(|p| p.as_array().map(Vec::len)),
+            Some(Some(1))
+        );
         let cursor = first
             .get("next_offset")
             .and_then(|v| v.as_str())
@@ -265,36 +261,24 @@ fn filtered_count_scroll_round_trip() {
         );
         let tail: serde_json::Value =
             serde_json::from_str(&take_string(tail_out)).expect("tail page");
-        assert_eq!(tail.get("points").map(|p| p.as_array().map(Vec::len)), Some(Some(1)));
+        assert_eq!(
+            tail.get("points").map(|p| p.as_array().map(Vec::len)),
+            Some(Some(1))
+        );
 
         // Misuse: null out, null filter, malformed JSON.
         let mut bad_count: u64 = 0;
         assert_eq!(
-            read::simvec_count_by_filter(
-                handle,
-                name.as_ptr(),
-                ptr::null(),
-                &mut bad_count
-            ),
+            read::simvec_count_by_filter(handle, name.as_ptr(), ptr::null(), &mut bad_count),
             MISUSE
         );
         assert_eq!(
-            read::simvec_count_by_filter(
-                handle,
-                name.as_ptr(),
-                filter.as_ptr(),
-                ptr::null_mut()
-            ),
+            read::simvec_count_by_filter(handle, name.as_ptr(), filter.as_ptr(), ptr::null_mut()),
             MISUSE
         );
         let bad = cstr("{not json");
         assert_eq!(
-            read::simvec_count_by_filter(
-                handle,
-                name.as_ptr(),
-                bad.as_ptr(),
-                &mut bad_count
-            ),
+            read::simvec_count_by_filter(handle, name.as_ptr(), bad.as_ptr(), &mut bad_count),
             MISUSE
         );
         let mut bad_out: *mut c_char = ptr::null_mut();
@@ -316,12 +300,7 @@ fn filtered_count_scroll_round_trip() {
         // Not-found: unknown collection reports NOTFOUND for both entries.
         let ghost = cstr("ghost");
         assert_eq!(
-            read::simvec_count_by_filter(
-                handle,
-                ghost.as_ptr(),
-                filter.as_ptr(),
-                &mut bad_count
-            ),
+            read::simvec_count_by_filter(handle, ghost.as_ptr(), filter.as_ptr(), &mut bad_count),
             NOTFOUND
         );
         let mut ghost_out: *mut c_char = ptr::null_mut();

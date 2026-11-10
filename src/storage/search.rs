@@ -35,7 +35,6 @@ mod exact;
 mod finish;
 mod quantized;
 
-
 /// Snapshot of the immutable views used by a single search pass. All
 /// fields are captured under one `inner.read()` acquisition so a concurrent
 /// background compaction (which swaps every file under the write lock) cannot
@@ -236,14 +235,6 @@ impl CollectionStore {
             },
         )
     }
-
-
-
-
-
-
-
-
 }
 
 /// A (score, slot) pair ordered by score for the top-K heap.
