@@ -33,7 +33,7 @@ mod keys;
 mod meta;
 mod payload_index;
 mod payload_key;
-mod payload_store;
+pub(crate) mod payload_store;
 mod payloads;
 pub(crate) mod quant;
 mod queue;
@@ -76,24 +76,12 @@ use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::types::{
     CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
-    VectorPoint,
+    StorageConfig, VectorPoint,
 };
 
-/// Tombstone ratio above which deletes trigger compaction.
-const COMPACTION_THRESHOLD: f64 = 0.20;
-
-/// WAL size at which a background checkpoint runs: flush every derived file,
-/// persist the payload store and truncate the log. Tombstone-ratio compaction
-/// never fires on pure-insert workloads, so without this bound the log would
-/// grow (and replay time with it) without limit.
-const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
-
-/// How many WAL transactions between meta.bin saves. The WAL is always
-/// fsynced on every transaction, so crash safety is preserved; meta.bin is an
-/// optimization that shortens replay, not a durability boundary. Slot water
-/// marks and counts are replayed from the log, so this interval — not the
-/// mutation rate — is what paces meta.bin writes.
-const META_SAVE_INTERVAL: u64 = 64;
+// Storage tuning (WAL checkpoint size, compaction threshold, meta save
+// interval, payload page geometry) lives in `types::StorageConfig` and is
+// supplied by the engine when a collection is opened or created.
 
 /// In-memory mutable state, guarded by the store's `RwLock`.
 struct StoreInner {
@@ -155,6 +143,9 @@ fn assert_not_applying() {
 /// A single opened collection.
 pub struct CollectionStore {
     dir: PathBuf,
+    /// Engine-level storage tuning this collection was opened with. Sourced
+    /// from [`StorageConfig`]; never persisted per collection.
+    storage: StorageConfig,
     inner: RwLock<StoreInner>,
     /// Tombstone mirror (slot -> deleted) for lock-free scans.
     tombstones: ArcSwap<TombstoneBits>,

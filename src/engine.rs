@@ -24,7 +24,8 @@ use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
 use crate::types::{
     CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, StorageConfig, VectorFilter,
+    VectorPoint,
 };
 
 /// A single operation of a coordinated transaction, grouped per collection.
@@ -92,6 +93,9 @@ pub use self::api::VectorEngine;
 pub struct LocalVectorEngine {
     root_dir: PathBuf,
     collections: Arc<RwLock<HashMap<String, Arc<CollectionStore>>>>,
+    /// Engine-level storage tuning applied to every collection this engine
+    /// opens or creates.
+    storage: StorageConfig,
     /// Applied to IVF collections created without an explicit IVF config.
     default_ivf: RwLock<Option<IvfConfig>>,
     /// Applied to HNSW collections created without an explicit HNSW config.

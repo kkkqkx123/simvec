@@ -16,7 +16,8 @@ use crate::metrics::MetricsSnapshot;
 use crate::storage::{CollectionStore, WalPoint, WalRecord};
 use crate::types::{
     CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, StorageConfig, VectorFilter,
+    VectorPoint,
 };
 
 impl LocalVectorEngine {
@@ -29,6 +30,16 @@ impl LocalVectorEngine {
     /// invisible to search and only touched by publish, reverse recovery,
     /// and startup reconciliation.
     pub fn open(root_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_storage(root_dir, StorageConfig::default())
+    }
+
+    /// Open (or create) the engine root directory with explicit engine-level
+    /// storage tuning. Every collection loaded from disk adopts `storage`.
+    pub fn open_with_storage(
+        root_dir: impl AsRef<Path>,
+        storage: StorageConfig,
+    ) -> Result<Self> {
+        storage.validate()?;
         let root_dir = root_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_dir)?;
 
@@ -51,16 +62,17 @@ impl LocalVectorEngine {
             if name.contains(".rebuild-") || name.contains(".old-") || name.contains(".suspect-") {
                 continue;
             }
-            let store = CollectionStore::open(&path)?;
+            let store = CollectionStore::open_with_storage(&path, &storage)?;
             collections.insert(name, store);
         }
 
-        Ok(Self::assemble(root_dir, collections))
+        Ok(Self::assemble(root_dir, collections, storage))
     }
 
     pub(super) fn assemble(
         root_dir: PathBuf,
         collections: HashMap<String, Arc<CollectionStore>>,
+        storage: StorageConfig,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<MaintenanceJob>();
         let collections = Arc::new(RwLock::new(collections));
@@ -79,6 +91,7 @@ impl LocalVectorEngine {
         Self {
             root_dir,
             collections,
+            storage,
             default_ivf: RwLock::new(None),
             default_hnsw: RwLock::new(None),
             default_quantization: RwLock::new(None),
@@ -142,7 +155,7 @@ impl LocalVectorEngine {
             }
         }
         let dir = self.root_dir.join(name);
-        let store = CollectionStore::create(&dir, name, &effective)?;
+        let store = CollectionStore::create_with_storage(&dir, name, &effective, &self.storage)?;
         self.collections.write().insert(name.to_string(), store);
         Ok(())
     }
@@ -240,6 +253,8 @@ impl LocalVectorEngine {
             config.index = meta.index.clone();
             config.quantization_config = meta.quantization_config.clone();
             config.max_points = meta.max_points;
+            config.vectors_on_disk = meta.vectors_on_disk;
+            config.storage_hints = meta.storage_hints.clone();
             config
         }))
     }
@@ -257,6 +272,8 @@ impl LocalVectorEngine {
         config.index = meta.index.clone();
         config.quantization_config = meta.quantization_config.clone();
         config.max_points = meta.max_points;
+        config.vectors_on_disk = meta.vectors_on_disk;
+        config.storage_hints = meta.storage_hints.clone();
         Ok(CollectionInfo {
             name: meta.collection.clone(),
             vector_count: live,

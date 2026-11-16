@@ -471,6 +471,16 @@ pub struct CollectionConfig {
     /// instead of silently allocating unbounded index memory. `None` = no cap.
     #[serde(default)]
     pub max_points: Option<u64>,
+    /// Whether the dense vectors themselves live on disk (Qdrant
+    /// `vectors.on_disk`). The local engine always memory-maps its vector
+    /// segment and therefore only carries this field so the remote backend
+    /// can be described with the same type.
+    #[serde(default)]
+    pub vectors_on_disk: Option<bool>,
+    /// Remote storage-engine hints (optimizers, WAL, strict mode). The local
+    /// engine persists but never acts on them.
+    #[serde(default)]
+    pub storage_hints: Option<StorageHints>,
 }
 
 impl CollectionConfig {
@@ -485,6 +495,8 @@ impl CollectionConfig {
             on_disk_payload: None,
             shard_number: None,
             max_points: None,
+            vectors_on_disk: None,
+            storage_hints: None,
         }
     }
 
@@ -531,10 +543,159 @@ impl CollectionConfig {
         self.max_points = Some(max_points);
         self
     }
+
+    /// Set whether the dense vectors live on disk (remote backend only).
+    pub fn with_vectors_on_disk(mut self, vectors_on_disk: bool) -> Self {
+        self.vectors_on_disk = Some(vectors_on_disk);
+        self
+    }
+
+    /// Attach remote storage-engine hints.
+    pub fn with_storage_hints(mut self, storage_hints: StorageHints) -> Self {
+        self.storage_hints = Some(storage_hints);
+        self
+    }
 }
 
 impl Default for CollectionConfig {
     fn default() -> Self {
         Self::new(1536, DistanceMetric::Cosine)
+    }
+}
+
+/// Remote storage-engine hints carried alongside a collection request.
+///
+/// These map onto the remote service's per-collection storage layout
+/// (segment optimizer, write-ahead log, strict mode). The local engine
+/// persists them so a config round-trip stays lossless but never acts on
+/// them: local storage layout is governed by [`StorageConfig`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct StorageHints {
+    /// Segment optimizer hints.
+    #[serde(default)]
+    pub optimizers: Option<OptimizersHints>,
+    /// Write-ahead log hints.
+    #[serde(default)]
+    pub wal: Option<WalHints>,
+    /// Whether the remote backend enforces strict-mode query limits.
+    #[serde(default)]
+    pub strict_mode_enabled: Option<bool>,
+}
+
+/// Segment-optimizer hints, mirroring the remote service's diff message.
+///
+/// Every field is optional so a caller can override one knob without
+/// restating the server defaults.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct OptimizersHints {
+    /// Deleted-vector ratio that triggers segment optimization.
+    #[serde(default)]
+    pub deleted_threshold: Option<f64>,
+    /// Minimum vector count before vacuuming a segment.
+    #[serde(default)]
+    pub vacuum_min_vector_number: Option<u64>,
+    /// Preferred segment count; `Some(0)` means "let the server decide".
+    #[serde(default)]
+    pub default_segment_number: Option<u64>,
+    /// Upper bound on a segment's vector count before it is split.
+    #[serde(default)]
+    pub max_segment_size: Option<u64>,
+    /// Vector count above which a segment is memory-mapped instead of kept
+    /// in RAM.
+    #[serde(default)]
+    pub memmap_threshold: Option<u64>,
+    /// Vector count above which a segment gets an HNSW index.
+    #[serde(default)]
+    pub indexing_threshold: Option<u64>,
+    /// Seconds between forced segment flushes.
+    #[serde(default)]
+    pub flush_interval_sec: Option<u64>,
+    /// Optimizer threads; `Some(0)` means the server picks.
+    #[serde(default)]
+    pub max_optimization_threads: Option<u64>,
+}
+
+/// Write-ahead log hints.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct WalHints {
+    /// WAL capacity in megabytes.
+    #[serde(default)]
+    pub wal_capacity_mb: Option<u64>,
+    /// How many segments to keep ahead of the current one.
+    #[serde(default)]
+    pub wal_segments_ahead: Option<u64>,
+}
+
+/// Engine-level storage tuning for the local engine.
+///
+/// One instance governs every collection under the engine root: these knobs
+/// describe the host's IO profile (log size, checkpoint cadence, payload
+/// page geometry) rather than a single collection's layout, so they are not
+/// part of [`CollectionConfig`]. `Default` reproduces the historical
+/// compile-time constants exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// WAL bytes after which a background checkpoint runs.
+    pub wal_checkpoint_bytes: u64,
+    /// Tombstone ratio that triggers physical reclamation.
+    pub compaction_threshold: f64,
+    /// Transactions between `meta.bin` saves.
+    pub meta_save_interval: u64,
+    /// Payload store block size in bytes.
+    pub payload_block_size: usize,
+    /// Payload store page size in bytes.
+    pub payload_page_size: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            wal_checkpoint_bytes: 64 * 1024 * 1024,
+            compaction_threshold: 0.20,
+            meta_save_interval: 64,
+            payload_block_size: 128,
+            payload_page_size: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Validate the tuning knobs. Called when the engine opens so a bad
+    /// value fails startup instead of surfacing as a mid-run surprise.
+    pub fn validate(&self) -> Result<()> {
+        if self.wal_checkpoint_bytes == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "wal_checkpoint_bytes must be >= 1".to_string(),
+            ));
+        }
+        if !(self.compaction_threshold > 0.0 && self.compaction_threshold < 1.0) {
+            return Err(VectorSearchError::InvalidConfig(
+                "compaction_threshold must be within (0, 1)".to_string(),
+            ));
+        }
+        if self.meta_save_interval == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "meta_save_interval must be >= 1".to_string(),
+            ));
+        }
+        if self.payload_block_size == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "payload_block_size must be >= 1".to_string(),
+            ));
+        }
+        if self.payload_page_size == 0 || self.payload_page_size % self.payload_block_size != 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "payload_page_size must be a positive multiple of payload_block_size".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Payload store geometry derived from the tuning knobs.
+    pub fn payload_store_config(&self) -> crate::storage::payload_store::StoreConfig {
+        crate::storage::payload_store::StoreConfig {
+            block_size: self.payload_block_size,
+            page_size: self.payload_page_size,
+        }
     }
 }

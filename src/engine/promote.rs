@@ -57,14 +57,14 @@ impl LocalVectorEngine {
         })();
         if let Err(error) = rename_result {
             if live_dir.exists() {
-                if let Ok(store) = CollectionStore::open(&live_dir) {
+                if let Ok(store) = CollectionStore::open_with_storage(&live_dir, &self.storage) {
                     self.collections.write().insert(live.to_string(), store);
                 } else if let Some(store) = live_store {
                     self.collections.write().insert(live.to_string(), store);
                 }
             } else if backup_dir.exists() {
                 let _ = std::fs::rename(&backup_dir, &live_dir);
-                if let Ok(store) = CollectionStore::open(&live_dir) {
+                if let Ok(store) = CollectionStore::open_with_storage(&live_dir, &self.storage) {
                     self.collections.write().insert(live.to_string(), store);
                 } else if let Some(store) = live_store {
                     self.collections.write().insert(live.to_string(), store);
@@ -74,13 +74,13 @@ impl LocalVectorEngine {
             }
             return Err(error);
         }
-        let store = CollectionStore::open(&live_dir)?;
+        let store = CollectionStore::open_with_storage(&live_dir, &self.storage)?;
         self.collections.write().insert(live.to_string(), store);
         // Keep the backup handle loaded for inspection (`count`, reverse
         // recovery) without exposing it to search: nothing routes to
         // `.old-*` names and `collection_names` hides them.
         if backup_dir.exists() {
-            if let Ok(backup_store) = CollectionStore::open(&backup_dir) {
+            if let Ok(backup_store) = CollectionStore::open_with_storage(&backup_dir, &self.storage) {
                 self.collections
                     .write()
                     .insert(backup_name.clone(), backup_store);
@@ -115,7 +115,7 @@ impl LocalVectorEngine {
             let _ = std::fs::rename(&live_dir, self.root_dir.join(suspect));
         }
         std::fs::rename(&backup_dir, &live_dir)?;
-        let store = CollectionStore::open(&live_dir)?;
+        let store = CollectionStore::open_with_storage(&live_dir, &self.storage)?;
         self.collections.write().insert(live.to_string(), store);
         Ok(backup_name)
     }

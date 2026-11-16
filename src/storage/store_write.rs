@@ -107,7 +107,7 @@ impl CollectionStore {
                 .txns_since_last_save
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 + 1;
-            if capacity_changed || count >= META_SAVE_INTERVAL {
+            if capacity_changed || count >= self.storage.meta_save_interval {
                 inner.meta.save(&self.dir)?;
                 self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
             }

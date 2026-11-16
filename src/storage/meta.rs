@@ -8,16 +8,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
-use crate::types::{DistanceMetric, IndexConfig, QuantizationConfig};
+use crate::types::{DistanceMetric, IndexConfig, QuantizationConfig, StorageHints};
 
 /// Current on-disk format version.
 ///
-/// Version 2 adds `quantization_config` for Scalar/Binary/Product quantization
-/// support. Version 3 adds `max_points`, the optional live-point admission
-/// cap. Version 4 merges the index tier fields into a single `index` enum.
-/// The store is pre-stable, so breaking format changes are applied
-/// directly and older files are rejected on open.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+/// Development stage: locked at 1.  `Meta::validate` rejects any file whose
+/// version differs, so a stale directory is rebuilt instead of misread.
+/// Version evolution starts with the first production release, following the
+/// same policy as `INDEX_VERSION` / `HNSW_VERSION` in `index::persist`.
+pub(crate) const FORMAT_VERSION: u32 = 1;
 
 /// Default number of slots per `vectors.bin` segment.
 pub(crate) const SEGMENT_SLOTS_DEFAULT: u32 = 8192;
@@ -50,6 +49,13 @@ pub struct Meta {
     /// Optional live-point admission cap (see `CollectionConfig::max_points`).
     #[serde(default)]
     pub max_points: Option<u64>,
+    /// Whether dense vectors live on disk (see
+    /// `CollectionConfig::vectors_on_disk`). Remote-backend metadata only.
+    #[serde(default)]
+    pub vectors_on_disk: Option<bool>,
+    /// Remote storage-engine hints (see `CollectionConfig::storage_hints`).
+    #[serde(default)]
+    pub storage_hints: Option<StorageHints>,
     pub created_at: i64,
 }
 
@@ -78,6 +84,8 @@ impl Meta {
             tombstone_count: 0,
             last_applied_txn: 0,
             max_points: None,
+            vectors_on_disk: None,
+            storage_hints: None,
             created_at: Utc::now().timestamp(),
         }
     }

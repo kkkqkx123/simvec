@@ -38,7 +38,7 @@ impl CollectionStore {
     /// compaction; visibility of data never depends on compaction having run.
     pub fn needs_compaction(&self) -> bool {
         let inner = self.inner.read();
-        threshold_met(&inner.meta)
+        threshold_met(&inner.meta, self.storage.compaction_threshold)
     }
 
     /// Whether the WAL has grown past the checkpoint threshold.
@@ -46,7 +46,7 @@ impl CollectionStore {
     /// Tombstone-driven compaction never fires on insert-heavy workloads, so
     /// this size-based trigger is what bounds replay time and log growth.
     pub fn needs_checkpoint(&self) -> bool {
-        self.wal.appended_bytes() >= WAL_CHECKPOINT_BYTES
+        self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes
     }
 
     /// Checkpoint: make every derived file durable, persist the payload
@@ -112,14 +112,12 @@ impl CollectionStore {
         let mut total = meta.slot_capacity * dim as u64 * 4;
         // Payload pointer table: 12 bytes per slot.
         total += meta.next_slot * 12;
-        // Payload data area: one 32 MiB page per 256K blocks of 128 B.
-        let pages = meta
-            .next_slot
-            .div_ceil(
-                payload_store::DEFAULT_PAGE_SIZE as u64 / payload_store::DEFAULT_BLOCK_SIZE as u64,
-            )
-            .max(1);
-        total += pages * payload_store::DEFAULT_PAGE_SIZE as u64;
+        // Payload data area: one page per `blocks_per_page` slots, sized by
+        // the configured payload geometry rather than the historical default.
+        let blocks_per_page = (self.storage.payload_page_size / self.storage.payload_block_size)
+            .max(1) as u64;
+        let pages = meta.next_slot.div_ceil(blocks_per_page).max(1);
+        total += pages * self.storage.payload_page_size as u64;
         // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.
         total += meta.slot_capacity * 20;
         // HNSW graph: Arc node per slot plus per-layer adjacency up to 2*m.

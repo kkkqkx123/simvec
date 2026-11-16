@@ -25,7 +25,7 @@ use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::types::{
     CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
-    VectorPoint,
+    StorageConfig, VectorPoint,
 };
 
 use super::*;
@@ -48,6 +48,46 @@ impl CollectionStore {
         config: &CollectionConfig,
         segment_slots: u32,
     ) -> Result<Arc<Self>> {
+        Self::create_with_storage_and_slots(
+            dir,
+            collection,
+            config,
+            segment_slots,
+            &StorageConfig::default(),
+        )
+    }
+
+    /// Create a collection with explicit engine-level storage tuning.
+    ///
+    /// The tuning only affects this process: collection directories stay
+    /// self-describing because the payload store records its own geometry in
+    /// `payloads_store/config.json`.
+    pub fn create_with_storage(
+        dir: impl AsRef<Path>,
+        collection: &str,
+        config: &CollectionConfig,
+        storage: &StorageConfig,
+    ) -> Result<Arc<Self>> {
+        Self::create_with_storage_and_slots(
+            dir,
+            collection,
+            config,
+            meta::SEGMENT_SLOTS_DEFAULT,
+            storage,
+        )
+    }
+
+    /// Like [`CollectionStore::create_with_storage`] with an explicit segment
+    /// slot count.
+    #[doc(hidden)]
+    pub fn create_with_storage_and_slots(
+        dir: impl AsRef<Path>,
+        collection: &str,
+        config: &CollectionConfig,
+        segment_slots: u32,
+        storage: &StorageConfig,
+    ) -> Result<Arc<Self>> {
+        storage.validate()?;
         validate_collection_name(collection)?;
         if config.vector_size == 0 {
             return Err(VectorSearchError::InvalidVectorDimension {
@@ -98,6 +138,10 @@ impl CollectionStore {
         meta.quantization_config = config.quantization_config.clone();
         // Persist the admission cap so it survives reopen.
         meta.max_points = config.max_points;
+        // Remote-only layout flags round-trip through meta.bin so collection
+        // info and re-created requests stay byte-identical with the original.
+        meta.vectors_on_disk = config.vectors_on_disk;
+        meta.storage_hints = config.storage_hints.clone();
         meta.save(dir)?;
 
         let vectors = Vectors::create(
@@ -126,12 +170,11 @@ impl CollectionStore {
         let slot_capacity = meta.slot_capacity;
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
         // New collections always use the Gridstore-style PayloadStore.
-        let payload_store = PayloadStore::create(
-            &dir.join("payloads_store"),
-            payload_store::StoreConfig::default(),
-        )?;
+        let payload_store =
+            PayloadStore::create(&dir.join("payloads_store"), storage.payload_store_config())?;
         Ok(Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            storage: storage.clone(),
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
                 meta,
@@ -171,6 +214,15 @@ impl CollectionStore {
     /// Open an existing collection directory, rebuilding the id->slot map and
     /// replaying the WAL (idempotent).
     pub fn open(dir: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::open_with_storage(dir, &StorageConfig::default())
+    }
+
+    /// Open an existing collection with explicit engine-level storage tuning.
+    pub fn open_with_storage(
+        dir: impl AsRef<Path>,
+        storage: &StorageConfig,
+    ) -> Result<Arc<Self>> {
+        storage.validate()?;
         let dir = dir.as_ref();
         for name in &["meta.bin", "vectors.bin", "keys.bin", "payloads.bin"] {
             let path = dir.join(name);
@@ -242,6 +294,7 @@ impl CollectionStore {
 
         let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            storage: storage.clone(),
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
                 ivf_config: match &meta.index {
@@ -363,8 +416,8 @@ pub(super) fn validate_admission_locked(inner: &StoreInner, ops: &[WalRecord]) -
     Ok(())
 }
 
-pub(super) fn threshold_met(meta: &Meta) -> bool {
-    meta.next_slot > 0 && meta.tombstone_count as f64 / meta.next_slot as f64 > COMPACTION_THRESHOLD
+pub(super) fn threshold_met(meta: &Meta, threshold: f64) -> bool {
+    meta.next_slot > 0 && meta.tombstone_count as f64 / meta.next_slot as f64 > threshold
 }
 
 /// Number of upserted and deleted points in a WAL operation batch.
