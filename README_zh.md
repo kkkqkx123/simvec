@@ -12,7 +12,7 @@
 - **两阶段发布模拟。** 索引构建写入 `*.rebuild-*` 临时目录，原子发布，并保留 `.old-*` 备份用于反向恢复（`restore_promote_backup`）。
 - **Payload 存储与过滤。** 完整 JSON payload、可选的 payload 字段索引，以及丰富的过滤语言：match、range、values-count、地理（半径 / 矩形）、嵌套条件，以及 `must` / `should` / `must_not` 组合器。
 - **SIMD 距离内核。** x86-64 上支持 AVX2+FMA 和 AVX-512，aarch64 上支持 NEON，另有一个始终作为正确性基线的朴素实现。支持 Cosine、Euclid、Dot、Manhattan 四种度量。
-- **量化。** 标量量化和乘积量化（PQ，k-means 训练码本），仅作为检索加速使用（精确分数总是重新计算）。
+- **量化。** 标量量化、二值量化与乘积量化（PQ，k-means 训练码本），仅作为检索加速使用（精确分数总是重新计算）。
 - **墓碑与压实（compaction）。** 删除是逻辑删除；`compact_collection` 物理回收槽位。后台维护线程每 30 秒执行一次索引构建、压实、漂移检查和 HNSW 提升。
 - **指标。** 每个 `MetricsSnapshot` 包含检索路径计数器（扫描 / IVF / HNSW、重试、回退）。可选的 `lock-metrics` 特性用于锁竞争排查的等待时间埋点。
 

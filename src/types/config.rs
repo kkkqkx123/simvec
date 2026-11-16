@@ -229,6 +229,9 @@ impl CompressionRatio {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Quantization method. The `always_ram` flag on every variant is a
+/// Qdrant-compat reserved bit: storage is always segmented mmap and the flag
+/// has no effect on placement.
 pub enum QuantizationType {
     Scalar {
         quantile: Option<f32>,

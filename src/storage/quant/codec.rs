@@ -189,8 +189,8 @@ impl QuantStore {
 
     /// Search score (higher = nearer) for a preprocessed query and a stored
     /// code. Applies the collection's score convention, including the binary
-    /// Hamming negation.
-    pub fn score_quantized(&self, query: &QuantQuery, code: &[u8]) -> f32 {
+    /// Hamming negation. Lock-free: reads only the query and code bytes.
+    pub(crate) fn score_quantized_for_query(query: &QuantQuery, code: &[u8]) -> f32 {
         match query {
             QuantQuery::Binary { bits } => {
                 let mut ham = 0u32;
@@ -199,16 +199,15 @@ impl QuantStore {
                 }
                 -(ham as f32)
             }
-            q => crate::distance::to_score(q.metric(), self.distance_quantized_query(q, code)),
+            q => crate::distance::to_score(q.metric(), Self::distance_quantized_for_query(q, code)),
         }
     }
 
     /// Quantized distance between a preprocessed query and a stored code.
     /// Returns internal distance (smaller = nearer) consistent with `distance`.
-    ///
-    /// Hot path: reads only the [`QuantQuery`] and the code bytes — no meta
+    /// Lock-free: reads only the [`QuantQuery`] and the code bytes — no meta
     /// lock, no per-slot metadata access.
-    pub fn distance_quantized_query(&self, query: &QuantQuery, code: &[u8]) -> f32 {
+    pub(crate) fn distance_quantized_for_query(query: &QuantQuery, code: &[u8]) -> f32 {
         match query {
             QuantQuery::Scalar {
                 query: q,

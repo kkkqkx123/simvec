@@ -210,7 +210,9 @@ impl CollectionStore {
         // Mirror the vector into quantized storage when ready.
         if let Some(q) = self.quant.read().as_ref() {
             if q.is_ready() {
-                let _ = q.write_slot(slot, &point.vector);
+                if let Err(e) = q.write_slot(slot, &point.vector) {
+                    tracing::warn!(slot, error = %e, "quant write_slot failed; search falls back to exact until rebuild");
+                }
             } else if matches!(
                 q.config().quant_type,
                 crate::types::QuantizationType::Scalar { .. }
@@ -218,7 +220,9 @@ impl CollectionStore {
             ) {
                 // Scalar/Binary are always ready after create/rebuild; attempt to
                 // quantize even when `ready` flag races the build.
-                let _ = q.write_slot(slot, &point.vector);
+                if let Err(e) = q.write_slot(slot, &point.vector) {
+                    tracing::warn!(slot, error = %e, "quant write_slot raced rebuild; code rebuilt on next build_quantization");
+                }
             }
         }
         self.write_payload_at(slot as u32, point.payload.as_ref())?;

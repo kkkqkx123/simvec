@@ -23,13 +23,28 @@ fn stopped_err() -> VectorSearchError {
     VectorSearchError::Internal("quantization build cancelled".to_string())
 }
 
-/// Deterministic stride sample of at most `max` slots.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic hash-partitioned sample of at most `max` slots.
+/// Hash decorrelation keeps clustered sequential inserts from biasing the
+/// sample; `select_nth_unstable` keeps the cost linear without full sorting.
 fn stride_sample(slots: &[u32], max: usize) -> Vec<u32> {
     if slots.len() <= max {
         return slots.to_vec();
     }
-    let stride = slots.len().div_ceil(max);
-    slots.iter().step_by(stride).copied().collect()
+    let mut hashed: Vec<(u64, u32)> = slots
+        .iter()
+        .map(|&s| (splitmix64(s as u64 ^ 0x9E37_79B9_7F4A_7C15), s))
+        .collect();
+    hashed.select_nth_unstable_by(max, |(a, _), (b, _)| a.cmp(b));
+    hashed.truncate(max);
+    hashed.into_iter().map(|(_, s)| s).collect()
 }
 
 impl QuantStore {
@@ -73,11 +88,15 @@ impl QuantStore {
                         let max = values.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                         (min, max)
                     } else {
-                        values.sort_by(|a, b| a.total_cmp(b));
                         let low_idx = ((1.0 - quantile) / 2.0 * values.len() as f32) as usize;
-                        let high_idx = ((1.0 + quantile) / 2.0 * values.len() as f32) as usize;
+                        let high_idx =
+                            ((1.0 + quantile) / 2.0 * values.len() as f32) as usize;
                         let high_idx = high_idx.min(values.len() - 1);
-                        (values[low_idx], values[high_idx])
+                        values.select_nth_unstable_by(low_idx, |a, b| a.total_cmp(b));
+                        let min = values[low_idx];
+                        values.select_nth_unstable_by(high_idx, |a, b| a.total_cmp(b));
+                        let max = values[high_idx];
+                        (min, max)
                     }
                 };
                 let range = max - min;

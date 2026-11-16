@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use super::super::directory::DirView;
 use super::super::index_lifecycle::PublishedIndex;
 use super::super::keys::Keys;
-use super::super::quant::{QuantQuery, QuantStore};
+use super::super::quant::QuantQuery;
 use super::super::vectors::Vectors;
 use super::super::{CollectionStore, PayloadStore, TombstoneBits};
 use crate::error::{Result, VectorSearchError};
@@ -80,54 +80,61 @@ impl CollectionStore {
         // quantized codes (qdrant-style); survivors are rescored with exact
         // vectors below when the method's rescore default (or the query's
         // override) says so. `quantization.ignore/exact` opts out per query.
-        let quant_rescore;
-        let held_guard: Option<parking_lot::RwLockReadGuard<'_, Option<QuantStore>>>;
-        let held_snap: Option<arc_swap::Guard<Arc<Vec<Arc<memmap2::Mmap>>>>>;
-        let held_qq: Option<QuantQuery<'_>>;
+        // Quant setup runs under a short-lived read lock: preprocess the
+        // query and clone the code snapshot, then release the lock before
+        // the graph walk so concurrent rebuilds are never blocked.
+        let mut quant_bytes = 0usize;
+        let mut quant_snap_arc: Option<Arc<Vec<Arc<memmap2::Mmap>>>> = None;
+        let mut held_qq: Option<QuantQuery<'_>> = None;
+        let mut quant_rescore = false;
         let quant_enabled = self.has_quantization() && !quant_params.ignore && !quant_params.exact;
         if quant_enabled {
-            let quant_guard = self.quant.read();
-            if let Some(quant) = quant_guard.as_ref().filter(|q| q.is_ready()) {
-                let qq = quant.encode_query(&query.vector, self.inner.read().meta.distance)?;
-                let q_snap = quant.snapshot();
-                // Widen ef by the oversampling factor so the cheaper quantized
-                // traversal still yields the same candidate quality.
-                let default_oversample = match &quant.config().quant_type {
-                    crate::types::QuantizationType::Scalar { .. } => 2usize,
-                    crate::types::QuantizationType::Binary { .. } => 4usize,
-                    crate::types::QuantizationType::Product { .. } => 3usize,
-                };
-                let oversample = quant_params
-                    .oversampling
-                    .map(|o| (o.max(1.0).ceil() as usize).max(1))
-                    .unwrap_or(default_oversample);
+            let setup = {
+                let quant_guard = self.quant.read();
+                quant_guard.as_ref().filter(|q| q.is_ready()).and_then(|quant| {
+                    let metric = self.inner.read().meta.distance;
+                    match quant.encode_query(&query.vector, metric) {
+                        Err(e) => {
+                            tracing::warn!(error = %e, "quant encode_query failed; HNSW traversal falls back to exact");
+                            None
+                        }
+                        Ok(qq) => {
+                            let bytes = quant.bytes_per_vector();
+                            let snap: Arc<Vec<Arc<memmap2::Mmap>>> =
+                                Arc::clone(&quant.snapshot());
+                            let default_oversample = match &quant.config().quant_type {
+                                crate::types::QuantizationType::Scalar { .. } => 2usize,
+                                crate::types::QuantizationType::Binary { .. } => 4usize,
+                                crate::types::QuantizationType::Product { .. } => 3usize,
+                            };
+                            let oversample = quant_params
+                                .oversampling
+                                .map(|o| (o.max(1.0).ceil() as usize).max(1))
+                                .unwrap_or(default_oversample);
+                            let rescore =
+                                quant_params.default_rescore(&quant.config().quant_type);
+                            Some((bytes, snap, qq, rescore, oversample))
+                        }
+                    }
+                })
+            };
+            if let Some((bytes, snap, qq, rescore, oversample)) = setup {
                 ef = (ef.saturating_mul(oversample)).max(ef);
-                quant_rescore = quant_params.default_rescore(&quant.config().quant_type);
-                held_guard = Some(quant_guard);
-                held_snap = Some(q_snap);
+                quant_rescore = rescore;
+                quant_bytes = bytes;
+                quant_snap_arc = Some(snap);
                 held_qq = Some(qq);
-            } else {
-                // Quant exists but is not ready; traversal stays exact.
-                quant_rescore = false;
-                held_guard = Some(quant_guard);
-                held_snap = None;
-                held_qq = None;
             }
-        } else {
-            quant_rescore = false;
-            held_guard = None;
-            held_snap = None;
-            held_qq = None;
         }
         let hnsw_ctx = HnswSearchContext {
             tombstones: Some(snap.tombstones),
             vectors: snap.vsnap,
             segment_slots: snap.segment_slots,
             filter_mask: snap.filter_mask,
-            quant: match (&held_guard, &held_snap, &held_qq) {
-                (Some(guard), Some(q_snap), Some(qq)) => Some(HnswQuantCtx {
-                    store: guard.as_ref().expect("quant store held"),
-                    snapshot: q_snap,
+            quant: match (&quant_snap_arc, &held_qq) {
+                (Some(snap), Some(qq)) => Some(HnswQuantCtx {
+                    bytes_per_vector: quant_bytes,
+                    snapshot: snap,
                     query: qq,
                 }),
                 _ => None,

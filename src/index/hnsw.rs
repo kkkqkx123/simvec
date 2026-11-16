@@ -48,9 +48,11 @@ pub(crate) const DEFAULT_ITERATIVE_MAX_ROUNDS: usize = 3;
 /// Optional quantized traversal state for the HNSW search context. When
 /// present, graph traversal distances are computed against quantized codes
 /// (qdrant-style quantized graph search); the caller rescores the survivors
-/// with exact vectors.
+/// with exact vectors. The context carries only the code width, a code
+/// snapshot and the preprocessed query, so searches never hold the quant
+/// read lock across the graph walk and rebuilds are never blocked.
 pub(crate) struct HnswQuantCtx<'a> {
-    pub store: &'a crate::storage::quant::QuantStore,
+    pub bytes_per_vector: usize,
     pub snapshot: &'a [Arc<memmap2::Mmap>],
     pub query: &'a crate::storage::quant::QuantQuery<'a>,
 }

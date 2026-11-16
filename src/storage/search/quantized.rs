@@ -32,43 +32,44 @@ impl CollectionStore {
         filtered: bool,
         started: Instant,
     ) -> Result<Vec<SearchResult>> {
-        let quant_guard = self.quant.read();
-        let Some(quant) = quant_guard.as_ref() else {
-            return Err(VectorSearchError::Internal(
-                "quantization not active".to_string(),
-            ));
+        // Preprocess under a short-lived read lock; the parallel scan below
+        // holds only an owned snapshot Arc, never the quant lock, so
+        // concurrent rebuilds are never blocked by searches.
+        let (bytes_per_vector, q_snap_arc, oversample, rescore, qq) = {
+            let quant_guard = self.quant.read();
+            let Some(quant) = quant_guard.as_ref() else {
+                return Err(VectorSearchError::Internal(
+                    "quantization not active".to_string(),
+                ));
+            };
+            if !quant.is_ready() {
+                return Err(VectorSearchError::Internal(
+                    "quantization not ready".to_string(),
+                ));
+            }
+            let bytes = quant.bytes_per_vector();
+            if bytes == 0 {
+                return Err(VectorSearchError::Internal(
+                    "quant bytes per vector is zero".to_string(),
+                ));
+            }
+            let default_oversample = match &quant.config().quant_type {
+                crate::types::QuantizationType::Scalar { .. } => 2usize,
+                crate::types::QuantizationType::Binary { .. } => 4usize,
+                crate::types::QuantizationType::Product { .. } => 3usize,
+            };
+            let params = query.quantization.clone().unwrap_or_default();
+            let oversample = params
+                .oversampling
+                .map(|o| (o.max(1.0).ceil() as usize).max(1))
+                .unwrap_or(default_oversample);
+            let rescore = params.default_rescore(&quant.config().quant_type);
+            let snap: Arc<Vec<Arc<Mmap>>> = Arc::clone(&quant.snapshot());
+            let qq = quant.encode_query(&query.vector, metric)?;
+            (bytes, snap, oversample, rescore, qq)
         };
-        if !quant.is_ready() {
-            return Err(VectorSearchError::Internal(
-                "quantization not ready".to_string(),
-            ));
-        }
-        let q_snap = quant.snapshot();
-        let bytes_per_vector = quant.bytes_per_vector();
-        if bytes_per_vector == 0 {
-            return Err(VectorSearchError::Internal(
-                "quant bytes per vector is zero".to_string(),
-            ));
-        }
         let k = query.offset.unwrap_or(0).saturating_add(query.limit);
-        let params = query.quantization.clone().unwrap_or_default();
-        // Oversampling: trade recall vs latency. Scalar 2x, Binary 4x, Product 3x
-        // by default; `quantization.oversampling` overrides per query.
-        let default_oversample = match &quant.config().quant_type {
-            crate::types::QuantizationType::Scalar { .. } => 2usize,
-            crate::types::QuantizationType::Binary { .. } => 4usize,
-            crate::types::QuantizationType::Product { .. } => 3usize,
-        };
-        let oversample = params
-            .oversampling
-            .map(|o| (o.max(1.0).ceil() as usize).max(1))
-            .unwrap_or(default_oversample);
-        // Rescore defaults per method: Binary=true, Scalar/Product=false.
-        let rescore = params.default_rescore(&quant.config().quant_type);
         let quant_k = (k * oversample).min(next_slot as usize).max(k);
-        // Preprocess the query once: scalar range params, binary bits, or a
-        // PQ LUT. The per-slot loop is then lock-free (see codec.rs).
-        let qq = quant.encode_query(&query.vector, metric)?;
 
         let heap: BinaryHeap<std::cmp::Reverse<ScoredSlot>> = (0..next_slot as u32)
             .into_par_iter()
@@ -82,8 +83,7 @@ impl CollectionStore {
                         quant_k,
                         metric,
                         query,
-                        quant,
-                        &q_snap,
+                        &q_snap_arc,
                         bytes_per_vector,
                         snap,
                         &qq,
@@ -187,9 +187,8 @@ impl CollectionStore {
         heap: &mut BinaryHeap<std::cmp::Reverse<ScoredSlot>>,
         slot: u32,
         k: usize,
-        metric: crate::types::DistanceMetric,
+        _metric: crate::types::DistanceMetric,
         query: &SearchQuery,
-        quant: &QuantStore,
         q_snap: &[Arc<Mmap>],
         bytes_per_vector: usize,
         snap: &SearchSnapshot<'_>,
@@ -229,7 +228,7 @@ impl CollectionStore {
             return;
         };
         // Hot path: preprocessed query + code bytes only, no locks.
-        let score = quant.score_quantized(qq, code);
+        let score = QuantStore::score_quantized_for_query(qq, code);
         let item = ScoredSlot { score, slot };
         if heap.len() < k {
             heap.push(std::cmp::Reverse(item));

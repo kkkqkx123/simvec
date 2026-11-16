@@ -127,6 +127,16 @@ impl CollectionStore {
             let per_node = 64 + (2 * hnsw.m as u64 + 1) * 4;
             total += meta.next_slot * per_node;
         }
+        // Quantized codes: derived file plus in-memory codebook for Product.
+        if let Some(qc) = meta.quantization_config.as_ref() {
+            total += meta.slot_capacity * qc.quant_bytes_per_vector(meta.vector_size) as u64;
+            if let Some(q) = self.quant.read().as_ref() {
+                let snap = q.meta_snapshot();
+                if let Some(cb) = snap.codebook.as_ref() {
+                    total += cb.len() as u64 * 4;
+                }
+            }
+        }
         total += self.wal.appended_bytes();
         total
     }
@@ -183,7 +193,9 @@ impl CollectionStore {
         self.payloads.grow_to(new_capacity)?;
         if let Some(q) = self.quant.read().as_ref() {
             // Quant file growth mirrors vectors capacity; zero-fill new range.
-            let _ = q.grow_to(new_capacity);
+            if let Err(e) = q.grow_to(new_capacity) {
+                tracing::warn!(error = %e, "quant grow_to failed; rebuild will recreate the file");
+            }
         }
 
         let next = self.tombstones.load().resized(new_capacity as usize);

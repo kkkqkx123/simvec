@@ -22,8 +22,10 @@ pub enum SearchMode {
 }
 
 /// Per-search quantization controls (mirrors qdrant's
-/// `QuantizationSearchParams`). Only consumed by the local engine's quantized
-/// scan path; IVF/HNSW/exact paths and remote backends ignore it.
+/// `QuantizationSearchParams`). The exact-scan quantization path consumes all
+/// fields; HNSW graph traversal consumes `ignore`/`exact` plus `rescore` and
+/// `oversampling` for candidate widening; the IVF path stays exact and
+/// ignores these controls, as do remote backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantizationSearchParams {
     /// Skip the quantized scan and use the exact path.

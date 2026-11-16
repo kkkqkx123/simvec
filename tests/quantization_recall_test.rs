@@ -133,3 +133,93 @@ fn recall_guard_product_euclid() {
         QuantizationConfig::product(CompressionRatio::X8),
     );
 }
+
+#[test]
+fn quant_survives_reopen_with_recall() {
+    let dim = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let col_dir = dir.path().join("col");
+    let truth;
+    let query;
+    {
+        let store = CollectionStore::create(
+            &col_dir,
+            "col",
+            &CollectionConfig::new(dim, DistanceMetric::Cosine)
+                .with_quantization(QuantizationConfig::scalar(0.99)),
+        )
+        .unwrap();
+        seed(&store, 400, dim);
+        store.build_quantization().unwrap();
+        assert!(store.has_quantization());
+        query = sample(7, dim);
+        truth = exact_topk(&store, &query, 10);
+    }
+    let reopened = CollectionStore::open(&col_dir).unwrap();
+    assert!(
+        reopened.has_quantization(),
+        "quantization must survive reopen"
+    );
+    let got = reopened
+        .search(
+            &SearchQuery::new(query.clone(), 10)
+                .with_quantization_params(QuantizationSearchParams {
+                    rescore: Some(true),
+                    ..Default::default()
+                }),
+        )
+        .unwrap();
+    let got_ids: Vec<String> = got.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(got_ids.len(), 10);
+    assert!(
+        recall(&got_ids, &truth) >= 0.8,
+        "reopened quant recall below guard (got {got_ids:?}, truth {truth:?})"
+    );
+}
+
+#[test]
+fn quant_survives_compaction_with_recall() {
+    let dim = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let store = CollectionStore::create(
+        dir.path().join("col"),
+        "col",
+        &CollectionConfig::new(dim, DistanceMetric::Cosine)
+            .with_quantization(QuantizationConfig::binary()),
+    )
+    .unwrap();
+    seed(&store, 400, dim);
+    store.build_quantization().unwrap();
+    let query = sample(7, dim);
+    let truth_before = exact_topk(&store, &query, 10);
+    // Delete a disjoint id range so compaction renumbers slots.
+    let dels: Vec<simvec::storage::WalRecord> = (350..400)
+        .map(|i| simvec::storage::WalRecord::Delete {
+            point_id: i.to_string(),
+        })
+        .collect();
+    store.apply_ops(&dels).unwrap();
+    store.compact().unwrap();
+    assert!(
+        store.has_quantization(),
+        "quantization must stay ready across compaction"
+    );
+    let truth = exact_topk(&store, &query, 10);
+    assert!(!truth.is_empty());
+    let _ = truth_before;
+    let got = store
+        .search(
+            &SearchQuery::new(query.clone(), 10)
+                .with_quantization_params(QuantizationSearchParams {
+                    rescore: Some(true),
+                    oversampling: Some(8.0),
+                    ..Default::default()
+                }),
+        )
+        .unwrap();
+    let got_ids: Vec<String> = got.iter().map(|r| r.id.to_string()).collect();
+    assert!(
+        recall(&got_ids, &truth) >= 0.8,
+        "compacted quant recall below guard (got {got_ids:?}, truth {truth:?})"
+    );
+}

@@ -34,9 +34,11 @@ impl HnswIndex {
                 q.snapshot,
                 slot as u64,
                 segment_slots,
-                q.store.bytes_per_vector(),
+                q.bytes_per_vector,
             )?;
-            return Some(q.store.distance_quantized_query(q.query, code));
+            return Some(crate::storage::quant::QuantStore::distance_quantized_for_query(
+                q.query, code,
+            ));
         }
         let v = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim)?;
         Some(self.distance(query, v))

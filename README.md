@@ -12,7 +12,7 @@
 - **Simulated two-phase publish.** Index builds write to `*.rebuild-*` scratch directories, publish atomically, and keep `.old-*` backups for reverse recovery (`restore_promote_backup`).
 - **Payload storage with filtering.** Full JSON payloads, optional payload field indexes, and a rich filter language: match, range, values-count, geo (radius / bounding box), nested conditions, and `must` / `should` / `must_not` combinators.
 - **SIMD distance kernels.** AVX2+FMA and AVX-512 on x86-64, NEON on aarch64, with a naive fallback that always serves as the correctness baseline. Metrics: Cosine, Euclid, Dot, Manhattan.
-- **Quantization.** Scalar and product quantization with k-means codebook training, used as a search accelerator (exact scores are always recomputed).
+- **Quantization.** Scalar, binary and product quantization with k-means codebook training, used as a search accelerator (exact scores are always recomputed).
 - **Tombstones and compaction.** Deletes are logical; `compact_collection` physically reclaims slots. A background maintenance worker runs builds, compaction, drift sweeps, and HNSW promotion every 30 s.
 - **Metrics.** Per-collection `MetricsSnapshot` with search path counters (scan / IVF / HNSW, retries, fallbacks). Optional `lock-metrics` feature instruments lock wait times for contention investigations.
 

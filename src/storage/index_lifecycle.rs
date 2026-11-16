@@ -269,7 +269,9 @@ impl CollectionStore {
             let ready = self.has_quantization();
             if needs && !ready {
                 // Product quantization not yet trained, or scalar missing.
-                let _ = self.build_quantization();
+                if let Err(e) = self.build_quantization() {
+                    tracing::warn!(error = %e, "pre-index quant build failed; index builds on exact vectors");
+                }
             } else if needs {
                 // For scalar, periodically refresh the scale even when ready
                 // if live set has grown significantly. For now trigger on
@@ -279,7 +281,9 @@ impl CollectionStore {
                 // repeated k-means.
                 let qc = self.inner.read().meta.quantization_config.clone().unwrap();
                 if matches!(qc.quant_type, crate::types::QuantizationType::Scalar { .. }) {
-                    let _ = self.build_quantization();
+                    if let Err(e) = self.build_quantization() {
+                        tracing::warn!(error = %e, "scalar quant refresh failed; serving existing codes");
+                    }
                 }
             }
         }
