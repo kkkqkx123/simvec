@@ -21,6 +21,45 @@ pub enum SearchMode {
     },
 }
 
+/// Per-search quantization controls (mirrors qdrant's
+/// `QuantizationSearchParams`). Only consumed by the local engine's quantized
+/// scan path; IVF/HNSW/exact paths and remote backends ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantizationSearchParams {
+    /// Skip the quantized scan and use the exact path.
+    pub ignore: bool,
+    /// Exact search: same as `ignore`, expressed the way qdrant's
+    /// `SearchRequest.exact` does it. Takes precedence over `ignore`.
+    pub exact: bool,
+    /// Rescore quantized coarse candidates with original f32 vectors before
+    /// returning. Default depends on the quant method: Binary defaults to
+    /// true (Hamming ranking is only coarsely monotonic in the true metric),
+    /// Scalar/Product default to false (their quantized distance is already
+    /// in the true metric's units).
+    pub rescore: Option<bool>,
+    /// Candidate multiplier for the quantized coarse scan (>= 1.0). When
+    /// unset, a per-method default is used (Scalar 2x, Binary 4x, Product 3x).
+    pub oversampling: Option<f64>,
+}
+
+impl QuantizationSearchParams {
+    pub fn default_rescore(&self, quant_type: &crate::types::QuantizationType) -> bool {
+        self.rescore
+            .unwrap_or(matches!(quant_type, crate::types::QuantizationType::Binary { .. }))
+    }
+}
+
+impl Default for QuantizationSearchParams {
+    fn default() -> Self {
+        Self {
+            ignore: false,
+            exact: false,
+            rescore: None,
+            oversampling: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub vector: Vec<f32>,
@@ -41,6 +80,9 @@ pub struct SearchQuery {
     /// `None` returns the whole payload. Applied after the payload read,
     /// so it only trims serialization cost, never filtering semantics.
     pub payload_selector: Option<PayloadSelector>,
+    /// Quantized-scan controls (`ignore` / `exact` / `rescore` /
+    /// `oversampling`). `None` uses the defaults of [`QuantizationSearchParams`].
+    pub quantization: Option<QuantizationSearchParams>,
 }
 
 impl SearchQuery {
@@ -56,6 +98,7 @@ impl SearchQuery {
             nprobe: None,
             search_mode: None,
             payload_selector: None,
+            quantization: None,
         }
     }
 
@@ -86,6 +129,19 @@ impl SearchQuery {
 
     pub fn with_nprobe(mut self, nprobe: usize) -> Self {
         self.nprobe = Some(nprobe);
+        self
+    }
+
+    /// Set quantized-scan controls for this search.
+    pub fn with_quantization_params(mut self, params: QuantizationSearchParams) -> Self {
+        self.quantization = Some(params);
+        self
+    }
+
+    /// Force exact (non-quantized) search for this query.
+    pub fn with_exact(mut self, exact: bool) -> Self {
+        let params = self.quantization.get_or_insert_with(Default::default);
+        params.exact = exact;
         self
     }
 

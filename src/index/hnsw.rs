@@ -45,11 +45,22 @@ mod search;
 /// comes up short and `HnswConfig::iterative_max_rounds` is unset.
 pub(crate) const DEFAULT_ITERATIVE_MAX_ROUNDS: usize = 3;
 
+/// Optional quantized traversal state for the HNSW search context. When
+/// present, graph traversal distances are computed against quantized codes
+/// (qdrant-style quantized graph search); the caller rescores the survivors
+/// with exact vectors.
+pub(crate) struct HnswQuantCtx<'a> {
+    pub store: &'a crate::storage::quant::QuantStore,
+    pub snapshot: &'a [Arc<memmap2::Mmap>],
+    pub query: &'a crate::storage::quant::QuantQuery<'a>,
+}
+
 pub(crate) struct HnswSearchContext<'a> {
     pub tombstones: Option<&'a TombstoneBits>,
     pub vectors: &'a [Arc<memmap2::Mmap>],
     pub segment_slots: u32,
     pub filter_mask: Option<&'a BitVec>,
+    pub quant: Option<HnswQuantCtx<'a>>,
 }
 
 /// Per-thread reusable working sets for the search hot path.

@@ -189,7 +189,7 @@ impl HnswIndex {
             let Some(&start) = ep.first() else {
                 return;
             };
-            let best = self.greedy_step(vector, start, lc, vectors, segment_slots);
+            let best = self.greedy_step(vector, start, lc, vectors, segment_slots, None);
             ep = vec![best];
             lc -= 1;
         }
@@ -206,6 +206,7 @@ impl HnswIndex {
                     vectors,
                     segment_slots,
                     filter_mask: None,
+                    quant: None,
                 },
             );
             let selected =

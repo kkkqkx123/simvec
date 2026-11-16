@@ -29,7 +29,7 @@ use crate::types::{DistanceMetric, QuantizationConfig, QuantizationType};
 mod codec;
 mod rebuild;
 
-pub(crate) use self::codec::encode_binary_for_query;
+pub(crate) use self::codec::{encode_binary_for_query, QuantQuery};
 
 const QUANT_MAGIC: [u8; 4] = *b"VQMT";
 const QUANT_VERSION: u16 = 1;

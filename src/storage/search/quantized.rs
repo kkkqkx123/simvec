@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use super::super::directory::DirView;
 use super::super::index_lifecycle::PublishedIndex;
 use super::super::keys::Keys;
-use super::super::quant::QuantStore;
+use super::super::quant::{QuantQuery, QuantStore};
 use super::super::vectors::Vectors;
 use super::super::{CollectionStore, PayloadStore, TombstoneBits};
 use crate::error::{Result, VectorSearchError};
@@ -51,20 +51,24 @@ impl CollectionStore {
             ));
         }
         let k = query.offset.unwrap_or(0).saturating_add(query.limit);
-        // Oversampling: trade recall vs latency. Scalar 2x, Binary 4x, Product 3x.
-        let oversample = match &quant.config().quant_type {
+        let params = query.quantization.clone().unwrap_or_default();
+        // Oversampling: trade recall vs latency. Scalar 2x, Binary 4x, Product 3x
+        // by default; `quantization.oversampling` overrides per query.
+        let default_oversample = match &quant.config().quant_type {
             crate::types::QuantizationType::Scalar { .. } => 2usize,
             crate::types::QuantizationType::Binary { .. } => 4usize,
             crate::types::QuantizationType::Product { .. } => 3usize,
         };
+        let oversample = params
+            .oversampling
+            .map(|o| (o.max(1.0).ceil() as usize).max(1))
+            .unwrap_or(default_oversample);
+        // Rescore defaults per method: Binary=true, Scalar/Product=false.
+        let rescore = params.default_rescore(&quant.config().quant_type);
         let quant_k = (k * oversample).min(next_slot as usize).max(k);
-        // Precompute binary query bits once to avoid per-slot allocation.
-        let query_bits: Option<Vec<u8>> = match &quant.config().quant_type {
-            crate::types::QuantizationType::Binary { .. } => {
-                Some(super::super::quant::encode_binary_for_query(&query.vector))
-            }
-            _ => None,
-        };
+        // Preprocess the query once: scalar range params, binary bits, or a
+        // PQ LUT. The per-slot loop is then lock-free (see codec.rs).
+        let qq = quant.encode_query(&query.vector, metric)?;
 
         let heap: BinaryHeap<std::cmp::Reverse<ScoredSlot>> = (0..next_slot as u32)
             .into_par_iter()
@@ -82,7 +86,7 @@ impl CollectionStore {
                         &q_snap,
                         bytes_per_vector,
                         snap,
-                        query_bits.as_deref(),
+                        &qq,
                     );
                     acc
                 },
@@ -130,18 +134,30 @@ impl CollectionStore {
         }
         quant_candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
 
-        // Rerank with exact distances.
-        let mut reranked: Vec<(f32, u32)> = Vec::with_capacity(quant_candidates.len());
-        for (_, slot) in quant_candidates {
-            let Some(v) = Vectors::read_slot(snap.vsnap, slot as u64, snap.segment_slots, snap.dim)
-            else {
-                continue;
-            };
-            let dist = crate::distance::distance(metric, &query.vector, v);
-            let score = crate::distance::to_score(metric, dist);
-            reranked.push((score, slot));
-        }
-        reranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        // Without rescoring, return quantized-score results directly
+        // (truncated to k). Quantized scores are internally consistent with
+        // the metric; Binary Hamming is only coarsely monotonic in the true
+        // distance, which `QuantizationSearchParams::rescore` documents.
+        let final_scored = if !rescore {
+            quant_candidates.truncate(k);
+            quant_candidates
+        } else {
+            // Rerank with exact distances for guaranteed recall of the
+            // visible top-k.
+            let mut reranked: Vec<(f32, u32)> = Vec::with_capacity(quant_candidates.len());
+            for (_, slot) in quant_candidates {
+                let Some(v) =
+                    Vectors::read_slot(snap.vsnap, slot as u64, snap.segment_slots, snap.dim)
+                else {
+                    continue;
+                };
+                let dist = crate::distance::distance(metric, &query.vector, v);
+                let score = crate::distance::to_score(metric, dist);
+                reranked.push((score, slot));
+            }
+            reranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            reranked
+        };
 
         self.metrics
             .record_search(SearchPath::Quantized, filtered, started.elapsed());
@@ -149,7 +165,7 @@ impl CollectionStore {
         // `quant_scan_step`; re-filtering here would repeat every
         // key/payload read.
         self.finish_scored(
-            reranked,
+            final_scored,
             query,
             &SearchSnapshot {
                 dim: snap.dim,
@@ -177,7 +193,7 @@ impl CollectionStore {
         q_snap: &[Arc<Mmap>],
         bytes_per_vector: usize,
         snap: &SearchSnapshot<'_>,
-        query_bits: Option<&[u8]>,
+        qq: &QuantQuery<'_>,
     ) {
         // Fast pre-filter via bitmap for equality payload conditions, when present.
         if let Some(mask) = snap.filter_mask {
@@ -212,22 +228,8 @@ impl CollectionStore {
         else {
             return;
         };
-        // Binary hamming can be computed from pre-encoded query bits without
-        // per-slot allocation; other types use the quantized distance helper.
-        let score = match &quant.config().quant_type {
-            crate::types::QuantizationType::Binary { .. } => {
-                let qbits = query_bits.expect("binary query bits precomputed");
-                let mut ham = 0u32;
-                for (a, b) in qbits.iter().zip(code.iter()) {
-                    ham += (a ^ b).count_ones();
-                }
-                -(ham as f32)
-            }
-            _ => {
-                let qdist = quant.distance_quantized(&query.vector, code, metric);
-                crate::distance::to_score(metric, qdist)
-            }
-        };
+        // Hot path: preprocessed query + code bytes only, no locks.
+        let score = quant.score_quantized(qq, code);
         let item = ScoredSlot { score, slot };
         if heap.len() < k {
             heap.push(std::cmp::Reverse(item));

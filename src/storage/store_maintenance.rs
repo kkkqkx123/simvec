@@ -262,10 +262,12 @@ impl CollectionStore {
             .expect("quant present")
             .meta_snapshot();
         let _ = quant;
-        // Delegate training to QuantStore.
+        // Delegate training to QuantStore. No external cancellation source is
+        // wired yet; rebuild checks the flag cooperatively.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
         let quant_store = self.quant.read();
         let qs = quant_store.as_ref().expect("quant store exists");
-        qs.rebuild(&vsnap, segment_slots, &live, dim)?;
+        qs.rebuild(&vsnap, segment_slots, &live, dim, &stopped)?;
         Ok(true)
     }
 

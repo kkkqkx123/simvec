@@ -152,8 +152,10 @@ impl CollectionStore {
         // Quantized path: when quantization is active and ready, do a coarse
         // quantized scan for `k * oversample` then rerank with exact vectors.
         // This is a derived storage optimization over the exact scan; recall is
-        // traded for 4x-32x memory reduction.
-        if self.has_quantization() {
+        // traded for 4x-32x memory reduction. `quantization.ignore/exact`
+        // opts out per query.
+        let quant_params = query.quantization.clone().unwrap_or_default();
+        if self.has_quantization() && !quant_params.ignore && !quant_params.exact {
             // Try the quantized path; if it fails (corrupt quant file) fall
             // back to exact scan transparently.
             let quant_result =

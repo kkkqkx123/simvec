@@ -9,6 +9,7 @@ use crate::index::IndexBuildParams;
 use crate::metrics::{timed_write_lock, Metrics};
 use crate::storage::vectors::Vectors;
 use crate::storage::TombstoneBits;
+use crate::index::hnsw::{HnswQuantCtx, HnswSearchContext};
 use crate::types::{DistanceMetric, HnswConfig};
 
 use bitvec::prelude::*;
@@ -16,6 +17,31 @@ use bitvec::prelude::*;
 use super::*;
 
 impl HnswIndex {
+    /// Traversal distance for one slot: quantized code distance when a
+    /// quantized context is present, exact vector distance otherwise.
+    /// Returns internal distance (smaller = nearer), matching `self.distance`.
+    #[inline]
+    pub(super) fn cand_dist(
+        &self,
+        query: &[f32],
+        qctx: Option<&HnswQuantCtx<'_>>,
+        vectors: &[Arc<memmap2::Mmap>],
+        segment_slots: u32,
+        slot: u32,
+    ) -> Option<f32> {
+        if let Some(q) = qctx {
+            let code = crate::storage::quant::QuantStore::read_slot(
+                q.snapshot,
+                slot as u64,
+                segment_slots,
+                q.store.bytes_per_vector(),
+            )?;
+            return Some(q.store.distance_quantized_query(q.query, code));
+        }
+        let v = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim)?;
+        Some(self.distance(query, v))
+    }
+
     /// Greedy descent with `ef = 1`: repeatedly move to the closest neighbor
     /// until no improvement. Equivalent to running paper Algorithm 2 with
     /// `ef = 1`, which is what pgvector uses between upper layers.
@@ -26,6 +52,7 @@ impl HnswIndex {
         layer: u8,
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
+        qctx: Option<&HnswQuantCtx<'_>>,
     ) -> Cand {
         let mut best = start;
         loop {
@@ -35,11 +62,9 @@ impl HnswIndex {
             let neighbors = node.layer(layer).read().clone();
             let mut improved = false;
             for slot in neighbors {
-                let Some(v) = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim)
-                else {
+                let Some(dist) = self.cand_dist(query, qctx, vectors, segment_slots, slot) else {
                     continue;
                 };
-                let dist = self.distance(query, v);
                 if (Cand { dist, slot }).cmp(&best) == std::cmp::Ordering::Less {
                     best = Cand { dist, slot };
                     improved = true;
@@ -181,12 +206,10 @@ impl HnswIndex {
                     continue;
                 }
                 visited_count += 1;
-                let Some(v) =
-                    Vectors::read_slot(ctx.vectors, slot as u64, ctx.segment_slots, self.dim)
+                let Some(dist) = self.cand_dist(query, ctx.quant.as_ref(), ctx.vectors, ctx.segment_slots, slot)
                 else {
                     continue;
                 };
-                let dist = self.distance(query, v);
                 let cand = Cand { dist, slot };
                 scratch.candidates.push(std::cmp::Reverse(cand));
                 if !matches_filter(slot) {
@@ -232,19 +255,23 @@ impl HnswIndex {
         let Some(entry) = *self.entry.read() else {
             return Ok(Vec::new());
         };
-        let Some(entry_vec) =
-            Vectors::read_slot(ctx.vectors, entry.slot as u64, ctx.segment_slots, self.dim)
-        else {
+        let Some(dist) = self.cand_dist(
+            query,
+            ctx.quant.as_ref(),
+            ctx.vectors,
+            ctx.segment_slots,
+            entry.slot,
+        ) else {
             return Ok(Vec::new());
         };
 
         let mut best = Cand {
-            dist: self.distance(query, entry_vec),
+            dist,
             slot: entry.slot,
         };
         let mut lc = entry.level;
         while lc > 0 {
-            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots);
+            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots, ctx.quant.as_ref());
             lc -= 1;
         }
 
@@ -278,19 +305,23 @@ impl HnswIndex {
         let Some(entry) = *self.entry.read() else {
             return Ok(Vec::new());
         };
-        let Some(entry_vec) =
-            Vectors::read_slot(ctx.vectors, entry.slot as u64, ctx.segment_slots, self.dim)
-        else {
+        let Some(dist) = self.cand_dist(
+            query,
+            ctx.quant.as_ref(),
+            ctx.vectors,
+            ctx.segment_slots,
+            entry.slot,
+        ) else {
             return Ok(Vec::new());
         };
 
         let mut best = Cand {
-            dist: self.distance(query, entry_vec),
+            dist,
             slot: entry.slot,
         };
         let mut lc = entry.level;
         while lc > 0 {
-            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots);
+            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots, ctx.quant.as_ref());
             lc -= 1;
         }
 
