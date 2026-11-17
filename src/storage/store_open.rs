@@ -218,10 +218,7 @@ impl CollectionStore {
     }
 
     /// Open an existing collection with explicit engine-level storage tuning.
-    pub fn open_with_storage(
-        dir: impl AsRef<Path>,
-        storage: &StorageConfig,
-    ) -> Result<Arc<Self>> {
+    pub fn open_with_storage(dir: impl AsRef<Path>, storage: &StorageConfig) -> Result<Arc<Self>> {
         storage.validate()?;
         let dir = dir.as_ref();
         for name in &["meta.bin", "vectors.bin", "keys.bin", "payloads.bin"] {

@@ -4,8 +4,8 @@
 
 use simvec::storage::CollectionStore;
 use simvec::types::{
-    CollectionConfig, CompressionRatio, DistanceMetric, QuantizationConfig, QuantizationSearchParams,
-    SearchQuery,
+    CollectionConfig, CompressionRatio, DistanceMetric, QuantizationConfig,
+    QuantizationSearchParams, SearchQuery,
 };
 
 /// Clustered dataset: `clusters` blobs around unit-axis centers shifted to be
@@ -38,11 +38,12 @@ fn seed(store: &CollectionStore, n: u64, dim: usize) {
 fn exact_topk(store: &CollectionStore, query: &[f32], k: usize) -> Vec<String> {
     store
         .search(
-            &SearchQuery::new(query.to_vec(), k)
-                .with_quantization_params(QuantizationSearchParams {
+            &SearchQuery::new(query.to_vec(), k).with_quantization_params(
+                QuantizationSearchParams {
                     ignore: true,
                     ..Default::default()
-                }),
+                },
+            ),
         )
         .unwrap()
         .into_iter()
@@ -61,8 +62,11 @@ fn recall(got: &[String], truth: &[String]) -> f64 {
 fn recall_guard_case(metric: DistanceMetric, qc: QuantizationConfig) {
     // Binary 1-bit codes are coarse; the binary case passes an explicit
     // larger oversampling to clear the guard (the default 4x yields ~0.7).
-    let oversampling = matches!(qc.quant_type, simvec::types::QuantizationType::Binary { .. })
-        .then_some(8.0f64);
+    let oversampling = matches!(
+        qc.quant_type,
+        simvec::types::QuantizationType::Binary { .. }
+    )
+    .then_some(8.0f64);
     let dim = 16;
     let dir = tempfile::tempdir().unwrap();
     let store = CollectionStore::create(
@@ -81,12 +85,13 @@ fn recall_guard_case(metric: DistanceMetric, qc: QuantizationConfig) {
     // Default quantized path (rescore on to keep scores exact).
     let got = store
         .search(
-            &SearchQuery::new(query.clone(), 10)
-                .with_quantization_params(QuantizationSearchParams {
+            &SearchQuery::new(query.clone(), 10).with_quantization_params(
+                QuantizationSearchParams {
                     rescore: Some(true),
                     oversampling,
                     ..Default::default()
-                }),
+                },
+            ),
         )
         .unwrap();
     let got_ids: Vec<String> = got.iter().map(|r| r.id.to_string()).collect();
@@ -99,10 +104,12 @@ fn recall_guard_case(metric: DistanceMetric, qc: QuantizationConfig) {
     // ignore=true must match the exact path exactly.
     let ignored = store
         .search(
-            &SearchQuery::new(query.clone(), 10).with_quantization_params(QuantizationSearchParams {
-                ignore: true,
-                ..Default::default()
-            }),
+            &SearchQuery::new(query.clone(), 10).with_quantization_params(
+                QuantizationSearchParams {
+                    ignore: true,
+                    ..Default::default()
+                },
+            ),
         )
         .unwrap();
     let ignored_ids: Vec<String> = ignored.iter().map(|r| r.id.to_string()).collect();
@@ -162,11 +169,12 @@ fn quant_survives_reopen_with_recall() {
     );
     let got = reopened
         .search(
-            &SearchQuery::new(query.clone(), 10)
-                .with_quantization_params(QuantizationSearchParams {
+            &SearchQuery::new(query.clone(), 10).with_quantization_params(
+                QuantizationSearchParams {
                     rescore: Some(true),
                     ..Default::default()
-                }),
+                },
+            ),
         )
         .unwrap();
     let got_ids: Vec<String> = got.iter().map(|r| r.id.to_string()).collect();
@@ -209,12 +217,13 @@ fn quant_survives_compaction_with_recall() {
     let _ = truth_before;
     let got = store
         .search(
-            &SearchQuery::new(query.clone(), 10)
-                .with_quantization_params(QuantizationSearchParams {
+            &SearchQuery::new(query.clone(), 10).with_quantization_params(
+                QuantizationSearchParams {
                     rescore: Some(true),
                     oversampling: Some(8.0),
                     ..Default::default()
-                }),
+                },
+            ),
         )
         .unwrap();
     let got_ids: Vec<String> = got.iter().map(|r| r.id.to_string()).collect();

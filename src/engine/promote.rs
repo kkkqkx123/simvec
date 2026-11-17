@@ -80,7 +80,8 @@ impl LocalVectorEngine {
         // recovery) without exposing it to search: nothing routes to
         // `.old-*` names and `collection_names` hides them.
         if backup_dir.exists() {
-            if let Ok(backup_store) = CollectionStore::open_with_storage(&backup_dir, &self.storage) {
+            if let Ok(backup_store) = CollectionStore::open_with_storage(&backup_dir, &self.storage)
+            {
                 self.collections
                     .write()
                     .insert(backup_name.clone(), backup_store);

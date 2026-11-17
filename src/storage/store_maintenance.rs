@@ -114,8 +114,8 @@ impl CollectionStore {
         total += meta.next_slot * 12;
         // Payload data area: one page per `blocks_per_page` slots, sized by
         // the configured payload geometry rather than the historical default.
-        let blocks_per_page = (self.storage.payload_page_size / self.storage.payload_block_size)
-            .max(1) as u64;
+        let blocks_per_page =
+            (self.storage.payload_page_size / self.storage.payload_block_size).max(1) as u64;
         let pages = meta.next_slot.div_ceil(blocks_per_page).max(1);
         total += pages * self.storage.payload_page_size as u64;
         // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.

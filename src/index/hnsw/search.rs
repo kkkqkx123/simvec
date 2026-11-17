@@ -4,12 +4,12 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
+use crate::index::hnsw::{HnswQuantCtx, HnswSearchContext};
 use crate::index::persist::{PersistedHnsw, PersistedNodeRecord};
 use crate::index::IndexBuildParams;
 use crate::metrics::{timed_write_lock, Metrics};
 use crate::storage::vectors::Vectors;
 use crate::storage::TombstoneBits;
-use crate::index::hnsw::{HnswQuantCtx, HnswSearchContext};
 use crate::types::{DistanceMetric, HnswConfig};
 
 use bitvec::prelude::*;
@@ -36,9 +36,9 @@ impl HnswIndex {
                 segment_slots,
                 q.bytes_per_vector,
             )?;
-            return Some(crate::storage::quant::QuantStore::distance_quantized_for_query(
-                q.query, code,
-            ));
+            return Some(
+                crate::storage::quant::QuantStore::distance_quantized_for_query(q.query, code),
+            );
         }
         let v = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim)?;
         Some(self.distance(query, v))
@@ -208,8 +208,13 @@ impl HnswIndex {
                     continue;
                 }
                 visited_count += 1;
-                let Some(dist) = self.cand_dist(query, ctx.quant.as_ref(), ctx.vectors, ctx.segment_slots, slot)
-                else {
+                let Some(dist) = self.cand_dist(
+                    query,
+                    ctx.quant.as_ref(),
+                    ctx.vectors,
+                    ctx.segment_slots,
+                    slot,
+                ) else {
                     continue;
                 };
                 let cand = Cand { dist, slot };
@@ -273,7 +278,14 @@ impl HnswIndex {
         };
         let mut lc = entry.level;
         while lc > 0 {
-            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots, ctx.quant.as_ref());
+            best = self.greedy_step(
+                query,
+                best,
+                lc,
+                ctx.vectors,
+                ctx.segment_slots,
+                ctx.quant.as_ref(),
+            );
             lc -= 1;
         }
 
@@ -323,7 +335,14 @@ impl HnswIndex {
         };
         let mut lc = entry.level;
         while lc > 0 {
-            best = self.greedy_step(query, best, lc, ctx.vectors, ctx.segment_slots, ctx.quant.as_ref());
+            best = self.greedy_step(
+                query,
+                best,
+                lc,
+                ctx.vectors,
+                ctx.segment_slots,
+                ctx.quant.as_ref(),
+            );
             lc -= 1;
         }
 

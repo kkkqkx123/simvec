@@ -46,8 +46,10 @@ pub struct QuantizationSearchParams {
 
 impl QuantizationSearchParams {
     pub fn default_rescore(&self, quant_type: &crate::types::QuantizationType) -> bool {
-        self.rescore
-            .unwrap_or(matches!(quant_type, crate::types::QuantizationType::Binary { .. }))
+        self.rescore.unwrap_or(matches!(
+            quant_type,
+            crate::types::QuantizationType::Binary { .. }
+        ))
     }
 }
 

@@ -35,10 +35,7 @@ impl LocalVectorEngine {
 
     /// Open (or create) the engine root directory with explicit engine-level
     /// storage tuning. Every collection loaded from disk adopts `storage`.
-    pub fn open_with_storage(
-        root_dir: impl AsRef<Path>,
-        storage: StorageConfig,
-    ) -> Result<Self> {
+    pub fn open_with_storage(root_dir: impl AsRef<Path>, storage: StorageConfig) -> Result<Self> {
         storage.validate()?;
         let root_dir = root_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_dir)?;

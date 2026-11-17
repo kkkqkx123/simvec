@@ -79,8 +79,7 @@ pub(super) fn test_insert_and_probe_finds_blobs() {
                     vectors: &mmaps,
                     segment_slots: 128,
                     filter_mask: None,
-quant: None,
-
+                    quant: None,
                 },
             )
             .unwrap();
@@ -120,8 +119,7 @@ pub(super) fn test_probe_respects_tombstones() {
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -139,8 +137,7 @@ quant: None,
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -177,8 +174,7 @@ pub(super) fn test_incremental_insert_reaches_graph() {
                 vectors: &mmaps2,
                 segment_slots: 256,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -252,8 +248,7 @@ pub(super) fn test_search_layer_result_never_exceeds_ef_with_dead_nodes() {
             vectors: &mmaps,
             segment_slots: 128,
             filter_mask: None,
-quant: None,
-
+            quant: None,
         },
     );
     assert!(
@@ -357,8 +352,7 @@ pub(super) fn test_multiworker_build_registers_all_and_keeps_recall() {
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -426,8 +420,7 @@ pub(super) fn test_persisted_roundtrip_preserves_topology() {
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -441,8 +434,7 @@ quant: None,
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -520,8 +512,7 @@ pub(super) fn test_recall_against_exact_scan() {
                 vectors: &mmaps,
                 segment_slots: 128,
                 filter_mask: None,
-quant: None,
-
+                quant: None,
             },
         )
         .unwrap();
@@ -570,8 +561,7 @@ pub(super) fn test_iterative_scan_improves_recall() {
         vectors: &mmaps,
         segment_slots: 128,
         filter_mask: None,
-quant: None,
-
+        quant: None,
     };
 
     // One-shot with small ef.
@@ -650,8 +640,7 @@ pub(super) fn test_iterative_scan_tuple_budget_truncates() {
         vectors: &mmaps,
         segment_slots: 128,
         filter_mask: None,
-quant: None,
-
+        quant: None,
     };
     let q = vec![5.0f32; DIM];
 
@@ -726,8 +715,7 @@ pub(super) fn test_concurrent_insert_and_probe_exercises_version_reload() {
                         vectors: &mmaps,
                         segment_slots: 256,
                         filter_mask: None,
-quant: None,
-
+                        quant: None,
                     },
                 );
             }

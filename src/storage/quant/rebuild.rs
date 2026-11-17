@@ -66,8 +66,7 @@ impl QuantStore {
                 let quantile = quantile.unwrap_or(0.99);
                 // Stride-sample slots so calibration values stay bounded
                 // (streaming-style: we never hold all live values in memory).
-                let sample_slots =
-                    stride_sample(live_slots, SCALAR_SAMPLE_VALUES / dim.max(1));
+                let sample_slots = stride_sample(live_slots, SCALAR_SAMPLE_VALUES / dim.max(1));
                 let mut values: Vec<f32> = Vec::with_capacity(sample_slots.len() * dim);
                 for &slot in &sample_slots {
                     if let Some(v) = crate::storage::vectors::Vectors::read_slot(
@@ -89,8 +88,7 @@ impl QuantStore {
                         (min, max)
                     } else {
                         let low_idx = ((1.0 - quantile) / 2.0 * values.len() as f32) as usize;
-                        let high_idx =
-                            ((1.0 + quantile) / 2.0 * values.len() as f32) as usize;
+                        let high_idx = ((1.0 + quantile) / 2.0 * values.len() as f32) as usize;
                         let high_idx = high_idx.min(values.len() - 1);
                         values.select_nth_unstable_by(low_idx, |a, b| a.total_cmp(b));
                         let min = values[low_idx];
@@ -341,4 +339,3 @@ impl QuantStore {
         Ok(())
     }
 }
-
