@@ -1,20 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
+use std::collections::HashMap;
 
-use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
-
-use super::*;
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
-use crate::error::{Result, VectorSearchError};
-use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord};
+use super::{LocalVectorEngine, TxnOp};
+use crate::error::Result;
+use crate::storage::{WalPoint, WalRecord};
 use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
     Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
 };
 
@@ -130,7 +119,7 @@ impl LocalVectorEngine {
 
     /// Number of live points matching `filter`. Pure read.
     pub fn count_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
-        Ok(self.store(collection)?.count_by_filter(filter)?)
+        self.store(collection)?.count_by_filter(filter)
     }
 
     /// Replace the payload for a single point. The point must exist and not

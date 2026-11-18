@@ -25,7 +25,6 @@ fn main() {
         .map(|out| out.status.success())
         .unwrap_or(false);
     if !have_tool {
-        println!("cargo:warning=cbindgen not found; keeping committed {HEADER}");
         return;
     }
 

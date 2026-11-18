@@ -72,6 +72,10 @@ pub unsafe extern "C" fn simvec_free_string(s: *mut c_char) {
 /// Most recent status code recorded on the handle.
 ///
 /// Returns misuse for a null handle without touching any error state.
+///
+/// # Safety
+/// `engine` must be null or a valid handle created by this API that has not
+/// been freed.
 #[no_mangle]
 pub unsafe extern "C" fn simvec_errcode(engine: *mut simvec_engine_t) -> c_int {
     if engine.is_null() {

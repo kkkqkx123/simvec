@@ -1,26 +1,16 @@
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
-use bitvec::prelude::*;
-use memmap2::Mmap;
-use rayon::prelude::*;
-
-use super::super::directory::DirView;
-use super::super::index_lifecycle::PublishedIndex;
-use super::super::keys::Keys;
 use super::super::quant::QuantQuery;
 use super::super::vectors::Vectors;
-use super::super::{CollectionStore, PayloadStore, TombstoneBits};
-use crate::error::{Result, VectorSearchError};
+use super::super::CollectionStore;
+use crate::error::Result;
 use crate::index::hnsw::{HnswQuantCtx, HnswSearchContext};
 use crate::index::IvfSearchContext;
 use crate::index::{HnswIndex, IvfIndex};
-use crate::metrics::{SearchPath, SearchRetry};
-use crate::types::{PointId, SearchQuery, SearchResult};
+use crate::metrics::SearchRetry;
+use crate::types::{SearchQuery, SearchResult};
 
-use super::{ScoredSlot, SearchSnapshot};
+use super::SearchSnapshot;
 
 impl CollectionStore {
     /// IVF path: probe the `nprobe` closest lists (+ pending slots), then

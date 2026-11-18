@@ -1,7 +1,7 @@
 use crate::error::{Result, VectorSearchError};
-use crate::types::{DistanceMetric, QuantizationConfig, QuantizationType};
+use crate::types::{DistanceMetric, QuantizationType};
 
-use super::{QuantMeta, QuantStore};
+use super::QuantStore;
 
 /// Preprocessed query for quantized scoring.
 ///

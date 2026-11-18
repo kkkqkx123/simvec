@@ -10,23 +10,16 @@
 //! idempotently. Coordinated graph transactions land in [`LocalVectorEngine::apply_txn`].
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
-use crate::error::{Result, VectorSearchError};
-use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord};
-use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, StorageConfig, VectorFilter,
-    VectorPoint,
-};
+use crate::storage::CollectionStore;
+use crate::types::{HnswConfig, IvfConfig, PointId, StorageConfig, VectorPoint};
 
 /// A single operation of a coordinated transaction, grouped per collection.
 #[derive(Debug, Clone)]
@@ -131,7 +124,6 @@ impl Drop for LocalVectorEngine {
 /// Background maintenance loop: executes scheduled builds and, on each idle
 /// tick, sweeps collections for post-compaction rebuilds, drift-triggered
 /// rebuilds and exact-scan-to-IVF promotion.
-
 #[cfg(test)]
 #[path = "engine/tests.rs"]
 mod tests;

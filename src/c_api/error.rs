@@ -185,6 +185,10 @@ pub(crate) unsafe fn guard(
 ///
 /// The caller releases the result with `simvec_free_string`. An empty
 /// string means no recorded error.
+///
+/// # Safety
+/// The returned pointer owns freshly allocated memory and must be released
+/// exactly once with `simvec_free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn simvec_last_error_text() -> *mut c_char {
     let owned: CString = THREAD_ERROR.with(|slot| slot.borrow().clone().unwrap_or_default());

@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::IndexBuildParams;
 use crate::types::DistanceMetric;
 use std::collections::HashSet;
 

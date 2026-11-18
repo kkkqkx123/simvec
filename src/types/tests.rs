@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::error::{Result, VectorSearchError};
+use crate::error::VectorSearchError;
 
 use super::*;
 

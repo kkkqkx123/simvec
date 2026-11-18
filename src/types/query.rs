@@ -26,7 +26,7 @@ pub enum SearchMode {
 /// fields; HNSW graph traversal consumes `ignore`/`exact` plus `rescore` and
 /// `oversampling` for candidate widening; the IVF path stays exact and
 /// ignores these controls, as do remote backends.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuantizationSearchParams {
     /// Skip the quantized scan and use the exact path.
     pub ignore: bool,
@@ -50,17 +50,6 @@ impl QuantizationSearchParams {
             quant_type,
             crate::types::QuantizationType::Binary { .. }
         ))
-    }
-}
-
-impl Default for QuantizationSearchParams {
-    fn default() -> Self {
-        Self {
-            ignore: false,
-            exact: false,
-            rescore: None,
-            oversampling: None,
-        }
     }
 }
 

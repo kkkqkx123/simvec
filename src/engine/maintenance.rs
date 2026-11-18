@@ -1,22 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
 
-use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
 use super::*;
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
-use crate::error::{Result, VectorSearchError};
+use super::{LocalVectorEngine, MaintenanceJob};
+use crate::error::Result;
 use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord};
-use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
-};
+use crate::storage::CollectionStore;
+use crate::types::IndexConfig;
 
 impl LocalVectorEngine {
     /// Build and publish the IVF index of a collection synchronously.

@@ -1,23 +1,11 @@
-use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
 
-use bitvec::prelude::*;
-use memmap2::Mmap;
 use rayon::prelude::*;
 
-use super::super::directory::DirView;
-use super::super::index_lifecycle::PublishedIndex;
 use super::super::keys::Keys;
-use super::super::quant::QuantStore;
 use super::super::vectors::Vectors;
-use super::super::{CollectionStore, PayloadStore, TombstoneBits};
+use super::super::CollectionStore;
 use crate::error::{Result, VectorSearchError};
-use crate::index::hnsw::HnswSearchContext;
-use crate::index::IvfSearchContext;
-use crate::index::{HnswIndex, IvfIndex};
-use crate::metrics::{SearchPath, SearchRetry};
 use crate::types::{PointId, SearchQuery, SearchResult};
 
 use super::{ScoredSlot, SearchSnapshot};

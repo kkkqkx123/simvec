@@ -1,32 +1,15 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::path::Path;
+use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use bitvec::prelude::*;
-use parking_lot::{Mutex, RwLock};
-
-use super::filter_bitmap::FilterBitmap;
-use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
 use super::meta::Meta;
-use super::payload_index::PayloadIndexManager;
-use super::payload_store::PayloadStore;
-use super::payloads::Payloads;
-use super::quant::QuantStore;
-use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
-use super::tombstones::TombstoneBits;
 use super::vectors::Vectors;
-use super::{assert_not_applying, is_commit_worker, set_applying, set_commit_worker};
-use super::{CollectionStore, StoreInner};
+use super::CollectionStore;
 use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
-    VectorPoint,
-};
+use crate::types::{PointId, VectorPoint};
 
 use super::*;
 

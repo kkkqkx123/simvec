@@ -1,22 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
+use std::path::Path;
 
-use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
-
-use super::*;
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
+use super::LocalVectorEngine;
 use crate::error::{Result, VectorSearchError};
-use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord};
-use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
-};
+use crate::storage::CollectionStore;
 
 impl LocalVectorEngine {
     /// Atomically promote a temp rebuild collection over its live collection.

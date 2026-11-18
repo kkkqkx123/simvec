@@ -683,7 +683,11 @@ impl StorageConfig {
                 "payload_block_size must be >= 1".to_string(),
             ));
         }
-        if self.payload_page_size == 0 || self.payload_page_size % self.payload_block_size != 0 {
+        if self.payload_page_size == 0
+            || !self
+                .payload_page_size
+                .is_multiple_of(self.payload_block_size)
+        {
             return Err(VectorSearchError::InvalidConfig(
                 "payload_page_size must be a positive multiple of payload_block_size".to_string(),
             ));

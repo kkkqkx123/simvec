@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::{Result, VectorSearchError};
 use crate::types::{CollectionConfig, DistanceMetric, VectorPoint};
 
 fn config(dim: usize) -> CollectionConfig {

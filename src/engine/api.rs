@@ -1,17 +1,10 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
-use super::*;
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
-use crate::error::{EngineResult, Result, VectorEngineError, VectorSearchError};
-use crate::metrics::MetricsSnapshot;
-use crate::storage::CollectionStore;
+use super::LocalVectorEngine;
+use crate::error::{EngineResult, VectorEngineError, VectorSearchError};
 use crate::types::{
-    CollectionConfig, CollectionInfo, HealthStatus, IndexMetadata, Payload, PayloadSchemaType,
-    PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
+    CollectionConfig, HealthStatus, IndexMetadata, Payload, PayloadSchemaType, PointId,
+    SearchQuery, SearchResult, VectorFilter, VectorPoint,
 };
 
 // ---------------------------------------------------------------------------

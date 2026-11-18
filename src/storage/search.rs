@@ -9,26 +9,19 @@
 //! therefore path-independent.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bitvec::prelude::*;
-use memmap2::Mmap;
 use rayon::prelude::*;
 
 use super::directory::DirView;
 use super::index_lifecycle::PublishedIndex;
-use super::keys::Keys;
-use super::quant::QuantStore;
-use super::vectors::Vectors;
 use super::{CollectionStore, PayloadStore, TombstoneBits};
 use crate::error::{Result, VectorSearchError};
-use crate::index::hnsw::HnswSearchContext;
-use crate::index::IvfSearchContext;
-use crate::index::{HnswIndex, IvfIndex};
-use crate::metrics::{SearchPath, SearchRetry};
-use crate::types::{PointId, SearchQuery, SearchResult};
+use crate::metrics::SearchPath;
+use crate::types::{SearchQuery, SearchResult};
 
 mod ann;
 mod exact;

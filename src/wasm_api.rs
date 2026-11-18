@@ -102,6 +102,12 @@ pub struct WasmEngine {
     inner: MemoryEngine,
 }
 
+impl Default for WasmEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl WasmEngine {
     /// Create an empty engine with no collections.

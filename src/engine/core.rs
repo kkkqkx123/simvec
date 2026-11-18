@@ -1,23 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self};
 use std::sync::Arc;
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
+use std::thread::Builder as ThreadBuilder;
 
-use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
 use super::maintenance::maintenance_loop;
-use super::*;
-use super::{LocalVectorEngine, MaintenanceJob, TxnOp};
+use super::{LocalVectorEngine, MaintenanceJob};
 use crate::error::{Result, VectorSearchError};
-use crate::metrics::MetricsSnapshot;
-use crate::storage::{CollectionStore, WalPoint, WalRecord};
+use crate::storage::CollectionStore;
 use crate::types::{
-    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, IvfConfig,
-    Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, StorageConfig, VectorFilter,
-    VectorPoint,
+    CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, StorageConfig,
 };
 
 impl LocalVectorEngine {

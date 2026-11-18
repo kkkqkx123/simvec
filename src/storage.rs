@@ -49,13 +49,12 @@ mod store_read;
 mod store_write;
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
-use bitvec::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
 pub(crate) use meta::Meta;
@@ -69,15 +68,11 @@ use self::index_lifecycle::PublishedIndex;
 use self::keys::Keys;
 use self::payloads::Payloads;
 use self::quant::QuantStore;
-use self::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
+use self::queue::CommitQueue;
 use self::vectors::Vectors;
 
-use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, IvfConfig, Payload, PointId, QuantizationConfig,
-    StorageConfig, VectorPoint,
-};
+use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 
 // Storage tuning (WAL checkpoint size, compaction threshold, meta save
 // interval, payload page geometry) lives in `types::StorageConfig` and is

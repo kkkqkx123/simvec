@@ -406,7 +406,7 @@ impl MemoryEngine {
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         self.with_collection(collection, |c| {
             let mut ids: Vec<&PointId> = c.points.keys().collect();
-            ids.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            ids.sort_by_key(|a| a.to_string());
             let mut skipping = offset.is_some();
             let mut results = Vec::new();
             let mut last: Option<PointId> = None;
@@ -455,7 +455,7 @@ impl MemoryEngine {
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         self.with_collection(collection, |c| {
             let mut ids: Vec<&PointId> = c.points.keys().collect();
-            ids.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            ids.sort_by_key(|a| a.to_string());
             let mut skipping = offset.is_some();
             let mut results = Vec::new();
             let mut last: Option<PointId> = None;
@@ -648,7 +648,7 @@ impl MemoryEngine {
         let mut collections: Vec<MemorySnapshotCollection> = Vec::with_capacity(guard.len());
         for (name, collection) in guard.iter() {
             let mut points: Vec<VectorPoint> = collection.points.values().cloned().collect();
-            points.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+            points.sort_by_key(|a| a.id.to_string());
             collections.push(MemorySnapshotCollection {
                 name: name.clone(),
                 config: collection.config.clone(),
@@ -667,7 +667,7 @@ impl MemoryEngine {
     pub fn export_collection(&self, name: &str) -> Result<MemorySnapshotCollection> {
         self.with_collection(name, |c| {
             let mut points: Vec<VectorPoint> = c.points.values().cloned().collect();
-            points.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+            points.sort_by_key(|a| a.id.to_string());
             Ok(MemorySnapshotCollection {
                 name: name.to_string(),
                 config: c.config.clone(),

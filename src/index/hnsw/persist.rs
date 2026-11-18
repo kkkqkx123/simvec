@@ -1,17 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-
-use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
 use crate::index::persist::{PersistedHnsw, PersistedNodeRecord};
-use crate::index::IndexBuildParams;
-use crate::metrics::{timed_write_lock, Metrics};
-use crate::storage::vectors::Vectors;
-use crate::storage::TombstoneBits;
-use crate::types::{DistanceMetric, HnswConfig};
-
-use bitvec::prelude::*;
+use crate::types::HnswConfig;
 
 use super::*;
 

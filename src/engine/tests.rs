@@ -1,5 +1,9 @@
 use super::*;
-use crate::types::{DistanceMetric, FilterCondition, Payload, VectorFilter};
+use crate::error::VectorSearchError;
+use crate::types::{
+    CollectionConfig, CollectionStatus, DistanceMetric, FilterCondition, Payload, SearchQuery,
+    VectorFilter,
+};
 
 pub(super) fn config(dim: usize) -> CollectionConfig {
     CollectionConfig::new(dim, DistanceMetric::Cosine)
