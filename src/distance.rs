@@ -3,7 +3,7 @@
 //! The local engine ranks by an internal *distance* (smaller is nearer) and
 //! converts it to a *similarity* score for output. That score is the
 //! crate-wide contract: higher is better, and `score_threshold` is a lower
-//! bound on it. 
+//! bound on it.
 //!
 //! | metric    | internal distance          | output score        |
 //! |-----------|----------------------------|---------------------|
