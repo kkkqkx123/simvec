@@ -117,6 +117,7 @@ impl CollectionStore {
         Ok(Some(VectorPoint {
             id: id.clone(),
             vector,
+            data: None,
             payload,
         }))
     }
@@ -198,6 +199,7 @@ impl CollectionStore {
             results.push(VectorPoint {
                 id,
                 vector: vector.unwrap_or_default(),
+                data: None,
                 payload,
             });
             if results.len() >= limit {
@@ -269,6 +271,7 @@ impl CollectionStore {
             results.push(VectorPoint {
                 id,
                 vector: vector.unwrap_or_default(),
+                data: None,
                 payload,
             });
             if results.len() >= limit {

@@ -34,6 +34,12 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
     /// Human-readable engine name (used for logging and health checks).
     fn name(&self) -> &str;
 
+    /// Vector kinds this engine can serve. Must agree with what
+    /// `create_collection` accepts, so hosts can gate feature flags on it.
+    fn supported_kinds(&self) -> Vec<crate::types::VectorKind> {
+        vec![crate::types::VectorKind::Dense]
+    }
+
     /// Engine version string.
     fn version(&self) -> &str;
 
@@ -263,6 +269,14 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
 impl VectorEngine for LocalVectorEngine {
     fn name(&self) -> &str {
         "simvec"
+    }
+
+    fn supported_kinds(&self) -> Vec<crate::types::VectorKind> {
+        vec![
+            crate::types::VectorKind::Dense,
+            crate::types::VectorKind::Sparse,
+            crate::types::VectorKind::Multi,
+        ]
     }
 
     fn version(&self) -> &str {

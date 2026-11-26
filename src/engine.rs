@@ -86,6 +86,10 @@ pub use self::api::VectorEngine;
 pub struct LocalVectorEngine {
     root_dir: PathBuf,
     collections: Arc<RwLock<HashMap<String, Arc<CollectionStore>>>>,
+    /// Sparse / Multi kind collections, served by the exact-scan kind store
+    /// instead of the dense HNSW/IVF pipeline. Keyed by collection name; a
+    /// name lives in at most one of the two maps.
+    kind_collections: Arc<RwLock<HashMap<String, Arc<crate::kind_store::KindStore>>>>,
     /// Engine-level storage tuning applied to every collection this engine
     /// opens or creates.
     storage: StorageConfig,

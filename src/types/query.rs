@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::filter_cond::{PayloadSelector, PointId, VectorFilter};
+use crate::types::point::VectorData;
 
 use super::point::Payload;
 
@@ -56,6 +57,11 @@ impl QuantizationSearchParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub vector: Vec<f32>,
+    /// Non-dense query payload for Sparse/Multi collections. Exactly one of
+    /// `vector` and `data` must be set, and the shape must match the
+    /// collection kind.
+    #[serde(default)]
+    pub data: Option<VectorData>,
     pub limit: usize,
     pub offset: Option<usize>,
     /// Similarity lower bound: results with `score >= score_threshold` are
@@ -82,6 +88,7 @@ impl SearchQuery {
     pub fn new(vector: Vec<f32>, limit: usize) -> Self {
         Self {
             vector,
+            data: None,
             limit,
             offset: None,
             score_threshold: None,
@@ -98,6 +105,24 @@ impl SearchQuery {
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
         self
+    }
+
+    /// Build a non-dense query (Sparse or Multi collections).
+    pub fn with_data(data: VectorData, limit: usize) -> Self {
+        Self {
+            vector: Vec::new(),
+            data: Some(data),
+            limit,
+            offset: None,
+            score_threshold: None,
+            filter: None,
+            with_payload: Some(true),
+            with_vector: None,
+            nprobe: None,
+            search_mode: None,
+            payload_selector: None,
+            quantization: None,
+        }
     }
 
     pub fn with_score_threshold(mut self, threshold: f32) -> Self {

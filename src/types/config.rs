@@ -426,6 +426,45 @@ impl IvfConfig {
     }
 }
 
+/// Collection-level vector kind. `Dense` is the historical default; `Sparse`
+/// and `Multi` collections are served by the exact-scan kind store
+/// (`crate::kind_store`) instead of the dense HNSW/IVF pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VectorKind {
+    /// Single dense embedding per point (default).
+    #[default]
+    Dense,
+    /// Sparse (index, weight) pairs scored with a weighted dot product.
+    Sparse,
+    /// A bounded sequence of dense vectors per point scored with MaxSim.
+    Multi,
+}
+
+impl VectorKind {
+    /// Human-readable name used in diagnostics and unsupported errors.
+    pub fn as_name(self) -> &'static str {
+        match self {
+            VectorKind::Dense => "dense",
+            VectorKind::Sparse => "sparse",
+            VectorKind::Multi => "multi",
+        }
+    }
+}
+
+/// Parameters for `VectorKind::Sparse` collections.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SparseConfig {
+    /// Vocabulary size bound: a sparse index must satisfy `index < vocab_size`.
+    pub vocab_size: usize,
+}
+
+/// Parameters for `VectorKind::Multi` collections.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MultiConfig {
+    /// Maximum number of sub-vectors stored per point.
+    pub max_vectors_per_point: usize,
+}
+
 /// Index tier selection for a collection.
 ///
 /// The three variants are mutually exclusive: selecting one tier resets
@@ -459,6 +498,18 @@ impl IndexConfig {
 pub struct CollectionConfig {
     pub vector_size: usize,
     pub distance: DistanceMetric,
+    /// Collection vector kind; defaults to `Dense` for configs created
+    /// before the field existed.
+    #[serde(default)]
+    pub kind: VectorKind,
+    /// Parameters for `VectorKind::Sparse` collections; must be set when
+    /// (and only when) `kind` is `Sparse`.
+    #[serde(default)]
+    pub sparse_config: Option<SparseConfig>,
+    /// Parameters for `VectorKind::Multi` collections; must be set when
+    /// (and only when) `kind` is `Multi`.
+    #[serde(default)]
+    pub multi_config: Option<MultiConfig>,
     pub index: IndexConfig,
     pub quantization_config: Option<QuantizationConfig>,
     pub replication_factor: Option<usize>,
@@ -488,6 +539,9 @@ impl CollectionConfig {
         Self {
             vector_size,
             distance,
+            kind: VectorKind::Dense,
+            sparse_config: None,
+            multi_config: None,
             index: IndexConfig::default(),
             quantization_config: None,
             replication_factor: None,
@@ -498,6 +552,99 @@ impl CollectionConfig {
             vectors_on_disk: None,
             storage_hints: None,
         }
+    }
+
+    /// Declare a `VectorKind::Sparse` collection.
+    pub fn with_sparse(vector_size: usize, distance: DistanceMetric, config: SparseConfig) -> Self {
+        Self {
+            kind: VectorKind::Sparse,
+            sparse_config: Some(config),
+            index: IndexConfig::Flat,
+            ..Self::new(vector_size, distance)
+        }
+    }
+
+    /// Declare a `VectorKind::Multi` collection.
+    pub fn with_multi(vector_size: usize, distance: DistanceMetric, config: MultiConfig) -> Self {
+        Self {
+            kind: VectorKind::Multi,
+            multi_config: Some(config),
+            index: IndexConfig::Flat,
+            ..Self::new(vector_size, distance)
+        }
+    }
+
+    /// Validate the kind-specific parameter combinations. Dense collections
+    /// must not carry kind parameters; Sparse/Multi collections must carry
+    /// exactly their own parameters and may not select an ANN tier or
+    /// quantization (both operate on fixed-length dense vectors only).
+    pub fn validate_kind(&self) -> Result<()> {
+        match self.kind {
+            VectorKind::Dense => {
+                if self.sparse_config.is_some() || self.multi_config.is_some() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "dense collections must not declare sparse/multi parameters".to_string(),
+                    ));
+                }
+            }
+            VectorKind::Sparse => {
+                if self.sparse_config.is_none() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "sparse collections must declare sparse parameters".to_string(),
+                    ));
+                }
+                if self.multi_config.is_some() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "sparse collections must not declare multi parameters".to_string(),
+                    ));
+                }
+                if self.vector_size == 0 {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "sparse vocab_size must be >= 1".to_string(),
+                    ));
+                }
+            }
+            VectorKind::Multi => {
+                if self.multi_config.is_none() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi collections must declare multi parameters".to_string(),
+                    ));
+                }
+                if self.sparse_config.is_some() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi collections must not declare sparse parameters".to_string(),
+                    ));
+                }
+                if self.vector_size == 0 {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi sub-vector dimension must be >= 1".to_string(),
+                    ));
+                }
+                if self
+                    .multi_config
+                    .is_some_and(|c| c.max_vectors_per_point == 0)
+                {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi max_vectors_per_point must be >= 1".to_string(),
+                    ));
+                }
+            }
+        }
+        if self.kind != VectorKind::Dense {
+            if !matches!(self.index, IndexConfig::Flat) {
+                return Err(VectorSearchError::InvalidConfig(format!(
+                    "{} collections do not support ANN indexes; use IndexConfig::Flat",
+                    self.kind.as_name()
+                )));
+            }
+            if self.quantization_config.is_some() {
+                return Err(VectorSearchError::InvalidConfig(format!(
+                    "{} collections do not support quantization",
+                    self.kind.as_name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn with_ivf(mut self, ivf_config: IvfConfig) -> Self {

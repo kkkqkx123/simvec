@@ -80,6 +80,7 @@ impl WalPoint {
         Ok(VectorPoint {
             id: PointId::from(self.id.clone()),
             vector: self.vector.clone(),
+            data: None,
             payload,
         })
     }
@@ -130,6 +131,16 @@ pub enum WalRecord {
         slot: u32,
         key: String,
         value: String,
+    },
+    /// Upsert a non-dense point (Sparse / Multi kind collections). Kept at
+    /// the end of the enum so postcard's variant indices for the historical
+    /// dense records stay stable. Only replayed by kind stores; the dense
+    /// store rejects it.
+    UpsertKind {
+        id: String,
+        data: crate::types::VectorData,
+        /// JSON-encoded payload.
+        payload: Option<String>,
     },
 }
 

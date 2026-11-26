@@ -10,6 +10,9 @@ use crate::types::{
 impl LocalVectorEngine {
     /// Upsert a point (WAL-backed).
     pub fn upsert(&self, collection: &str, point: VectorPoint) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.upsert_batch(std::slice::from_ref(&point));
+        }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::Upsert {
             point: WalPoint::from_point(&point)?,
@@ -24,6 +27,9 @@ impl LocalVectorEngine {
 
     /// Upsert a batch of points (WAL-backed, single transaction).
     pub fn upsert_batch(&self, collection: &str, points: &[VectorPoint]) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.upsert_batch(points);
+        }
         let store = self.store(collection)?;
         let ops: Result<Vec<_>> = points
             .iter()
@@ -51,6 +57,9 @@ impl LocalVectorEngine {
 
     /// Delete a point by id (WAL-backed). Deleting a missing id is a no-op.
     pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.delete(point_id);
+        }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::Delete {
             point_id: point_id.to_string(),
@@ -65,6 +74,9 @@ impl LocalVectorEngine {
 
     /// Delete a batch of points (WAL-backed, single transaction).
     pub fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.delete_batch(point_ids);
+        }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::DeleteBatch {
             point_ids: point_ids.iter().map(|id| id.to_string()).collect(),
@@ -79,6 +91,9 @@ impl LocalVectorEngine {
 
     /// Delete every point matching `filter`. Returns the number deleted.
     pub fn delete_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.delete_by_filter(filter);
+        }
         let store = self.store(collection)?;
         let deleted = match store.delete_by_filter(filter) {
             Ok(deleted) => deleted,
@@ -98,6 +113,9 @@ impl LocalVectorEngine {
     /// Remote Qdrant engines normalize their raw Euclid distances to the
     /// same contract at the client boundary.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.search(query);
+        }
         let store = self.store(collection)?;
         let results = store.search(query);
         if results.is_err() {
@@ -108,17 +126,26 @@ impl LocalVectorEngine {
 
     /// Fetch a point by id.
     pub fn get(&self, collection: &str, point_id: &PointId) -> Result<Option<VectorPoint>> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.get(point_id);
+        }
         let store = self.store(collection)?;
         store.get(point_id)
     }
 
     /// Number of live points in a collection.
     pub fn count(&self, collection: &str) -> Result<u64> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return Ok(kind.count());
+        }
         Ok(self.store(collection)?.count())
     }
 
     /// Number of live points matching `filter`. Pure read.
     pub fn count_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.count_by_filter(filter);
+        }
         self.store(collection)?.count_by_filter(filter)
     }
 
@@ -130,6 +157,9 @@ impl LocalVectorEngine {
         point_id: &PointId,
         payload: Payload,
     ) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.set_payload(point_id, payload);
+        }
         let store = self.store(collection)?;
         store.set_payload(point_id, payload)
     }
@@ -142,6 +172,9 @@ impl LocalVectorEngine {
         point_id: &PointId,
         keys: Vec<String>,
     ) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.delete_payload_keys(point_id, &keys);
+        }
         let store = self.store(collection)?;
         store.delete_payload_keys(point_id, keys)
     }
@@ -168,6 +201,9 @@ impl LocalVectorEngine {
         point_id: &PointId,
         fields: Payload,
     ) -> Result<()> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.set_payload_fields(point_id, fields);
+        }
         let store = self.store(collection)?;
         store.set_payload_fields(point_id, fields)
     }
@@ -208,6 +244,9 @@ impl LocalVectorEngine {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.scroll(limit, offset, with_payload, with_vector);
+        }
         let store = self.store(collection)?;
         store.scroll(limit, offset, with_payload, with_vector)
     }
@@ -224,6 +263,9 @@ impl LocalVectorEngine {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.scroll_by_filter(filter, limit, offset, with_payload, with_vector);
+        }
         let store = self.store(collection)?;
         store.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
     }
@@ -246,12 +288,21 @@ impl LocalVectorEngine {
         let mut by_collection: HashMap<String, Vec<WalRecord>> = HashMap::new();
         for op in ops {
             match op {
-                TxnOp::Upsert { collection, point } => by_collection
-                    .entry(collection)
-                    .or_default()
-                    .push(WalRecord::Upsert {
-                        point: WalPoint::from_point(&point)?,
-                    }),
+                TxnOp::Upsert { collection, point } => {
+                    if self.kind_store(&collection)?.is_some() {
+                        by_collection
+                            .entry(collection)
+                            .or_default()
+                            .push(kind_upsert_record(&point)?);
+                    } else {
+                        by_collection
+                            .entry(collection)
+                            .or_default()
+                            .push(WalRecord::Upsert {
+                                point: WalPoint::from_point(&point)?,
+                            });
+                    }
+                }
                 TxnOp::Delete {
                     collection,
                     point_id,
@@ -268,10 +319,19 @@ impl LocalVectorEngine {
         names.sort_unstable();
         for name in names {
             let ops = by_collection.remove(&name).expect("key present");
+            if let Some(kind) = self.kind_store(&name)? {
+                kind.apply_records(&ops)?;
+                continue;
+            }
             let store = self.store(&name)?;
             store.apply_txn(&ops)?;
             self.maybe_schedule_compaction(&name, &store);
         }
         Ok(())
     }
+}
+
+/// WAL record for a kind-collection upsert inside a coordinated transaction.
+fn kind_upsert_record(point: &VectorPoint) -> Result<WalRecord> {
+    crate::kind_store::kind_upsert_record(point)
 }

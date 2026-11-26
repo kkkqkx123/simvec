@@ -5,7 +5,7 @@ use super::queue::{CommitQueue, APPLY_WAIT_TIMEOUT};
 use super::WalRecord;
 use super::{CollectionStore, StoreInner};
 
-use crate::error::Result;
+use crate::error::{Result, VectorSearchError};
 use crate::types::{Payload, PointId, VectorPoint};
 
 use super::store_open::{count_ops, validate_admission_locked, validate_point};
@@ -173,6 +173,12 @@ impl CollectionStore {
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
                 WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
+                // Kind payloads never enter a dense collection's log.
+                WalRecord::UpsertKind { .. } => {
+                    return Err(VectorSearchError::CorruptData(
+                        "non-dense upsert record replayed in a dense collection".to_string(),
+                    ));
+                }
             }
         }
         Ok(())

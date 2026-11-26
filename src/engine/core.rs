@@ -40,33 +40,46 @@ impl LocalVectorEngine {
         );
 
         let mut collections = HashMap::new();
+        let mut kind_collections = HashMap::new();
         for entry in std::fs::read_dir(&root_dir)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("meta.bin").exists() {
+            if !path.join("meta.bin").exists() && !path.join("kind.bin").exists() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.contains(".rebuild-") || name.contains(".old-") || name.contains(".suspect-") {
                 continue;
             }
+            if path.join("kind.bin").exists() {
+                let store = crate::kind_store::KindStore::open(&path, &storage)?;
+                kind_collections.insert(name, store);
+                continue;
+            }
             let store = CollectionStore::open_with_storage(&path, &storage)?;
             collections.insert(name, store);
         }
 
-        Ok(Self::assemble(root_dir, collections, storage))
+        Ok(Self::assemble(
+            root_dir,
+            collections,
+            kind_collections,
+            storage,
+        ))
     }
 
     pub(super) fn assemble(
         root_dir: PathBuf,
         collections: HashMap<String, Arc<CollectionStore>>,
+        kind_collections: HashMap<String, Arc<crate::kind_store::KindStore>>,
         storage: StorageConfig,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<MaintenanceJob>();
         let collections = Arc::new(RwLock::new(collections));
+        let kind_collections = Arc::new(RwLock::new(kind_collections));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
 
         let worker_collections = Arc::clone(&collections);
@@ -82,6 +95,7 @@ impl LocalVectorEngine {
         Self {
             root_dir,
             collections,
+            kind_collections,
             storage,
             default_ivf: RwLock::new(None),
             default_hnsw: RwLock::new(None),
@@ -102,16 +116,15 @@ impl LocalVectorEngine {
     /// (`.suspect-*`) handles are tracked separately and never appear here,
     /// so metrics and maintenance sweeps only see serving data.
     pub fn collection_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .collections
-            .read()
-            .keys()
+        let mut names: std::collections::HashSet<String> = self.collections.read().keys().cloned().collect();
+        names.extend(self.kind_collections.read().keys().cloned());
+        let mut names: Vec<String> = names
+            .into_iter()
             .filter(|name| {
                 !name.contains(".rebuild-")
                     && !name.contains(".old-")
                     && !name.contains(".suspect-")
             })
-            .cloned()
             .collect();
         names.sort_unstable();
         names
@@ -146,6 +159,19 @@ impl LocalVectorEngine {
             }
         }
         let dir = self.root_dir.join(name);
+        if effective.kind != crate::types::VectorKind::Dense {
+            // Kind collections never use ANN tiers or quantization; coerce
+            // the default dense knobs instead of rejecting configs built
+            // with the default `CollectionConfig::new`.
+            effective.index = IndexConfig::Flat;
+            effective.quantization_config = None;
+            let store =
+                crate::kind_store::KindStore::create(&dir, name, &effective, &self.storage)?;
+            self.kind_collections
+                .write()
+                .insert(name.to_string(), store);
+            return Ok(());
+        }
         let store = CollectionStore::create_with_storage(&dir, name, &effective, &self.storage)?;
         self.collections.write().insert(name.to_string(), store);
         Ok(())
@@ -166,10 +192,13 @@ impl LocalVectorEngine {
     pub fn delete_collection(&self, name: &str) -> Result<()> {
         let dir = {
             let mut collections = self.collections.write();
-            collections
-                .remove(name)
-                .map(|store| store.dir().to_path_buf())
-                .unwrap_or_else(|| self.root_dir.join(name))
+            if let Some(store) = collections.remove(name) {
+                store.dir().to_path_buf()
+            } else if let Some(store) = self.kind_collections.write().remove(name) {
+                store.dir().to_path_buf()
+            } else {
+                self.root_dir.join(name)
+            }
         };
         if !dir.exists() {
             return Err(VectorSearchError::CollectionNotFound(name.to_string()));
@@ -229,6 +258,16 @@ impl LocalVectorEngine {
     /// Whether a collection exists.
     pub fn collection_exists(&self, name: &str) -> bool {
         self.collections.read().contains_key(name)
+            || self.kind_collections.read().contains_key(name)
+    }
+
+    /// The kind store behind `collection`, when it is a Sparse/Multi
+    /// collection.
+    pub fn kind_store(
+        &self,
+        collection: &str,
+    ) -> Result<Option<Arc<crate::kind_store::KindStore>>> {
+        Ok(self.kind_collections.read().get(collection).cloned())
     }
 
     /// Collection configuration, or `None` if the collection does not exist.
@@ -237,6 +276,25 @@ impl LocalVectorEngine {
     /// ANN configurations are read back from the persisted metadata; remote-only
     /// replication fields are still excluded.
     pub fn collection_config(&self, name: &str) -> Result<Option<CollectionConfig>> {
+        if let Some(store) = self.kind_store(name)? {
+            let mut config = CollectionConfig::new(store.vector_size(), store.distance());
+            config.kind = store.kind();
+            match store.kind() {
+                crate::types::VectorKind::Sparse => {
+                    config.sparse_config = Some(crate::types::SparseConfig {
+                        vocab_size: store.vector_size(),
+                    });
+                }
+                crate::types::VectorKind::Multi => {
+                    config.multi_config = Some(crate::types::MultiConfig {
+                        max_vectors_per_point: store.max_vectors_per_point(),
+                    });
+                }
+                crate::types::VectorKind::Dense => {}
+            }
+            config.index = IndexConfig::Flat;
+            return Ok(Some(config));
+        }
         let collections = self.collections.read();
         Ok(collections.get(name).map(|store| {
             let meta = store.meta();
@@ -252,6 +310,23 @@ impl LocalVectorEngine {
 
     /// Detailed collection info.
     pub fn collection_info(&self, name: &str) -> Result<CollectionInfo> {
+        if let Some(store) = self.kind_store(name)? {
+            let live = store.count();
+            let mut config = CollectionConfig::new(store.vector_size(), store.distance());
+            config.kind = store.kind();
+            config.index = IndexConfig::Flat;
+            return Ok(CollectionInfo {
+                name: name.to_string(),
+                vector_count: live,
+                indexed_vector_count: live,
+                points_count: live,
+                segments_count: 0,
+                config,
+                status: CollectionStatus::Green,
+                index: None,
+                memory_bytes: 0,
+            });
+        }
         let collections = self.collections.read();
         let store = collections
             .get(name)
