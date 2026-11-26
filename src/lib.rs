@@ -13,6 +13,8 @@ pub mod filter_cond;
 pub mod kind_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod index;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod named_store;
 #[cfg(feature = "wasm")]
 pub mod memory_engine;
 pub mod metrics;

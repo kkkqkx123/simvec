@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
@@ -465,6 +467,46 @@ pub struct MultiConfig {
     pub max_vectors_per_point: usize,
 }
 
+/// Parameters of one named vector space inside a named-vectors collection.
+///
+/// A named space is either dense or sparse; `Multi` is not a valid named
+/// space kind (see `VectorsConfig`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorSpaceConfig {
+    /// Space payload kind; must be `Dense` or `Sparse`.
+    pub kind: VectorKind,
+    /// Dense dimension for `Dense` spaces, vocabulary bound for `Sparse`.
+    pub vector_size: usize,
+    /// Distance metric scored within this space only.
+    pub distance: DistanceMetric,
+}
+
+/// Collection vector layout: a single space (the historical shape, keyed by
+/// `kind`/`vector_size`/`distance`) or a named map of spaces.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub enum VectorsConfig {
+    /// Single-space layout; the fields on `CollectionConfig` apply.
+    #[default]
+    Single,
+    /// Named layout: every point carries one vector per declared space and
+    /// every query targets one space by name. Spaces may mix dense and
+    /// sparse kinds; `Multi` is not allowed.
+    Named(BTreeMap<String, VectorSpaceConfig>),
+}
+
+impl CollectionConfig {
+    /// Declare a named-vectors collection. `vector_size`/`distance`/`kind`
+    /// on the returned config keep their default single-space values; they
+    /// are not interpreted for named layouts.
+    pub fn with_named(spaces: BTreeMap<String, VectorSpaceConfig>) -> Self {
+        Self {
+            vectors: VectorsConfig::Named(spaces),
+            index: IndexConfig::Flat,
+            ..Self::new(0, DistanceMetric::Cosine)
+        }
+    }
+}
+
 /// Index tier selection for a collection.
 ///
 /// The three variants are mutually exclusive: selecting one tier resets
@@ -502,6 +544,11 @@ pub struct CollectionConfig {
     /// before the field existed.
     #[serde(default)]
     pub kind: VectorKind,
+    /// Collection vector layout. `Single` (default) interprets the
+    /// `kind`/`vector_size`/`distance` fields above; `Named` carries its own
+    /// per-space parameters and ignores those fields.
+    #[serde(default)]
+    pub vectors: VectorsConfig,
     /// Parameters for `VectorKind::Sparse` collections; must be set when
     /// (and only when) `kind` is `Sparse`.
     #[serde(default)]
@@ -540,6 +587,7 @@ impl CollectionConfig {
             vector_size,
             distance,
             kind: VectorKind::Dense,
+            vectors: VectorsConfig::Single,
             sparse_config: None,
             multi_config: None,
             index: IndexConfig::default(),
@@ -642,6 +690,49 @@ impl CollectionConfig {
                     "{} collections do not support quantization",
                     self.kind.as_name()
                 )));
+            }
+        }
+        if matches!(self.vectors, VectorsConfig::Named(_)) {
+            if self.kind != VectorKind::Dense || self.sparse_config.is_some() || self.multi_config.is_some() {
+                return Err(VectorSearchError::InvalidConfig(
+                    "named-vectors collections must keep the default single-space kind fields"
+                        .to_string(),
+                ));
+            }
+            if !matches!(self.index, IndexConfig::Flat) {
+                return Err(VectorSearchError::InvalidConfig(
+                    "named-vectors collections do not support ANN indexes; use IndexConfig::Flat"
+                        .to_string(),
+                ));
+            }
+            if self.quantization_config.is_some() {
+                return Err(VectorSearchError::InvalidConfig(
+                    "named-vectors collections do not support quantization".to_string(),
+                ));
+            }
+            if let VectorsConfig::Named(spaces) = &self.vectors {
+                if spaces.is_empty() {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "named-vectors collections must declare at least one space".to_string(),
+                    ));
+                }
+                for (name, space) in spaces {
+                    if name.is_empty() {
+                        return Err(VectorSearchError::InvalidConfig(
+                            "named-vector space names must not be empty".to_string(),
+                        ));
+                    }
+                    if space.kind == VectorKind::Multi {
+                        return Err(VectorSearchError::InvalidConfig(format!(
+                            "named-vector space {name} must not use the multi kind"
+                        )));
+                    }
+                    if space.vector_size == 0 {
+                        return Err(VectorSearchError::InvalidConfig(format!(
+                            "named-vector space {name} vector_size must be >= 1"
+                        )));
+                    }
+                }
             }
         }
         Ok(())

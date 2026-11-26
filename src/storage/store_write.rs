@@ -173,8 +173,8 @@ impl CollectionStore {
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
                 WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
-                // Kind payloads never enter a dense collection's log.
-                WalRecord::UpsertKind { .. } => {
+                // Kind and named payloads never enter a dense collection's log.
+                WalRecord::UpsertKind { .. } | WalRecord::UpsertNamed { .. } => {
                     return Err(VectorSearchError::CorruptData(
                         "non-dense upsert record replayed in a dense collection".to_string(),
                     ));

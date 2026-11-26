@@ -427,6 +427,7 @@ pub(super) fn count_ops(ops: &[WalRecord]) -> (u64, u64) {
             | WalRecord::Quantize
             | WalRecord::DropCollection
             | WalRecord::UpsertKind { .. }
+            | WalRecord::UpsertNamed { .. }
             | WalRecord::SetPayload { .. }
             | WalRecord::DeletePayloadKeys { .. }
             | WalRecord::SetPayloadField { .. } => {}

@@ -90,6 +90,10 @@ pub struct LocalVectorEngine {
     /// instead of the dense HNSW/IVF pipeline. Keyed by collection name; a
     /// name lives in at most one of the two maps.
     kind_collections: Arc<RwLock<HashMap<String, Arc<crate::kind_store::KindStore>>>>,
+    /// Named-vectors collections, served by the exact-scan named store.
+    /// Keyed by collection name; a name lives in at most one of the three
+    /// maps.
+    named_collections: Arc<RwLock<HashMap<String, Arc<crate::named_store::NamedStore>>>>,
     /// Engine-level storage tuning applied to every collection this engine
     /// opens or creates.
     storage: StorageConfig,

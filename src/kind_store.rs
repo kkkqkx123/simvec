@@ -21,7 +21,7 @@
 #[path = "kind_store_tests.rs"]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -209,7 +209,8 @@ impl KindStore {
                     }
                 }
                 WalRecord::Compact => {}
-                WalRecord::Upsert { .. } | WalRecord::Quantize | WalRecord::DropCollection => {
+                WalRecord::Upsert { .. } | WalRecord::UpsertNamed { .. } | WalRecord::Quantize
+                | WalRecord::DropCollection => {
                     return Err(VectorSearchError::CorruptData(format!(
                         "unexpected WAL record in kind collection {}",
                         self.dir.display()
@@ -454,7 +455,8 @@ impl KindStore {
                         payload.insert(key, value);
                     }
                 }
-                WalRecord::Upsert { .. } | WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {
+                WalRecord::Upsert { .. } | WalRecord::UpsertNamed { .. } | WalRecord::Compact
+                | WalRecord::Quantize | WalRecord::DropCollection => {
                     return Err(VectorSearchError::Internal(
                         "kind store commit received an unsupported record".to_string(),
                     ));
@@ -567,6 +569,7 @@ impl KindStore {
                 id: point.id.clone(),
                 vector: Vec::new(),
                 data: Some(point.data.clone()),
+                named: BTreeMap::new(),
                 payload: point.payload.clone(),
             }))
     }
@@ -636,6 +639,7 @@ impl KindStore {
                 id: point.id.clone(),
                 vector: Vec::new(),
                 data: with_vector.then(|| point.data.clone()),
+                named: BTreeMap::new(),
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -680,6 +684,7 @@ impl KindStore {
                 id: point.id.clone(),
                 vector: Vec::new(),
                 data: with_vector.then(|| point.data.clone()),
+                named: BTreeMap::new(),
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -752,7 +757,7 @@ fn score_pair(query: &VectorData, stored: &VectorData, metric: crate::types::Dis
 /// Cosine/Dot accumulate the weighted dot product over shared terms;
 /// Euclid/Manhattan accumulate squared/absolute gaps over the union and
 /// normalize to the higher-is-better contract.
-fn sparse_score(
+pub(crate) fn sparse_score(
     q_idx: &[u32],
     q_val: &[f32],
     d_idx: &[u32],

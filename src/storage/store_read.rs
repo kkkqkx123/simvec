@@ -118,6 +118,7 @@ impl CollectionStore {
             id: id.clone(),
             vector,
             data: None,
+            named: Default::default(),
             payload,
         }))
     }
@@ -200,6 +201,7 @@ impl CollectionStore {
                 id,
                 vector: vector.unwrap_or_default(),
                 data: None,
+                named: Default::default(),
                 payload,
             });
             if results.len() >= limit {
@@ -272,6 +274,7 @@ impl CollectionStore {
                 id,
                 vector: vector.unwrap_or_default(),
                 data: None,
+                named: Default::default(),
                 payload,
             });
             if results.len() >= limit {

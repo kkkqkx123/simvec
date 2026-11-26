@@ -478,6 +478,8 @@ impl MemoryEngine {
                         } else {
                             Vec::new()
                         },
+                        data: None,
+                        named: Default::default(),
                         payload: if with_payload.unwrap_or(true) {
                             point.payload.clone()
                         } else {

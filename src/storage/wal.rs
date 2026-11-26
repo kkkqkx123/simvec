@@ -19,6 +19,7 @@
 //! replay silently and is treated as end of log; anything else malformed is
 //! reported as `CorruptData`.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -61,6 +62,11 @@ pub struct WalPoint {
 
 impl WalPoint {
     pub fn from_point(point: &VectorPoint) -> Result<Self> {
+        if !point.named.is_empty() {
+            return Err(VectorSearchError::InvalidConfig(
+                "dense WAL upserts must not carry named-space vectors".to_string(),
+            ));
+        }
         let payload = match &point.payload {
             Some(p) => Some(serde_json::to_string(p)?),
             None => None,
@@ -81,6 +87,7 @@ impl WalPoint {
             id: PointId::from(self.id.clone()),
             vector: self.vector.clone(),
             data: None,
+            named: BTreeMap::new(),
             payload,
         })
     }
@@ -139,6 +146,17 @@ pub enum WalRecord {
     UpsertKind {
         id: String,
         data: crate::types::VectorData,
+        /// JSON-encoded payload.
+        payload: Option<String>,
+    },
+    /// Upsert a named-vectors point (one vector per declared space). Kept at
+    /// the end of the enum so every historical variant index stays stable.
+    /// Only replayed by named stores.
+    UpsertNamed {
+        id: String,
+        /// One vector per named space; upserts replace the point's full
+        /// named map.
+        vectors: std::collections::BTreeMap<String, crate::types::VectorData>,
         /// JSON-encoded payload.
         payload: Option<String>,
     },

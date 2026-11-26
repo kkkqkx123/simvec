@@ -62,6 +62,13 @@ pub struct SearchQuery {
     /// collection kind.
     #[serde(default)]
     pub data: Option<VectorData>,
+    /// Target named-vector space for named-vectors collections. Must be set
+    /// together with `named_vector` exactly when the collection is named.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Query payload for the space named by `target`.
+    #[serde(default)]
+    pub named_vector: Option<VectorData>,
     pub limit: usize,
     pub offset: Option<usize>,
     /// Similarity lower bound: results with `score >= score_threshold` are
@@ -89,6 +96,8 @@ impl SearchQuery {
         Self {
             vector,
             data: None,
+            target: None,
+            named_vector: None,
             limit,
             offset: None,
             score_threshold: None,
@@ -112,6 +121,28 @@ impl SearchQuery {
         Self {
             vector: Vec::new(),
             data: Some(data),
+            target: None,
+            named_vector: None,
+            limit,
+            offset: None,
+            score_threshold: None,
+            filter: None,
+            with_payload: Some(true),
+            with_vector: None,
+            nprobe: None,
+            search_mode: None,
+            payload_selector: None,
+            quantization: None,
+        }
+    }
+
+    /// Build a named-vectors query targeting the space `name`.
+    pub fn with_named(name: impl Into<String>, data: VectorData, limit: usize) -> Self {
+        Self {
+            vector: Vec::new(),
+            data: None,
+            target: Some(name.into()),
+            named_vector: Some(data),
             limit,
             offset: None,
             score_threshold: None,

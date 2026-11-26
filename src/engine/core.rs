@@ -41,13 +41,17 @@ impl LocalVectorEngine {
 
         let mut collections = HashMap::new();
         let mut kind_collections = HashMap::new();
+        let mut named_collections = HashMap::new();
         for entry in std::fs::read_dir(&root_dir)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("meta.bin").exists() && !path.join("kind.bin").exists() {
+            if !path.join("meta.bin").exists()
+                && !path.join("kind.bin").exists()
+                && !path.join("named.bin").exists()
+            {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -59,6 +63,11 @@ impl LocalVectorEngine {
                 kind_collections.insert(name, store);
                 continue;
             }
+            if path.join("named.bin").exists() {
+                let store = crate::named_store::NamedStore::open(&path, &storage)?;
+                named_collections.insert(name, store);
+                continue;
+            }
             let store = CollectionStore::open_with_storage(&path, &storage)?;
             collections.insert(name, store);
         }
@@ -67,6 +76,7 @@ impl LocalVectorEngine {
             root_dir,
             collections,
             kind_collections,
+            named_collections,
             storage,
         ))
     }
@@ -75,11 +85,13 @@ impl LocalVectorEngine {
         root_dir: PathBuf,
         collections: HashMap<String, Arc<CollectionStore>>,
         kind_collections: HashMap<String, Arc<crate::kind_store::KindStore>>,
+        named_collections: HashMap<String, Arc<crate::named_store::NamedStore>>,
         storage: StorageConfig,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<MaintenanceJob>();
         let collections = Arc::new(RwLock::new(collections));
         let kind_collections = Arc::new(RwLock::new(kind_collections));
+        let named_collections = Arc::new(RwLock::new(named_collections));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
 
         let worker_collections = Arc::clone(&collections);
@@ -96,6 +108,7 @@ impl LocalVectorEngine {
             root_dir,
             collections,
             kind_collections,
+            named_collections,
             storage,
             default_ivf: RwLock::new(None),
             default_hnsw: RwLock::new(None),
@@ -159,6 +172,23 @@ impl LocalVectorEngine {
             }
         }
         let dir = self.root_dir.join(name);
+        if matches!(effective.vectors, crate::types::VectorsConfig::Named(_)) {
+            // Named collections never use ANN tiers or quantization; coerce
+            // the default dense knobs and keep the single-space fields at
+            // their defaults, which are not interpreted for named layouts.
+            effective.index = IndexConfig::Flat;
+            effective.quantization_config = None;
+            let spaces = match &effective.vectors {
+                crate::types::VectorsConfig::Named(spaces) => spaces.clone(),
+                _ => unreachable!("checked above"),
+            };
+            let store =
+                crate::named_store::NamedStore::create(&dir, name, &spaces, &self.storage)?;
+            self.named_collections
+                .write()
+                .insert(name.to_string(), store);
+            return Ok(());
+        }
         if effective.kind != crate::types::VectorKind::Dense {
             // Kind collections never use ANN tiers or quantization; coerce
             // the default dense knobs instead of rejecting configs built
@@ -195,6 +225,8 @@ impl LocalVectorEngine {
             if let Some(store) = collections.remove(name) {
                 store.dir().to_path_buf()
             } else if let Some(store) = self.kind_collections.write().remove(name) {
+                store.dir().to_path_buf()
+            } else if let Some(store) = self.named_collections.write().remove(name) {
                 store.dir().to_path_buf()
             } else {
                 self.root_dir.join(name)
@@ -259,6 +291,16 @@ impl LocalVectorEngine {
     pub fn collection_exists(&self, name: &str) -> bool {
         self.collections.read().contains_key(name)
             || self.kind_collections.read().contains_key(name)
+            || self.named_collections.read().contains_key(name)
+    }
+
+    /// The named store behind `collection`, when it is a named-vectors
+    /// collection.
+    pub fn named_store(
+        &self,
+        collection: &str,
+    ) -> Result<Option<Arc<crate::named_store::NamedStore>>> {
+        Ok(self.named_collections.read().get(collection).cloned())
     }
 
     /// The kind store behind `collection`, when it is a Sparse/Multi
@@ -276,6 +318,12 @@ impl LocalVectorEngine {
     /// ANN configurations are read back from the persisted metadata; remote-only
     /// replication fields are still excluded.
     pub fn collection_config(&self, name: &str) -> Result<Option<CollectionConfig>> {
+        if let Some(store) = self.named_store(name)? {
+            let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
+            config.vectors = crate::types::VectorsConfig::Named(store.spaces());
+            config.index = IndexConfig::Flat;
+            return Ok(Some(config));
+        }
         if let Some(store) = self.kind_store(name)? {
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());
             config.kind = store.kind();
@@ -310,6 +358,23 @@ impl LocalVectorEngine {
 
     /// Detailed collection info.
     pub fn collection_info(&self, name: &str) -> Result<CollectionInfo> {
+        if let Some(store) = self.named_store(name)? {
+            let live = store.count();
+            let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
+            config.vectors = crate::types::VectorsConfig::Named(store.spaces());
+            config.index = IndexConfig::Flat;
+            return Ok(CollectionInfo {
+                name: name.to_string(),
+                vector_count: live,
+                indexed_vector_count: live,
+                points_count: live,
+                segments_count: 0,
+                config,
+                status: CollectionStatus::Green,
+                index: None,
+                memory_bytes: 0,
+            });
+        }
         if let Some(store) = self.kind_store(name)? {
             let live = store.count();
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());

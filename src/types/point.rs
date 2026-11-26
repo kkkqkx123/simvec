@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +142,11 @@ pub struct VectorPoint {
     /// `vector` for Dense collections, `data` for Sparse/Multi collections.
     #[serde(default)]
     pub data: Option<VectorData>,
+    /// Named-space payload. Set only for named-vectors collections, where
+    /// exactly one of `vector`, `data` and `named` is non-empty. Each entry
+    /// is validated against the space of the same name.
+    #[serde(default)]
+    pub named: BTreeMap<String, VectorData>,
     pub payload: Option<Payload>,
 }
 
@@ -151,6 +156,7 @@ impl VectorPoint {
             id: id.into(),
             vector,
             data: None,
+            named: BTreeMap::new(),
             payload: None,
         }
     }
@@ -161,8 +167,29 @@ impl VectorPoint {
             id: id.into(),
             vector: Vec::new(),
             data: Some(data),
+            named: BTreeMap::new(),
             payload: None,
         }
+    }
+
+    /// Build a point carrying a single named-space vector. Additional spaces
+    /// can be appended through [`Self::with_named_vector`]; named-vectors
+    /// collections require every declared space to be present on upsert.
+    pub fn with_named(id: impl Into<PointId>, space: impl Into<String>, data: VectorData) -> Self {
+        Self {
+            id: id.into(),
+            vector: Vec::new(),
+            data: None,
+            named: BTreeMap::from([(space.into(), data)]),
+            payload: None,
+        }
+    }
+
+    /// Attach a vector for one named space, replacing any previous vector
+    /// for that space.
+    pub fn with_named_vector(mut self, space: impl Into<String>, data: VectorData) -> Self {
+        self.named.insert(space.into(), data);
+        self
     }
 
     /// The payload kind this point carries (`None` when both fields are empty).
