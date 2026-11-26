@@ -5,17 +5,13 @@ use std::sync::Arc;
 use super::*;
 use crate::error::VectorSearchError;
 use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SparseConfig, VectorKind,
-    VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SearchQuery, SparseConfig,
+    VectorKind, VectorPoint,
 };
 use crate::{LocalVectorEngine, VectorEngine};
 
 fn sparse_config() -> CollectionConfig {
-    CollectionConfig::with_sparse(
-        100,
-        DistanceMetric::Dot,
-        SparseConfig { vocab_size: 100 },
-    )
+    CollectionConfig::with_sparse(100, DistanceMetric::Dot, SparseConfig { vocab_size: 100 })
 }
 
 fn multi_config() -> CollectionConfig {

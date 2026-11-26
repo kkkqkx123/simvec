@@ -16,5 +16,4 @@ pub use crate::filter_cond::{
 };
 
 #[cfg(test)]
-#[path = "types/tests.rs"]
 mod tests;
