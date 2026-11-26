@@ -135,6 +135,48 @@ fn index_persists_across_restart() {
     assert_eq!(index.ef_search_default, 16);
 }
 
+/// A compaction renumbers the live slots; the published graph is remapped
+/// onto the new numbering and written back, so neither the running process nor
+/// a restart loses the ANN tier.
+#[test]
+fn compacted_index_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = engine_with_hnsw(&dir.path().join("vec"), 12);
+        assert!(engine.build_index("col").unwrap());
+        engine.delete("col", &PointId::from("p3")).unwrap();
+        engine.delete("col", &PointId::from("p20")).unwrap();
+
+        engine.compact_collection("col").unwrap();
+        assert!(
+            engine.has_index("col"),
+            "compaction must keep the graph published"
+        );
+        let info = engine.collection_info("col").unwrap();
+        assert_eq!(info.points_count, 22);
+        assert_eq!(info.index.unwrap().built_at_live_count, 22);
+    }
+
+    // The remapped graph was written back to hnsw.bin, so the reopen loads it
+    // instead of falling back to exact scan.
+    let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
+    assert!(reopened.has_index("col"), "remapped hnsw.bin must load");
+    assert_eq!(reopened.count("col").unwrap(), 22);
+
+    let hits = reopened
+        .search(
+            "col",
+            &SearchQuery::new(vec![50.0; DIM], 3).with_knn(3, Some(16)),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 3);
+    assert!(
+        hits.iter()
+            .all(|r| !matches!(r.id.to_string().as_str(), "p3" | "p20")),
+        "compacted-away points must stay absent"
+    );
+}
+
 #[test]
 fn incremental_inserts_stay_visible() {
     let dir = tempfile::tempdir().unwrap();
@@ -186,17 +228,34 @@ fn deleted_points_are_never_returned() {
         "tombstoned point must not be returned"
     );
 
-    // Compaction renumbers slots wholesale and flags a rebuild; the
-    // maintenance sweep must restore a published index afterwards.
+    // Compaction renumbers the live slots wholesale. The published graph is
+    // remapped onto the new numbering instead of being dropped, so the ANN
+    // tier survives without waiting for a rebuild — and the deleted point
+    // must stay absent, because its node was pruned from every adjacency list.
     engine.compact_collection("col").unwrap();
-    assert!(!engine.has_index("col"));
-    engine.run_maintenance_sweep();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !engine.has_index("col") && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        engine.run_maintenance_sweep();
-    }
-    assert!(engine.has_index("col"), "post-compaction rebuild ran");
+    assert!(
+        engine.has_index("col"),
+        "compaction must carry the published index across the renumbering"
+    );
+    let info = engine.collection_info("col").unwrap();
+    let index = info.index.expect("index info after compaction");
+    assert_eq!(index.index_kind, IndexKind::Hnsw);
+    assert_eq!(
+        index.built_at_live_count, info.points_count,
+        "every live point is still in the graph after the remap"
+    );
+
+    let hits = engine
+        .search(
+            "col",
+            &SearchQuery::new(vec![50.0; DIM], 12).with_knn(12, Some(32)),
+        )
+        .unwrap();
+    assert!(!hits.is_empty(), "remapped graph still answers");
+    assert!(
+        hits.iter().all(|r| r.id.to_string() != "p12"),
+        "the pruned point must not resurface after compaction"
+    );
 }
 
 #[test]

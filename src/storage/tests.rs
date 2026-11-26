@@ -427,15 +427,19 @@ fn test_create_existing_dir_conflicts() {
     assert!(matches!(err, VectorSearchError::CollectionAlreadyExists(_)));
 }
 
+/// `meta.bin` is the authority for capacity: a short `vectors.bin` is a crash
+/// artifact of the grow sequence, not a reason to make the collection
+/// permanently unopenable. The file is zero-extended and the WAL restores the
+/// slots it still covers.
 #[test]
-fn test_corrupt_vectors_length_rejected() {
+fn test_short_vectors_file_is_repaired_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_c");
     let store = CollectionStore::create(&store_dir, "col_c", &config(4)).unwrap();
     upsert_logged(&store, &point(1, 4));
+    let capacity = store.meta().slot_capacity;
     drop(store);
 
-    // Corrupt vectors.bin by truncating it.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(store_dir.join("vectors.bin"))
@@ -443,8 +447,38 @@ fn test_corrupt_vectors_length_rejected() {
     file.set_len(16).unwrap();
     drop(file);
 
-    let err = CollectionStore::open(&store_dir).unwrap_err();
-    assert!(matches!(err, VectorSearchError::CorruptData(_)));
+    let store = CollectionStore::open(&store_dir).expect("open must repair the length");
+    assert_eq!(store.meta().slot_capacity, capacity);
+    let len = std::fs::metadata(store_dir.join("vectors.bin"))
+        .unwrap()
+        .len();
+    assert_eq!(len, capacity * 4 * 4);
+    // The vector itself comes back from the WAL, which was still intact.
+    assert!(store.get(&PointId::from(1u64)).unwrap().is_some());
+}
+
+/// A `vectors.bin` longer than the declared capacity is the other half of the
+/// same crash window: the capacity from meta wins and the extra tail is
+/// ignored instead of blocking startup.
+#[test]
+fn test_oversized_vectors_file_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_c2");
+    let store = CollectionStore::create(&store_dir, "col_c2", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    let capacity = store.meta().slot_capacity;
+    drop(store);
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(store_dir.join("vectors.bin"))
+        .unwrap();
+    file.set_len(capacity * 4 * 4 + 4096).unwrap();
+    drop(file);
+
+    let store = CollectionStore::open(&store_dir).expect("open must tolerate the extra tail");
+    assert_eq!(store.meta().slot_capacity, capacity);
+    assert_eq!(store.count(), 1);
 }
 
 /// Pending slots accumulate while an HNSW graph is published, then the
@@ -596,4 +630,100 @@ fn test_max_points_cap_rejects_write_and_keeps_data() {
         .search(&SearchQuery::new(vec![3.0, 0.5], 4))
         .unwrap();
     assert_eq!(hits.len(), 4, "existing points must stay searchable");
+}
+
+/// The bulk of a checkpoint (payload pages, tracker, `keys.bin`,
+/// `vectors.bin`, tombstone table) must run *without* the store write lock:
+/// holding it across those fsyncs freezes readers as well as writers. Phase 2
+/// then takes the lock only for the water marks, which are microseconds.
+#[test]
+fn test_checkpoint_flush_runs_without_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_ckpt_lock");
+    let store = CollectionStore::create(&store_dir, "col_ckpt_lock", &config(4)).unwrap();
+    for id in 1..=8 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    let before = store.count();
+
+    let mut probed = false;
+    store
+        .checkpoint_with_probe(|| {
+            probed = true;
+            assert!(
+                store.write_lock_free(),
+                "phase 1 must not hold the store write lock"
+            );
+            // Reads keep working while the flush is in progress: this would
+            // deadlock if the write lock were held.
+            assert_eq!(store.count(), before);
+            assert_eq!(store.scroll(100, None, None, None).unwrap().0.len(), 8);
+        })
+        .unwrap();
+    assert!(probed, "the probe must run inside the checkpoint");
+
+    // The checkpoint is still a full one: the log is empty and the state
+    // reloads from the data files.
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 8);
+}
+
+#[test]
+fn test_id_map_handles_both_id_kinds() {
+    let mut map = IdMap::with_capacity(4);
+    let num = PointId::Num(7);
+    let uuid = PointId::Uuid("550e8400-e29b-41d4-a716-446655440000".to_string());
+
+    assert!(map.get(&num).is_none());
+    map.insert(&num, 3);
+    map.insert(&uuid, 4);
+    assert_eq!(map.get(&num), Some(3));
+    assert_eq!(map.get(&uuid), Some(4));
+    assert!(map.contains_key(&PointId::Num(7)));
+    assert_eq!(map.len(), 2);
+
+    // Numeric and string forms of the same id must not collide: `PointId`
+    // normalizes "7" to `Num(7)`, so a uuid key is a genuinely different id.
+    assert!(map.get(&PointId::from("7")).is_some());
+    assert!(map.get(&PointId::from("not-a-number")).is_none());
+
+    assert_eq!(map.insert(&num, 9), Some(3));
+    assert_eq!(map.get(&num), Some(9));
+    assert_eq!(map.remove(&num), Some(9));
+    assert_eq!(map.len(), 1);
+    map.clear();
+    assert_eq!(map.len(), 0);
+}
+
+/// A wide-vector collection must not pay for a 25 MiB first segment: the
+/// segment slot count is derived from the dimension, and `vectors.bin` starts
+/// out at the resulting size.
+#[test]
+fn test_wide_vectors_get_smaller_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_wide");
+    let store = CollectionStore::create(&store_dir, "col_wide", &config(768)).unwrap();
+    let meta = store.meta();
+    assert_eq!(meta.segment_slots, 1365);
+    // One segment, sized by the target rather than by a fixed slot count.
+    let expected = meta.slot_capacity * 768 * 4;
+    assert_eq!(
+        std::fs::metadata(store_dir.join("vectors.bin"))
+            .unwrap()
+            .len(),
+        expected
+    );
+    assert!(
+        expected <= 8 * 1024 * 1024,
+        "first segment is {expected} bytes"
+    );
+
+    // A narrow collection keeps the historical 8192-slot segment.
+    let narrow_dir = dir.path().join("col_narrow");
+    let narrow = CollectionStore::create(&narrow_dir, "col_narrow", &config(8)).unwrap();
+    assert_eq!(
+        narrow.meta().segment_slots,
+        super::meta::SEGMENT_SLOTS_DEFAULT
+    );
 }

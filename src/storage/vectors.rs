@@ -50,24 +50,43 @@ impl Vectors {
         })
     }
 
-    /// Open an existing file, validating that its length matches the declared
-    /// slot capacity.
+    /// Open an existing file, reconciling its length with the declared slot
+    /// capacity.
+    ///
+    /// `meta.bin` is the authority for capacity, and the two files cannot be
+    /// updated atomically: `ensure_capacity` fsyncs the grown `vectors.bin`
+    /// before `meta.bin` records the new capacity, so a crash in between
+    /// leaves the file *longer* than declared; a crash while meta is being
+    /// replaced can leave it the same or, after a failed truncate, shorter.
+    /// Both directions are recoverable here — extend with zeros when short,
+    /// ignore the tail when long — instead of making the collection
+    /// permanently unopenable.
     pub fn open(path: &Path, dim: usize, segment_slots: u32, slot_capacity: u64) -> Result<Self> {
         let file = File::options().read(true).write(true).open(path)?;
         let meta = file.metadata()?;
         let expected = slot_capacity as usize * dim * 4;
-        if meta.len() != expected as u64 {
-            return Err(VectorSearchError::CorruptData(format!(
-                "vectors.bin length {} does not match capacity {slot_capacity} * dim {dim} * 4",
-                meta.len()
-            )));
+        let actual = meta.len();
+        if actual < expected as u64 {
+            tracing::warn!(
+                actual,
+                expected,
+                "vectors.bin shorter than the capacity declared by meta; zero-extending"
+            );
+            file.set_len(expected as u64)?;
+            file.sync_all()?;
+        } else if actual > expected as u64 {
+            tracing::warn!(
+                actual,
+                expected,
+                "vectors.bin longer than the capacity declared by meta; ignoring the tail"
+            );
         }
 
         let segment_bytes = segment_bytes(dim, segment_slots);
         let mut segments = Vec::with_capacity(slot_capacity as usize + segment_slots as usize - 1);
         let mut offset = 0u64;
-        while offset < meta.len() {
-            let len = segment_bytes.min(meta.len() - offset);
+        while offset < expected as u64 {
+            let len = segment_bytes.min(expected as u64 - offset);
             segments.push(Arc::new(map_segment(&file, len, offset)?));
             offset += len;
         }

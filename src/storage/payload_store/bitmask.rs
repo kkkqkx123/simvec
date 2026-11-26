@@ -38,6 +38,10 @@ struct BitmaskInner {
     total_blocks: u64,
     block_size: u32,
     page_blocks: u32,
+    /// Next-fit cursor: the search for a free run starts here instead of at
+    /// block 0, which turns repeated `put` calls from a full-table scan per
+    /// allocation into an amortised forward pass.
+    next_fit: u64,
 }
 
 impl BitmaskInner {
@@ -63,29 +67,51 @@ impl BitmaskInner {
         }
     }
 
-    fn find_free_range(&self, count: u32) -> Option<(u32, u32)> {
-        if count == 0 || self.total_blocks == 0 {
+    /// Find a free run of `count` blocks that lies **entirely inside one page**.
+    ///
+    /// A pointer is `(page_id, block_offset, len)`, and `read_value` rejects
+    /// any read that would cross the page's mmap. Allowing a run to straddle a
+    /// page boundary therefore corrupts the page file (the write goes past the
+    /// fixed page size) and breaks the block→offset invariant for every later
+    /// allocation. The search is per page, in two passes around the next-fit
+    /// cursor, so a run can never straddle by construction.
+    fn find_free_range(&mut self, count: u32) -> Option<(u32, u32)> {
+        let page_blocks = self.page_blocks as u64;
+        if count == 0 || self.total_blocks == 0 || count as u64 > page_blocks {
             return None;
         }
-        let mut run_start: Option<u64> = None;
-        let mut run_len: u32 = 0;
-        for block in 0..self.total_blocks {
-            if !self.is_used(block) {
-                if run_start.is_none() {
-                    run_start = Some(block);
-                    run_len = 1;
-                } else {
-                    run_len += 1;
-                }
-                if run_len >= count {
-                    let start = run_start.unwrap();
-                    let page_id = (start / self.page_blocks as u64) as u32;
-                    let block_offset = (start % self.page_blocks as u64) as u32;
-                    return Some((page_id, block_offset));
-                }
+        let total_pages = self.total_blocks.div_ceil(page_blocks);
+        let cursor_page = self.next_fit / page_blocks;
+        for pass in 0..2u32 {
+            let (begin, end) = if pass == 0 {
+                (cursor_page, total_pages)
             } else {
-                run_start = None;
-                run_len = 0;
+                (0, cursor_page.min(total_pages))
+            };
+            for page in begin..end {
+                let page_start = page * page_blocks;
+                let page_end = (page_start + page_blocks).min(self.total_blocks);
+                let mut run_start: Option<u64> = None;
+                let mut run_len: u32 = 0;
+                for block in page_start..page_end {
+                    if self.is_used(block) {
+                        run_start = None;
+                        run_len = 0;
+                        continue;
+                    }
+                    match run_start {
+                        Some(_) => run_len += 1,
+                        None => {
+                            run_start = Some(block);
+                            run_len = 1;
+                        }
+                    }
+                    if run_len >= count {
+                        let start = run_start.expect("run start recorded");
+                        self.next_fit = start + count as u64;
+                        return Some(((start / page_blocks) as u32, (start % page_blocks) as u32));
+                    }
+                }
             }
         }
         None
@@ -108,6 +134,7 @@ impl MmapBitmask {
             total_blocks: 0,
             block_size: config.block_size as u32,
             page_blocks: config.blocks_per_page() as u32,
+            next_fit: 0,
         };
         Self::write_file(&mut file, &inner)?;
         Ok(Self {
@@ -127,6 +154,13 @@ impl MmapBitmask {
                 inner.block_size, config.block_size,
             )));
         }
+        if inner.page_blocks != config.blocks_per_page() as u32 {
+            return Err(VectorSearchError::CorruptData(format!(
+                "bitmask page_blocks mismatch: stored={}, expected={}",
+                inner.page_blocks,
+                config.blocks_per_page(),
+            )));
+        }
         Ok(Self {
             file: parking_lot::Mutex::new(file),
             inner: parking_lot::RwLock::new(inner),
@@ -135,34 +169,49 @@ impl MmapBitmask {
 
     /// Allocate `count` contiguous blocks. Returns (page_id, block_offset).
     ///
+    /// The run is always page-local (see `find_free_range`). When no page has
+    /// room the bitmap grows one page at a time until it does, so a request
+    /// that fits in a page can never be satisfied by an out-of-range offset.
+    /// `count` larger than a page's block count cannot be represented at all:
+    /// a payload spanning pages would need a cross-page pointer format, so it
+    /// is rejected before anything is written.
+    ///
     /// In-memory only; the updated bitmap is persisted by
     /// [`MmapBitmask::persist`] at checkpoint time.
     pub fn allocate(&self, count: u32, config: &StoreConfig) -> Result<(u32, u32)> {
-        let mut inner = self.inner.write();
+        let blocks_per_page = config.blocks_per_page() as u64;
+        if count == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "payload allocation of zero blocks".to_string(),
+            ));
+        }
+        if count as u64 > blocks_per_page {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "payload needs {count} blocks of {} bytes, which exceeds one {}-byte page",
+                config.block_size, config.page_size,
+            )));
+        }
 
-        // Try to find a free range in existing space.
+        let mut inner = self.inner.write();
         if let Some((pid, off)) = inner.find_free_range(count) {
-            let start = pid as u64 * inner.page_blocks as u64 + off as u64;
+            let start = pid as u64 * blocks_per_page + off as u64;
             for i in 0..count {
                 inner.set_bit(start + i as u64, true);
             }
             return Ok((pid, off));
         }
-
-        // No room — grow by one page.
-        let blocks_per_page = config.blocks_per_page() as u64;
+        // No page has room — add one page; a single-page request always fits
+        // in a fresh page.
+        let new_page_id = (inner.total_blocks / blocks_per_page) as u32;
         let new_total = inner.total_blocks + blocks_per_page;
         let new_bitmap_len = new_total.div_ceil(8) as usize;
         inner.data.resize(new_bitmap_len, 0);
         inner.total_blocks = new_total;
-
-        // Allocate from the new page.
-        let new_page_id = ((new_total - blocks_per_page) / blocks_per_page) as u32;
-        let start = new_total - blocks_per_page;
+        let start = new_page_id as u64 * blocks_per_page;
         for i in 0..count {
             inner.set_bit(start + i as u64, true);
         }
-
+        inner.next_fit = start + count as u64;
         Ok((new_page_id, 0))
     }
 
@@ -182,6 +231,9 @@ impl MmapBitmask {
         for i in 0..blocks {
             inner.set_bit(start + i as u64, false);
         }
+        // Rewind the cursor so the freed run is reused before new pages are
+        // added; this keeps long-running upsert loops page-local.
+        inner.next_fit = inner.next_fit.min(start);
     }
 
     /// Persist the current allocation state to disk and fsync it. Called at
@@ -226,6 +278,7 @@ impl MmapBitmask {
             total_blocks,
             block_size,
             page_blocks,
+            next_fit: 0,
         })
     }
 
@@ -306,5 +359,45 @@ mod tests {
             let (pid, _off) = bm.allocate(1, &config).unwrap();
             assert_eq!(pid, 0); // Still within the first page.
         }
+    }
+
+    #[test]
+    fn allocate_never_straddles_a_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(); // 8 blocks per page
+        let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+
+        assert_eq!(bm.allocate(6, &config).unwrap(), (0, 0));
+        // Page 0 only has blocks 6..8 left: a 4-block request must move to the
+        // next page instead of writing past the page end.
+        assert_eq!(bm.allocate(4, &config).unwrap(), (1, 0));
+        // Whatever is handed out next stays inside one page; next-fit may pick
+        // either the skipped tail of page 0 or the tail of page 1.
+        let (pid, off) = bm.allocate(2, &config).unwrap();
+        assert!(
+            off as usize + 2 <= config.blocks_per_page(),
+            "run must stay inside page {pid} (offset {off})"
+        );
+    }
+
+    #[test]
+    fn rejects_request_larger_than_a_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+        let err = bm.allocate(9, &config).expect_err("must reject");
+        assert!(err.to_string().contains("exceeds one"), "{err}");
+    }
+
+    #[test]
+    fn next_fit_reuses_the_freed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+        assert_eq!(bm.allocate(3, &config).unwrap(), (0, 0));
+        assert_eq!(bm.allocate(3, &config).unwrap(), (0, 3));
+        bm.free_blocks(0, 3, 3 * 128, &config);
+        // The cursor rewound to the freed run instead of appending a page.
+        assert_eq!(bm.allocate(2, &config).unwrap(), (0, 3));
     }
 }

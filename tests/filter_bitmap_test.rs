@@ -408,3 +408,64 @@ fn test_prefilter_bitmap_falls_back_for_complex_filter() {
         "must+must_not on same field must return nothing"
     );
 }
+
+/// A field whose value cardinality explodes must degrade to post-filtering
+/// without changing results.
+///
+/// This is the end-to-end form of the `FilterBitmap` budget: past a threshold
+/// the per-value bitmaps are dropped (they would otherwise dominate resident
+/// memory), and the query must still return exactly the points whose payload
+/// matches. The failure mode this guards against is a dropped field silently
+/// answering "no slots match".
+#[test]
+fn high_cardinality_field_still_filters_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CollectionStore::create(
+        dir.path().join("col"),
+        "col",
+        &config(DistanceMetric::Euclid, DIM),
+    )
+    .unwrap();
+
+    // One distinct `uid` per point: 400 distinct values on a 400-slot
+    // collection is far past the per-field bitmap budget.
+    const N: u64 = 400;
+    for i in 0..N {
+        upsert_logged(
+            &store,
+            &VectorPoint::new(i + 1, unit(i, DIM))
+                .with_payload_kv("uid", serde_json::json!(format!("u{i}")))
+                .with_payload_kv(
+                    "band",
+                    serde_json::json!(if i % 2 == 0 { "even" } else { "odd" }),
+                ),
+        );
+    }
+
+    // Filter on the high-cardinality field: must find exactly that point.
+    let filter = VectorFilter::new().must(FilterCondition::match_value("uid", "u137"));
+    let hits = store
+        .search(&SearchQuery::new(unit(137, DIM), 10).with_filter(filter))
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the dropped field must still filter exactly");
+    assert_eq!(hits[0].id.to_string(), "138");
+
+    // And the low-cardinality field keeps working alongside it.
+    let filter = VectorFilter::new().must(FilterCondition::match_value("band", "odd"));
+    let hits = store
+        .search(&SearchQuery::new(unit(1, DIM), 10).with_filter(filter.clone()))
+        .unwrap();
+    assert_eq!(hits.len(), 10, "search honors the limit");
+    assert!(hits
+        .iter()
+        .all(|h| h.id.to_string().parse::<u64>().unwrap() % 2 == 0));
+    assert_eq!(store.count_by_filter(&filter).unwrap(), N / 2);
+
+    // Count/scroll with the same filter agree with search.
+    assert_eq!(
+        store
+            .count_by_filter(&VectorFilter::new().must(FilterCondition::match_value("uid", "u137")))
+            .unwrap(),
+        1
+    );
+}

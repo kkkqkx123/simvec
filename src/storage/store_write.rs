@@ -36,8 +36,26 @@ impl CollectionStore {
         {
             let inner = self.inner.read();
             for op in ops {
-                if let WalRecord::Upsert { point } = op {
-                    validate_point(&inner.meta, &point.to_point()?)?;
+                match op {
+                    WalRecord::Upsert { point } => {
+                        let point = point.to_point()?;
+                        validate_point(&inner.meta, &point)?;
+                        self.validate_payload_size(point.payload.as_ref())?;
+                    }
+                    WalRecord::SetPayload {
+                        payload: Some(json),
+                        ..
+                    } => {
+                        self.validate_payload_len(json.len())?;
+                    }
+                    WalRecord::SetPayloadField { slot, key, value } => {
+                        // Merging grows the existing payload; the merged shape
+                        // is what has to fit, not just the new value.
+                        let mut merged = self.read_payload_at(*slot)?.unwrap_or_default();
+                        merged.insert(key.clone(), serde_json::from_str(value)?);
+                        self.validate_payload_size(Some(&merged))?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -118,7 +136,7 @@ impl CollectionStore {
             // reservation, so the reserved numbers are exactly the ones replay
             // assigns when it walks the same log order.
             let slot = (inner.meta.next_slot + inner.reserved.len() as u64) as u32;
-            inner.reserved.insert(id, slot);
+            inner.reserved.insert(&id, slot);
         }
     }
 
@@ -238,7 +256,7 @@ impl CollectionStore {
             self.init_slot_locked(inner, id, slot)?;
             return Ok(slot as u64);
         }
-        if let Some(slot) = inner.reverse.get(id).copied() {
+        if let Some(slot) = inner.reverse.get(id) {
             return Ok(slot as u64);
         }
         let slot = inner.meta.next_slot as u32;
@@ -256,7 +274,7 @@ impl CollectionStore {
     ) -> Result<()> {
         self.ensure_capacity(inner, slot as u64 + 1)?;
         self.keys.append_key(slot as usize, &id.to_string())?;
-        inner.reverse.insert(id.clone(), slot);
+        inner.reverse.insert(id, slot);
         // A reserved slot can sit beyond the applied high-water mark; the mark
         // only ever moves forward.
         inner.meta.next_slot = inner.meta.next_slot.max(slot as u64 + 1);
@@ -272,7 +290,6 @@ impl CollectionStore {
     }
 
     pub(super) fn apply_delete_slot_locked(&self, inner: &mut StoreInner, slot: u32) -> Result<()> {
-        self.payloads.set_tombstone(slot as usize, true)?;
         self.update_tombstone_bit(slot as usize, true);
         inner.filter_bitmap.unregister_slot(slot);
         inner.payload_indexes.unregister_slot(slot);

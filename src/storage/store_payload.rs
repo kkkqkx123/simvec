@@ -15,6 +15,34 @@ impl CollectionStore {
         ps.get(slot)
     }
 
+    /// Reject a payload that cannot fit in a single payload page.
+    ///
+    /// Called on the admission path (before the WAL append): a record that is
+    /// logged but cannot be applied would stay in the log forever and make
+    /// every later `open` fail while replaying it.
+    pub(super) fn validate_payload_size(&self, payload: Option<&Payload>) -> Result<()> {
+        let Some(payload) = payload else {
+            return Ok(());
+        };
+        let len = serde_json::to_vec(payload)?.len();
+        self.validate_payload_len(len)
+    }
+
+    pub(super) fn validate_payload_len(&self, len: usize) -> Result<()> {
+        let ps_guard = self.payload_store.load();
+        let Some(ps) = ps_guard.as_ref().as_ref() else {
+            return Ok(());
+        };
+        let limit = ps.max_payload_bytes();
+        if len > limit {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "payload of {len} bytes exceeds the {limit} byte payload page; \
+                 raise StorageConfig::payload_page_size"
+            )));
+        }
+        Ok(())
+    }
+
     /// Write a payload for a slot to PayloadStore.
     pub(super) fn write_payload_at(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
         let ps_guard = self.payload_store.load();
@@ -115,7 +143,6 @@ impl CollectionStore {
             .read()
             .reverse
             .get(id)
-            .copied()
             .ok_or_else(|| VectorSearchError::InvalidPointId(id.to_string()))?;
         if self.tombstones.load().bit(slot as usize) {
             return Err(VectorSearchError::InvalidPointId(format!(

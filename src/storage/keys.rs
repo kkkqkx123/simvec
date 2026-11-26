@@ -21,8 +21,10 @@ impl Keys {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
+        // The record stride comes from the file header, so a directory written
+        // with a different record layout still reads correctly.
         Ok(Self {
-            dir: BlobDirectory::open(path, MAGIC, KEY_REC_SIZE)?,
+            dir: BlobDirectory::open(path, MAGIC)?,
         })
     }
 
@@ -51,7 +53,7 @@ impl Keys {
 
     /// Read the key for a slot from a snapshot.
     pub fn read_key(view: &DirView, slot: usize) -> Result<Option<String>> {
-        match view.blob(KEY_REC_SIZE, slot) {
+        match view.blob(slot) {
             Some(bytes) => {
                 let key = std::str::from_utf8(bytes).map_err(|e| {
                     VectorSearchError::CorruptData(format!("invalid utf8 key at slot {slot}: {e}"))

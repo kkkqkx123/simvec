@@ -179,8 +179,11 @@ fn restart_applies_runtime_config_to_published_index() {
     assert!(!results.is_empty());
 }
 
+/// Compaction renumbers the live slots; the published IVF index is remapped
+/// onto the new numbering (list membership is unchanged) instead of being
+/// dropped, so probe search keeps working without a k-means rerun.
 #[test]
-fn compact_invalidates_index_and_rebuild_restores() {
+fn compaction_remaps_the_published_index() {
     let dir = tempfile::tempdir().unwrap();
     let engine = engine_with_blobs(&dir.path().join("vec"), 20);
     assert!(engine.build_index("col").unwrap());
@@ -193,19 +196,29 @@ fn compact_invalidates_index_and_rebuild_restores() {
 
     engine.compact_collection("col").unwrap();
     assert!(
-        !engine.has_index("col"),
-        "compaction renumbers slots wholesale; the index must be invalidated"
+        engine.has_index("col"),
+        "compaction must carry the lists across the slot renumbering"
     );
+    let info = engine.collection_info("col").unwrap();
+    assert_eq!(info.points_count, 38);
+    let index = info.index.unwrap();
+    assert_eq!(index.index_kind, IndexKind::Ivf);
+    assert_eq!(index.built_at_live_count, 38);
 
-    // Rebuild restores the index over the compacted slot space.
-    assert!(engine.build_index("col").unwrap());
     let query = vec![50.0; DIM];
     let results = engine.search("col", &SearchQuery::new(query, 5)).unwrap();
     assert!(!results.is_empty());
     assert!(
-        results.iter().all(|r| r.id.to_string() != "p20"),
-        "deleted points stay deleted after compact + rebuild"
+        results
+            .iter()
+            .all(|r| !matches!(r.id.to_string().as_str(), "p0" | "p20")),
+        "deleted points stay deleted after the remap"
     );
+
+    // The remapped file is what the next open loads, not a rebuild.
+    drop(engine);
+    let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
+    assert!(reopened.has_index("col"));
 }
 
 #[test]

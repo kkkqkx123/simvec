@@ -4,7 +4,8 @@
 //! - `meta.bin`     postcard `Meta`
 //! - `vectors.bin`  dense row-major f32, segmented mmap
 //! - `keys.bin`     slot -> point id directory
-//! - `payloads.bin` slot -> payload blob directory + tombstone flags
+//! - `tombstones.bin` slot -> deleted flag (survives WAL truncation)
+//! - `payloads_store/` block-based payload storage (tracker + pages)
 //! - `wal.bin`      append-only transaction log (crash recovery)
 //!
 //! Readers snapshot the mmap-backed `ArcSwap` views and scan without the
@@ -34,7 +35,6 @@ mod meta;
 mod payload_index;
 mod payload_key;
 pub(crate) mod payload_store;
-mod payloads;
 pub(crate) mod quant;
 mod queue;
 mod search;
@@ -67,7 +67,6 @@ pub use wal::{Wal, WalPoint, WalRecord, WalTxn};
 use self::filter_bitmap::FilterBitmap;
 use self::index_lifecycle::PublishedIndex;
 use self::keys::Keys;
-use self::payloads::Payloads;
 use self::quant::QuantStore;
 use self::queue::CommitQueue;
 use self::vectors::Vectors;
@@ -79,17 +78,81 @@ use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 // interval, payload page geometry) lives in `types::StorageConfig` and is
 // supplied by the engine when a collection is opened or created.
 
+/// Point id -> slot map, split by id kind.
+///
+/// A `HashMap<PointId, u32>` pays for the widest variant: `PointId` is 32
+/// bytes (the `String` variant plus the tag), so numeric ids — the common
+/// case — carry a fat key and a discriminant that is constant for the whole
+/// map. Splitting the two kinds keeps numeric ids at `u64` keys (roughly 20
+/// bytes per entry including hashbrown's control bytes and load factor,
+/// against 48-56 for the enum) and confines the owned `String` allocation to
+/// ids that really are uuids.
+#[derive(Debug, Default)]
+struct IdMap {
+    numeric: HashMap<u64, u32>,
+    uuid: HashMap<String, u32>,
+}
+
+impl IdMap {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            numeric: HashMap::with_capacity(capacity),
+            uuid: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.numeric.len() + self.uuid.len()
+    }
+
+    /// Slot holding `id`.
+    ///
+    /// Takes the id by reference: the enum-keyed map had to hash the whole
+    /// 32-byte key (padding included) on every lookup, while this hashes a
+    /// `u64` for the numeric case and reuses the caller's string otherwise.
+    fn get(&self, id: &PointId) -> Option<u32> {
+        match id {
+            PointId::Num(n) => self.numeric.get(n).copied(),
+            PointId::Uuid(u) => self.uuid.get(u.as_str()).copied(),
+        }
+    }
+
+    fn contains_key(&self, id: &PointId) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Record `id -> slot`, returning the slot it replaced.
+    fn insert(&mut self, id: &PointId, slot: u32) -> Option<u32> {
+        match id {
+            PointId::Num(n) => self.numeric.insert(*n, slot),
+            PointId::Uuid(u) => self.uuid.insert(u.clone(), slot),
+        }
+    }
+
+    fn remove(&mut self, id: &PointId) -> Option<u32> {
+        match id {
+            PointId::Num(n) => self.numeric.remove(n),
+            PointId::Uuid(u) => self.uuid.remove(u.as_str()),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.numeric.clear();
+        self.uuid.clear();
+    }
+}
+
 /// In-memory mutable state, guarded by the store's `RwLock`.
 struct StoreInner {
     meta: Meta,
-    reverse: HashMap<PointId, u32>,
+    reverse: IdMap,
     /// Slots handed out by the commit queue's reserve step for transactions
     /// that are not applied yet. An id stays here from the moment its slot is
     /// reserved until the applier writes the directory entry, so a concurrent
     /// transaction upserting the same id reuses the slot instead of getting a
     /// second one. The slot numbers are exactly the ones replay assigns,
     /// because both walk the log in the same order.
-    reserved: HashMap<PointId, u32>,
+    reserved: IdMap,
     /// Next log sequence number to hand out. Initialized above the water mark
     /// replayed at open, so a replayed record can never collide with a new
     /// one.
@@ -147,7 +210,6 @@ pub struct CollectionStore {
     tombstones: ArcSwap<TombstoneBits>,
     vectors: Vectors,
     keys: Keys,
-    payloads: Payloads,
     /// Gridstore-style payload storage for all payload operations.
     /// Wrapped in `ArcSwap` for lock-free snapshot reads during search.
     payload_store: ArcSwap<Option<PayloadStore>>,

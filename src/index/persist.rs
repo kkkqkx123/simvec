@@ -69,6 +69,32 @@ impl PersistedIvf {
             && self.distance == distance
             && self.slot_list.len() as u64 <= next_slot
     }
+
+    /// Renumber slot assignments through `map` (`u32::MAX` = dropped).
+    ///
+    /// Compaction renumbers the live slots densely while keeping their order,
+    /// so the list assignment of a surviving point is unchanged — only its
+    /// slot number moves. Rebuilding the index (k-means included) to
+    /// rediscover that would be pure waste.
+    pub(crate) fn remap(&self, map: &[u32]) -> Self {
+        let live = map.iter().filter(|m| **m != u32::MAX).count();
+        let mut slot_list = vec![u32::MAX; live];
+        for (old_slot, &list) in self.slot_list.iter().enumerate() {
+            let Some(&new_slot) = map.get(old_slot) else {
+                // Slots appended after the build have no assignment yet; the
+                // pending path adopts them after the remap.
+                continue;
+            };
+            if new_slot != u32::MAX {
+                slot_list[new_slot as usize] = list;
+            }
+        }
+        Self {
+            slot_list,
+            built_at_live_count: live as u64,
+            ..self.clone()
+        }
+    }
 }
 
 /// Write `data` to `<dir>/index.bin` atomically (temp file + fsync + rename).
@@ -167,6 +193,67 @@ impl PersistedHnsw {
             && self.dim == dim
             && self.distance == distance
             && self.nodes.iter().all(|n| (n.slot as u64) < next_slot)
+    }
+
+    /// Renumber the graph through `map` (`u32::MAX` = dropped).
+    ///
+    /// The topology carries over unchanged: adjacency lists are translated
+    /// and pruned of dead ids, which only ever shortens them, so the per-layer
+    /// caps still hold. Returns `None` when the result would not be a valid
+    /// `hnsw.bin` — a hole in the node table (a point that never made it into
+    /// the graph) cannot be invented here, and [`HnswIndex::from_persisted`]
+    /// requires the table to be dense from slot 0.
+    pub(crate) fn remap(&self, map: &[u32]) -> Option<Self> {
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for record in &self.nodes {
+            let new_slot = *map.get(record.slot as usize)?;
+            if new_slot == u32::MAX {
+                continue;
+            }
+            nodes.push(PersistedNodeRecord {
+                slot: new_slot,
+                level: record.level,
+                version: record.version,
+                neighbors: record
+                    .neighbors
+                    .iter()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|slot| match map.get(*slot as usize) {
+                                Some(&m) if m != u32::MAX => Some(m),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            });
+        }
+        // Live slots are renumbered densely in ascending order, so sorting by
+        // the new id yields exactly `0..live`.
+        nodes.sort_unstable_by_key(|n| n.slot);
+        if nodes.iter().enumerate().any(|(i, n)| n.slot as usize != i) {
+            return None;
+        }
+        let entry = match self.entry {
+            None => None,
+            Some((slot, level)) => match map.get(slot as usize).copied() {
+                Some(m) if m != u32::MAX => Some((m, level)),
+                // The entry point was tombstoned and is about to be dropped.
+                // The deepest surviving node takes over: any node can serve as
+                // an entry point, the level only decides where traversal
+                // starts.
+                _ => nodes
+                    .iter()
+                    .max_by_key(|n| n.level)
+                    .map(|n| (n.slot, n.level as i32)),
+            },
+        };
+        Some(Self {
+            entry,
+            built_at_live_count: nodes.len() as u64,
+            nodes,
+            ..self.clone()
+        })
     }
 }
 

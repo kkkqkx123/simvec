@@ -32,33 +32,58 @@ impl CollectionStore {
     /// Checkpoint: make every derived file durable, persist the payload
     /// store and truncate the WAL.
     ///
-    /// Runs on the background maintenance thread under the store write lock,
-    /// so no transaction can interleave with the flush. Ordering matters:
-    /// derived files are synced first, then `meta.bin`, then a WAL checkpoint
-    /// marker (its own append fsyncs everything preceding it) and finally the
-    /// truncate. A crash at any point leaves the log intact, so recovery
-    /// replays forward from a state that is already consistent.
+    /// Two phases, and the split is the point:
+    ///
+    /// 1. **Flush without the store lock.** Inside the queue gate (so no
+    ///    transaction can be applied) but *not* holding `inner`, this fsyncs
+    ///    the payload pages, the payload tracker/bitmask, `keys.bin` and
+    ///    `vectors.bin`, then persists the tombstone table. The gate is what
+    ///    makes the unlocked flush safe: with it closed nothing mutates the
+    ///    data files, so the bytes being flushed are stable. Readers keep
+    ///    taking the read lock the whole time, so a multi-second fsync storm
+    ///    no longer freezes search or scroll.
+    /// 2. **Durable water marks under the write lock** (microseconds, not
+    ///    seconds): `meta.bin` is written from the *live* state rather than
+    ///    from a phase-1 snapshot, so a concurrent `set_quantization_config`
+    ///    or `set_hnsw_config` cannot be overwritten by a stale copy, then a
+    ///    WAL checkpoint marker (its own append fsyncs everything preceding
+    ///    it) and finally the truncate.
+    ///
+    /// Ordering still matters: data files, then tombstones, then `meta.bin`,
+    /// then the marker, then the truncate. A crash at any point leaves the
+    /// log intact, so recovery replays forward from a state that is already
+    /// consistent.
+    ///
+    /// The `compact_mutex` is held for the whole call: it is the collection's
+    /// maintenance-exclusive lock, so compaction (which rewrites the very
+    /// files phase 1 reads) cannot swap them under the flush.
     ///
     /// A published ANN index is not rebuilt here: it is a derived structure
     /// refreshed by the maintenance worker on its own schedule, exactly like
     /// after ordinary mutations.
     pub fn checkpoint(&self) -> Result<u64> {
+        self.checkpoint_inner(|| {})
+    }
+
+    fn checkpoint_inner(&self, on_flush: impl FnOnce()) -> Result<u64> {
         let started = std::time::Instant::now();
+        // Compaction and index builds rewrite or replace the files flushed
+        // below, so they must not run concurrently with this pass.
+        let _maintenance = self.compact_mutex.lock();
         // The log is truncated below, so no transaction may be queued — or
         // halfway through the worker — while this runs.
         let _gate = self.queue.quiesce();
+        let (capacity, live) = {
+            let inner = self.inner.read();
+            (inner.meta.slot_capacity, inner.meta.live_count)
+        };
+
+        // Phase 1: the expensive part, without the store lock.
+        on_flush();
+        self.flush_data_files(capacity)?;
+
+        // Phase 2: durable water marks.
         let inner = self.inner.write();
-        // Payload store: dirty pages, block bitmask, slot→pointer table.
-        let ps_guard = self.payload_store.load();
-        if let Some(ps) = ps_guard.as_ref().as_ref() {
-            ps.checkpoint()?;
-        }
-        drop(ps_guard);
-        // Directory and vector files touched since the last checkpoint.
-        self.keys.sync();
-        self.payloads.sync();
-        self.vectors.sync();
-        // Durable metadata water marks.
         inner.meta.save(&self.dir)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
         // Marker first (this append itself fsyncs the log), then truncate.
@@ -67,7 +92,6 @@ impl CollectionStore {
             ops: vec![WalRecord::Compact],
         })?;
         self.wal.truncate()?;
-        let live = inner.meta.live_count;
         drop(inner);
         self.metrics.record_checkpoint(started.elapsed());
         tracing::debug!(
@@ -76,6 +100,46 @@ impl CollectionStore {
             "wal checkpoint committed"
         );
         Ok(live)
+    }
+
+    /// Flush every data file touched since the last checkpoint.
+    ///
+    /// Requires the queue gate to be closed (no transaction can be applied)
+    /// but takes no store lock, so readers are unaffected. `slot_capacity` is
+    /// captured under the gate, where no growth can race it.
+    fn flush_data_files(&self, slot_capacity: u64) -> Result<()> {
+        // Payload store: dirty pages, block bitmask, slot→pointer table.
+        let ps_guard = self.payload_store.load();
+        if let Some(ps) = ps_guard.as_ref().as_ref() {
+            ps.checkpoint()?;
+        }
+        drop(ps_guard);
+        // Directory and vector files touched since the last checkpoint.
+        self.keys.sync();
+        self.vectors.sync();
+        // Tombstones before meta and before the truncate: they are the only
+        // surviving record of the deletes once the log is cleared.
+        self.tombstones.load().save(&self.dir, slot_capacity)?;
+        Ok(())
+    }
+
+    /// Test-only: run a checkpoint with a probe invoked at the start of the
+    /// unlocked flush, so a test can assert which locks that phase holds.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_with_probe(&self, probe: impl FnOnce()) -> Result<u64> {
+        self.checkpoint_inner(probe)
+    }
+
+    /// Test-only: whether the store write lock is currently free.
+    #[cfg(test)]
+    pub(crate) fn write_lock_free(&self) -> bool {
+        match self.inner.try_write() {
+            Some(guard) => {
+                drop(guard);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Estimated resident index footprint in bytes.
@@ -98,8 +162,9 @@ impl CollectionStore {
             (self.storage.payload_page_size / self.storage.payload_block_size).max(1) as u64;
         let pages = meta.next_slot.div_ceil(blocks_per_page).max(1);
         total += pages * self.storage.payload_page_size as u64;
-        // Directory files: keys (8 B/slot) + payloads (12 B/slot) records.
-        total += meta.slot_capacity * 20;
+        // Directory file: keys (8 B/slot) plus the tombstone bitmap
+        // (1 bit/slot, rounded up to whole bytes).
+        total += meta.slot_capacity * 8 + meta.slot_capacity.div_ceil(8);
         // HNSW graph: Arc node per slot plus per-layer adjacency up to 2*m.
         if let IndexConfig::Hnsw(hnsw) = &meta.index {
             let per_node = 64 + (2 * hnsw.m as u64 + 1) * 4;
@@ -168,7 +233,6 @@ impl CollectionStore {
         self.vectors.grow_to(needed_slots)?;
         let new_capacity = self.vectors.slot_capacity();
         self.keys.grow_to(new_capacity)?;
-        self.payloads.grow_to(new_capacity)?;
         if let Some(q) = self.quant.read().as_ref() {
             // Quant file growth mirrors vectors capacity; zero-fill new range.
             if let Err(e) = q.grow_to(new_capacity) {

@@ -115,6 +115,18 @@ impl HnswIndex {
         repaired
     }
 
+    /// Whether the node table covers every slot below `slots` with no holes.
+    ///
+    /// A hole means a live point that never entered the graph (it is sitting
+    /// in `pending`, or the insert failed). Remapping after compaction cannot
+    /// invent its adjacency, and a dense node table is what makes the
+    /// remapped graph reloadable, so the caller falls back to a rebuild when
+    /// this returns false.
+    pub(crate) fn covers_all(&self, slots: usize) -> bool {
+        let nodes = self.nodes.read();
+        nodes.len() >= slots && nodes[..slots].iter().all(|n| n.is_some())
+    }
+
     /// Staleness ratio combining overwrite count and distance delta.
     /// Returns `max(count_ratio, delta_ratio)` where:
     /// - `count_ratio = overwrites / built_at_live_count`

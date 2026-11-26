@@ -16,8 +16,13 @@ use crate::types::{
 
 impl LocalVectorEngine {
     /// Open (or create) the engine root directory, loading every existing
-    /// collection. Returns [`VectorSearchError::InvalidConfig`] if a
-    /// collection directory is corrupt.
+    /// collection.
+    ///
+    /// A collection that fails to open (corrupt `meta.bin`, checksum failure,
+    /// incomplete directory) is renamed to `<name>.suspect-<unix_ts>` and
+    /// skipped instead of failing the whole engine: one damaged collection must
+    /// not take every other collection offline. Only a failure to enumerate
+    /// the root directory itself is fatal.
     ///
     /// Rebuild scratch (`*.rebuild-*`), publish backups (`*.old-*`), and
     /// quarantined (`.suspect-*`) directories are never loaded: they are
@@ -56,18 +61,27 @@ impl LocalVectorEngine {
             if name.contains(".rebuild-") || name.contains(".old-") || name.contains(".suspect-") {
                 continue;
             }
-            if path.join("kind.bin").exists() {
-                let store = crate::kind_store::KindStore::open(&path, &storage)?;
-                stores.insert(name, SpaceHandle::Kind(store));
-                continue;
+            let opened = if path.join("kind.bin").exists() {
+                crate::kind_store::KindStore::open(&path, &storage).map(SpaceHandle::Kind)
+            } else if path.join("named.bin").exists() {
+                crate::named_store::NamedStore::open(&path, &storage).map(SpaceHandle::Named)
+            } else {
+                CollectionStore::open_with_storage(&path, &storage).map(SpaceHandle::Dense)
+            };
+            match opened {
+                Ok(store) => {
+                    stores.insert(name, store);
+                }
+                Err(err) => {
+                    let quarantined = quarantine(&path, &name);
+                    tracing::error!(
+                        collection = %name,
+                        error = %err,
+                        quarantined = ?quarantined,
+                        "collection failed to open; quarantined and skipped"
+                    );
+                }
             }
-            if path.join("named.bin").exists() {
-                let store = crate::named_store::NamedStore::open(&path, &storage)?;
-                stores.insert(name, SpaceHandle::Named(store));
-                continue;
-            }
-            let store = CollectionStore::open_with_storage(&path, &storage)?;
-            stores.insert(name, SpaceHandle::Dense(store));
         }
 
         Ok(Self::assemble(root_dir, stores, storage))
@@ -428,5 +442,29 @@ impl LocalVectorEngine {
         self.handle(collection)
             .and_then(|h| h.as_dense().cloned())
             .ok_or_else(|| VectorSearchError::CollectionNotFound(collection.to_string()))
+    }
+}
+
+/// Move an unopenable collection directory out of the load path.
+///
+/// Renaming keeps the bytes around for offline recovery while making the
+/// directory invisible to the loader (`*.suspect-*` is skipped). Returns the
+/// new path on success.
+fn quarantine(path: &Path, name: &str) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let target = path.with_file_name(format!("{name}.suspect-{stamp}"));
+    match std::fs::rename(path, &target) {
+        Ok(()) => Some(target),
+        Err(err) => {
+            tracing::error!(
+                collection = %name,
+                error = %err,
+                "failed to quarantine unopenable collection; skipping in place"
+            );
+            None
+        }
     }
 }

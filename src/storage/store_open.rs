@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use bitvec::prelude::*;
 use parking_lot::{Mutex, RwLock};
 
 use super::filter_bitmap::FilterBitmap;
@@ -11,7 +10,6 @@ use super::keys::Keys;
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
 use super::payload_store::PayloadStore;
-use super::payloads::Payloads;
 use super::quant::QuantStore;
 use super::queue::CommitQueue;
 use super::tombstones::TombstoneBits;
@@ -34,7 +32,8 @@ impl CollectionStore {
         collection: &str,
         config: &CollectionConfig,
     ) -> Result<Arc<Self>> {
-        Self::create_with_segment_slots(dir, collection, config, meta::SEGMENT_SLOTS_DEFAULT)
+        let slots = meta::default_segment_slots(config.vector_size);
+        Self::create_with_segment_slots(dir, collection, config, slots)
     }
 
     /// Like [`CollectionStore::create`] but with an explicit segment slot count.
@@ -65,13 +64,8 @@ impl CollectionStore {
         config: &CollectionConfig,
         storage: &StorageConfig,
     ) -> Result<Arc<Self>> {
-        Self::create_with_storage_and_slots(
-            dir,
-            collection,
-            config,
-            meta::SEGMENT_SLOTS_DEFAULT,
-            storage,
-        )
+        let slots = meta::default_segment_slots(config.vector_size);
+        Self::create_with_storage_and_slots(dir, collection, config, slots, storage)
     }
 
     /// Like [`CollectionStore::create_with_storage`] with an explicit segment
@@ -147,7 +141,6 @@ impl CollectionStore {
             meta.segment_slots,
         )?;
         let keys = Keys::create(&dir.join("keys.bin"), meta.slot_capacity)?;
-        let payloads = Payloads::create(&dir.join("payloads.bin"), meta.slot_capacity)?;
         // Create quantized storage if requested. Scalar/Binary are ready immediately;
         // Product needs a codebook build before it becomes usable.
         let quant = if let Some(qc) = &config.quantization_config {
@@ -163,7 +156,11 @@ impl CollectionStore {
             None
         };
 
-        let tombstones = ArcSwap::from(Arc::new(TombstoneBits::new(meta.slot_capacity as usize)));
+        let initial_tombstones = TombstoneBits::new(meta.slot_capacity as usize);
+        // A fresh collection owns a valid, all-zero table so `open` never has
+        // to guess whether a missing file means "nothing deleted".
+        initial_tombstones.save(dir, meta.slot_capacity)?;
+        let tombstones = ArcSwap::from(Arc::new(initial_tombstones));
         let slot_capacity = meta.slot_capacity;
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
         // New collections always use the Gridstore-style PayloadStore.
@@ -175,8 +172,8 @@ impl CollectionStore {
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
                 meta,
-                reverse: HashMap::new(),
-                reserved: HashMap::new(),
+                reverse: IdMap::with_capacity(slot_capacity as usize),
+                reserved: IdMap::default(),
                 next_lsn: 1,
                 ivf_config: match &config.index {
                     IndexConfig::Ivf(opt) => opt.clone(),
@@ -189,7 +186,6 @@ impl CollectionStore {
             tombstones,
             vectors,
             keys,
-            payloads,
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: parking_lot::RwLock::new(quant),
             wal,
@@ -218,7 +214,7 @@ impl CollectionStore {
     pub fn open_with_storage(dir: impl AsRef<Path>, storage: &StorageConfig) -> Result<Arc<Self>> {
         storage.validate()?;
         let dir = dir.as_ref();
-        for name in &["meta.bin", "vectors.bin", "keys.bin", "payloads.bin"] {
+        for name in &["meta.bin", "vectors.bin", "keys.bin"] {
             let path = dir.join(name);
             if !path.exists() {
                 return Err(VectorSearchError::CollectionIncomplete {
@@ -236,12 +232,19 @@ impl CollectionStore {
             meta.slot_capacity,
         )?;
         let keys = Keys::open(&dir.join("keys.bin"))?;
-        let payloads = Payloads::open(&dir.join("payloads.bin"))?;
+        // The tombstone table outlives the WAL: once a checkpoint truncates the
+        // log, this file is the only record of the deletes. Load it before any
+        // scan so a deleted slot is never reported live.
+        let tombstone_bits =
+            TombstoneBits::load(dir, meta.slot_capacity as usize, meta.tombstone_count)?
+                .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
 
         let payload_store_path = dir.join("payloads_store");
+        // Opened once and reused for the rebuild pass below: opening twice
+        // re-read the tracker and bitmask for nothing.
+        let payload_store = PayloadStore::open(&payload_store_path)?;
 
-        let mut reverse = HashMap::new();
-        let tombstones = bitvec![0; meta.slot_capacity as usize];
+        let mut reverse = IdMap::with_capacity(meta.slot_capacity as usize);
         let mut filter_bitmap = FilterBitmap::with_capacity(meta.slot_capacity as usize);
         let mut payload_indexes = PayloadIndexManager::new();
         for def in PayloadIndexManager::load_defs(dir) {
@@ -254,12 +257,20 @@ impl CollectionStore {
         }
         {
             let keys_view = keys.snapshot();
-            let ps = PayloadStore::open(&payload_store_path)?;
+            let tombstone_view = &tombstone_bits;
             for slot in 0..meta.next_slot as usize {
                 if let Some(key) = Keys::read_key(&keys_view, slot)? {
+                    // Tombstoned slots keep their key in `keys.bin` until
+                    // compaction reclaims them, but they must not re-enter the
+                    // live id map: a later upsert of the same id has to take a
+                    // fresh slot instead of silently writing into a slot that
+                    // stays invisible.
+                    if tombstone_view.bit(slot) {
+                        continue;
+                    }
                     let id = PointId::from(key);
-                    reverse.insert(id, slot as u32);
-                    if let Ok(Some(p)) = ps.get(slot as u32) {
+                    reverse.insert(&id, slot as u32);
+                    if let Ok(Some(p)) = payload_store.get(slot as u32) {
                         filter_bitmap.register_slot(slot as u32, Some(&p));
                         payload_indexes.register_slot(slot as u32, Some(&p));
                     }
@@ -282,9 +293,9 @@ impl CollectionStore {
             None
         };
 
-        let payload_store = Some(PayloadStore::open(&payload_store_path)?);
+        let payload_store = Some(payload_store);
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
-        let tombstones = ArcSwap::from(Arc::new(TombstoneBits::from_bits(tombstones)));
+        let tombstones = ArcSwap::from(Arc::new(tombstone_bits));
 
         let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
@@ -297,7 +308,7 @@ impl CollectionStore {
                 },
                 meta,
                 reverse,
-                reserved: HashMap::new(),
+                reserved: IdMap::default(),
                 next_lsn: 1,
                 last_drift_ratio: None,
                 filter_bitmap,
@@ -306,7 +317,6 @@ impl CollectionStore {
             tombstones,
             vectors,
             keys,
-            payloads,
             payload_store: ArcSwap::from(Arc::new(payload_store)),
             quant: parking_lot::RwLock::new(quant),
             wal,

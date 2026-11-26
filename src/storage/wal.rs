@@ -51,7 +51,7 @@ struct WalTxnRef<'a> {
 
 /// A point as persisted in the WAL. The id is a string and the payload is
 /// JSON-encoded because postcard cannot encode untagged enums (`PointId`,
-/// `serde_json::Value`) — same choice as `keys.bin`/`payloads.bin`.
+/// `serde_json::Value`) — same choice as `keys.bin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalPoint {
     pub id: String,

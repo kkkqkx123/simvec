@@ -101,7 +101,7 @@ impl CollectionStore {
     pub fn get(&self, id: &PointId) -> Result<Option<VectorPoint>> {
         let inner = self.inner.read();
         let slot = match inner.reverse.get(id) {
-            Some(slot) => *slot as u64,
+            Some(slot) => slot as u64,
             None => return Ok(None),
         };
         if self.tombstones.load().bit(slot as usize) {
@@ -117,7 +117,10 @@ impl CollectionStore {
         let payload = self.read_payload_at(slot as u32)?;
         Ok(Some(VectorPoint {
             id: id.clone(),
-            vectors: BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), VectorData::Dense(vector))]),
+            vectors: BTreeMap::from([(
+                crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                VectorData::Dense(vector),
+            )]),
             payload,
         }))
     }
@@ -128,7 +131,7 @@ impl CollectionStore {
     /// numbering matches the one WAL replay rebuilds, which is the invariant
     /// the commit queue exists to preserve.
     pub fn slot_of(&self, id: &PointId) -> Option<u32> {
-        let slot = self.inner.read().reverse.get(id).copied()?;
+        let slot = self.inner.read().reverse.get(id)?;
         (!self.tombstones.load().bit(slot as usize)).then_some(slot)
     }
 

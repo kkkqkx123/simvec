@@ -147,6 +147,11 @@ impl Pages {
     /// visible to readers through the page's mmap (both map the same cache
     /// pages). The page is recorded as dirty so the next checkpoint flushes
     /// it; the WAL already carries the payload for replay-based recovery.
+    ///
+    /// A page is a fixed-size file: writing past `page_size` would grow it and
+    /// silently break the block→offset mapping for every reader (this is the
+    /// bug the allocator's page-local constraint prevents — the assertion here
+    /// is the second line of defence, not the primary one).
     pub fn write_value(
         &self,
         pointer: &ValuePointer,
@@ -162,7 +167,29 @@ impl Pages {
         })?;
 
         let start = pointer.block_offset as usize * config.block_size;
-        let _end = start + data.len();
+        let end = start + data.len();
+        if end > config.page_size {
+            return Err(VectorSearchError::CorruptData(format!(
+                "payload write out of bounds: page {} offset {} len {} (page size {})",
+                pointer.page_id,
+                start,
+                data.len(),
+                config.page_size,
+            )));
+        }
+        {
+            let mmap_guard = entry.mmap.read();
+            if let Some(mmap) = mmap_guard.as_ref() {
+                if end > mmap.len() {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "page {} is shorter than its configured size: {} < {}",
+                        pointer.page_id,
+                        mmap.len(),
+                        config.page_size
+                    )));
+                }
+            }
+        }
 
         write_at(&entry.file, start as u64, data)?;
         drop(pages);
@@ -252,5 +279,25 @@ mod tests {
 
         assert_eq!(pages.read_value(&ptr0, &config).unwrap(), data0);
         assert_eq!(pages.read_value(&ptr1, &config).unwrap(), data1);
+    }
+
+    #[test]
+    fn write_past_page_end_is_rejected_and_keeps_page_size() {
+        let dir = tempdir().unwrap();
+        let config = test_config(); // page_size = 1024
+        let pages = Pages::create(dir.path(), &config).unwrap();
+        pages.ensure_page(0, &config).unwrap();
+
+        // Last block starts at 896; a 256-byte value would end at 1152 > 1024.
+        let ptr = ValuePointer::new(0, 7, 256);
+        let err = pages
+            .write_value(&ptr, &[7u8; 256], &config)
+            .expect_err("must reject");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+
+        let len = std::fs::metadata(dir.path().join("pages/page_0000.bin"))
+            .unwrap()
+            .len();
+        assert_eq!(len, config.page_size as u64);
     }
 }

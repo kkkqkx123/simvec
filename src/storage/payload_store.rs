@@ -1,8 +1,8 @@
 //! Gridstore-style payload storage engine.
 //!
-//! Replaces the append-only `payloads.bin` blob directory with a block-based
-//! storage that supports in-place updates, eliminates tombstone-driven
-//! compaction, and provides O(1) space allocation.
+//! Block-based payload storage supporting in-place updates: a block allocator
+//! reuses freed space instead of appending, so superseded payloads never need
+//! tombstone-driven compaction.
 //!
 //! # On-disk layout
 //!
@@ -205,6 +205,17 @@ impl PayloadStore {
             None => Vec::new(),
         };
 
+        // Validate the size before touching any allocation state: failing after
+        // the old blocks were freed would leave the tracker pointing at blocks
+        // the allocator may hand out again.
+        if bytes.len() > self.config.page_size {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "payload of {} bytes exceeds the {} byte payload page",
+                bytes.len(),
+                self.config.page_size
+            )));
+        }
+
         let mut tracker = self.tracker.write();
         let bitmask = self.bitmask.write();
 
@@ -312,6 +323,16 @@ impl PayloadStore {
         }
         new_store.checkpoint()?;
         Ok(new_store)
+    }
+
+    /// Largest payload blob that can be stored, in bytes.
+    ///
+    /// A value must fit inside a single page because a `ValuePointer` is
+    /// `(page, block_offset, len)`; callers validate against this before the
+    /// write is logged, so an oversized payload is a clean rejection rather
+    /// than a WAL record that can never be applied.
+    pub fn max_payload_bytes(&self) -> usize {
+        self.config.page_size
     }
 
     /// Number of blocks needed for a given byte length.

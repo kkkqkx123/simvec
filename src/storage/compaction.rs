@@ -26,14 +26,16 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use super::directory::KEY_REC_SIZE;
+use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
 use super::tombstones::TombstoneBits;
 use super::{CollectionStore, Meta, WalRecord, WalTxn};
 use crate::error::{Result, VectorSearchError};
-use crate::types::PointId;
+use crate::index::{persist, HnswIndex, IvfIndex};
+use crate::types::{HnswConfig, IndexConfig, PointId};
 
-const HEADER_LEN: usize = 24;
-const FILE_VERSION: u32 = 1;
+const HEADER_LEN: usize = 32;
+const FILE_VERSION: u32 = 2;
 
 /// How often the lock-free rewrite is retried when a write races it before
 /// falling back to the whole-rewrite critical section.
@@ -113,6 +115,10 @@ pub(crate) fn write_dir_file(
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(&magic);
     header.extend_from_slice(&FILE_VERSION.to_le_bytes());
+    // The record stride is part of the file, so a reader never has to agree
+    // with the writer's compile-time constant.
+    header.extend_from_slice(&(rec_size as u32).to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
     header.extend_from_slice(&rec_capacity.to_le_bytes());
     header.extend_from_slice(&blob_len.to_le_bytes());
     file.write_all(&header)?;
@@ -330,7 +336,6 @@ impl CollectionStore {
     fn compaction_footprint(&self) -> u64 {
         let mut total = file_len(&self.dir.join("vectors.bin"));
         total += file_len(&self.dir.join("keys.bin"));
-        total += file_len(&self.dir.join("payloads.bin"));
         total += file_len(&self.dir.join("quant.bin"));
         total += dir_len(&self.dir.join("payloads_store"));
         total
@@ -486,7 +491,8 @@ impl CollectionStore {
                 let key = Keys::read_key(&keys_view, slot)?.ok_or_else(|| {
                     VectorSearchError::CorruptData(format!("live slot {slot} has no key"))
                 })?;
-                inner.reverse.insert(PointId::from(key), slot as u32);
+                let id = PointId::from(key);
+                inner.reverse.insert(&id, slot as u32);
             }
         }
         inner.meta.slot_capacity = plan.new_capacity;
@@ -514,18 +520,44 @@ impl CollectionStore {
                 );
             }
         }
+        // The compacted table has no tombstones left; persist it before meta
+        // so a crash right after the WAL truncate cannot read the old bits
+        // back and mark live slots as deleted.
+        self.tombstones.load().save(&self.dir, plan.new_capacity)?;
         inner.meta.save(&self.dir)?;
 
-        // Invalidate the published ANN index: slot numbering changed
-        // wholesale. A rebuild is scheduled by the maintenance worker.
+        // Slot numbering changed wholesale, but the topology did not: remap
+        // the published index instead of dropping it. Dropping costs the
+        // collection its ANN tier until the maintenance worker finishes a
+        // full rebuild, for a compaction that only removed tombstones.
         let had_index = self.index.load().is_some();
-        self.index.store(Arc::new(None));
-        self.pending.lock().clear();
-        self.building.store(false, AtomicOrdering::Relaxed);
-        if had_index {
-            self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
+        let remapped = self.remap_published_index(inner, plan);
+        // `pending` holds old slot numbers as well.
+        {
+            let mut pending = self.pending.lock();
+            let carried: Vec<u32> = pending
+                .drain(..)
+                .filter_map(|slot| match plan.map.get(slot as usize) {
+                    Some(&m) if m != u32::MAX => Some(m),
+                    _ => None,
+                })
+                .collect();
+            *pending = carried;
         }
-        self.discard_index_files();
+        self.building.store(false, AtomicOrdering::Relaxed);
+        if remapped {
+            self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
+        } else {
+            // No usable index to carry over (exact-scan collection, a graph
+            // with holes, or a remap that failed validation): go through the
+            // ordinary rebuild path.
+            self.index.store(Arc::new(None));
+            self.pending.lock().clear();
+            if had_index {
+                self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
+            }
+            self.discard_index_files();
+        }
 
         // WAL checkpoint + truncate.
         self.wal.append(&WalTxn {
@@ -535,5 +567,78 @@ impl CollectionStore {
         self.wal.truncate()?;
 
         Ok(plan.live_count)
+    }
+
+    /// Carry the published ANN index across a compaction by renumbering it.
+    ///
+    /// Compaction renumbers live slots densely in their existing order, so a
+    /// surviving point keeps its neighbours and only its id moves. Remapping
+    /// the persisted form and rebuilding the in-memory index from it is
+    /// O(nodes · degree); a rebuild — what used to happen here — is
+    /// O(nodes · ef_construct · log n) plus a full k-means for IVF, and the
+    /// collection runs on exact scan until it finishes.
+    ///
+    /// Returns whether a usable index is still published. `false` leaves the
+    /// caller to drop the index and schedule a rebuild: that is the case for
+    /// exact-scan collections, a graph with holes (a live point that never
+    /// entered the graph — its adjacency cannot be invented, and the reload
+    /// path requires a dense node table), and any remap that fails validation.
+    fn remap_published_index(&self, inner: &super::StoreInner, plan: &CompactionPlan) -> bool {
+        enum Next {
+            Hnsw(crate::index::persist::PersistedHnsw),
+            Ivf(crate::index::persist::PersistedIvf),
+        }
+
+        // Snapshot under the published guard, then drop it before storing the
+        // replacement: `ArcSwap` reclaims the old value once its guards are
+        // gone.
+        let next = {
+            let published = self.index.load();
+            match published.as_ref() {
+                Some(PublishedIndex::Hnsw(index)) => {
+                    if !index.covers_all(plan.map.len()) {
+                        return false;
+                    }
+                    index.to_persisted().remap(&plan.map).map(Next::Hnsw)
+                }
+                Some(PublishedIndex::Ivf(index)) => {
+                    Some(Next::Ivf(index.to_persisted().remap(&plan.map)))
+                }
+                None => None,
+            }
+        };
+
+        match next {
+            Some(Next::Hnsw(remapped)) => {
+                let config = match &inner.meta.index {
+                    IndexConfig::Hnsw(config) => config.clone(),
+                    _ => HnswConfig::default(),
+                };
+                let Ok(mut index) = HnswIndex::from_persisted(remapped.clone(), &config) else {
+                    return false;
+                };
+                index.set_metrics(self.metrics_arc());
+                self.index
+                    .store(Arc::new(Some(PublishedIndex::Hnsw(Arc::new(index)))));
+                if let Err(e) = persist::save_hnsw(&self.dir, &remapped) {
+                    // The graph in memory is correct; only the open-latency
+                    // optimization is lost, and the next open rebuilds.
+                    tracing::warn!(error = %e, "remapped hnsw.bin save failed");
+                }
+                true
+            }
+            Some(Next::Ivf(remapped)) => {
+                let config = inner.ivf_config.clone().unwrap_or_default();
+                let mut index = IvfIndex::from_persisted(remapped.clone(), config);
+                index.set_metrics(self.metrics_arc());
+                self.index
+                    .store(Arc::new(Some(PublishedIndex::Ivf(Arc::new(index)))));
+                if let Err(e) = persist::save(&self.dir, &remapped) {
+                    tracing::warn!(error = %e, "remapped index.bin save failed");
+                }
+                true
+            }
+            None => false,
+        }
     }
 }
