@@ -319,9 +319,7 @@ impl VectorEngine for LocalVectorEngine {
     }
 
     fn collection_exists(&self, name: &str) -> bool {
-        self.collections.read().contains_key(name)
-            || self.kind_collections.read().contains_key(name)
-            || self.named_collections.read().contains_key(name)
+        self.stores.read().contains_key(name)
     }
 
     fn get_index_metadata(&self, name: &str) -> Option<IndexMetadata> {
@@ -354,8 +352,7 @@ impl VectorEngine for LocalVectorEngine {
                 index_name: None,
             });
         }
-        let collections = self.collections.read();
-        let store = collections.get(name)?;
+        let store = self.handle(name)?.as_dense().cloned()?;
         let meta = store.meta();
         let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
         config.index = meta.index.clone();

@@ -137,7 +137,7 @@ fn memory_export_orders_points_by_id() {
 fn memory_engine_rejects_non_dense_configs() {
     let engine = MemoryEngine::new();
     assert!(engine
-        .create_collection("sparse", &CollectionConfig::with_sparse(16, DistanceMetric::Dot))
+        .create_collection("sparse", &CollectionConfig::with_sparse(DistanceMetric::Dot))
         .is_err());
     assert!(engine
         .create_collection(

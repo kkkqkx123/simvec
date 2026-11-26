@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
@@ -8,7 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
 
-use super::{score_pair, sparse_candidate_scores, truncate_topk, KindStore};
+use super::{posting_hits, score_pair, sparse_candidate_scores, truncate_topk, KindStore};
 
 impl KindStore {
     /// Collection kind served by this store.
@@ -107,61 +107,71 @@ impl KindStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let allowed: Option<HashSet<u32>> = match &query.filter {
-            Some(filter) => {
-                let mut set = HashSet::new();
-                for (slot, point) in inner.points.iter().enumerate() {
-                    if let Some(point) = point {
-                        if filter::matches(filter, &point.id, point.payload.as_ref())? {
-                            set.insert(slot as u32);
-                        }
-                    }
-                }
-                Some(set)
+        // Filter verdicts are computed lazily and cached per slot: only slots
+        // that a posting actually reaches (or that a full scan visits) are
+        // tested, never the whole slot table up front.
+        let mut verdicts: HashMap<u32, bool> = HashMap::new();
+        let mut accept = |slot: u32| -> Result<bool> {
+            if let Some(verdict) = verdicts.get(&slot) {
+                return Ok(*verdict);
             }
-            None => None,
+            let verdict = match (&query.filter, inner.points[slot as usize].as_ref()) {
+                (Some(filter), Some(point)) => {
+                    filter::matches(filter, &point.id, point.payload.as_ref())?
+                }
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            verdicts.insert(slot, verdict);
+            Ok(verdict)
         };
 
-        // Sparse scores accumulate directly from postings; multi scans every
-        // live slot because there is no coarse structure to consult.
-        let candidates: Vec<(u32, f32)> = match &owned {
-            VectorData::Sparse { indices, values } => sparse_candidate_scores(
-                &inner.inverted,
-                &inner.norms,
-                indices,
-                values,
-                self.distance,
-                allowed.as_ref(),
-            ),
-            _ => (0..inner.points.len() as u32)
+        // Cost choice: compare posting hits with the live point count. When
+        // postings are denser than the live set, a pre-filtered full scan is
+        // cheaper than accumulating a fat inverted map; otherwise accumulate
+        // directly from postings. Both paths share the same lazy filter cache.
+        let threshold = query.score_threshold();
+        let mut candidates: Vec<(u32, f32)> = Vec::new();
+        let mut full_scan = false;
+        if let VectorData::Sparse { indices, values } = &owned {
+            let hits = posting_hits(&inner.inverted, indices);
+            full_scan = hits > inner.live_count.saturating_mul(2) as usize;
+            if !full_scan {
+                candidates = sparse_candidate_scores(
+                    &inner.inverted,
+                    &inner.norms,
+                    indices,
+                    values,
+                    self.distance,
+                    Some(&mut accept),
+                )?;
+            }
+        }
+        if full_scan || !matches!(owned, VectorData::Sparse { .. }) {
+            candidates = (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
                 .map(|slot| (slot, 0.0))
-                .collect(),
-        };
+                .collect();
+        }
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
-            if allowed.is_some() && !allowed.as_ref().is_some_and(|set| set.contains(&slot)) {
+            if !accept(slot)? {
                 continue;
             }
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
-            if allowed.is_none() {
-                if let Some(filter) = &query.filter {
-                    if !filter::matches(filter, &point.id, point.payload.as_ref())? {
-                        continue;
-                    }
-                }
-            }
             let score = match &owned {
+                VectorData::Sparse { .. } if full_scan => {
+                    score_pair(&owned, &point.data, self.distance)
+                }
                 VectorData::Sparse { .. } => sparse_score,
                 _ => score_pair(&owned, &point.data, self.distance),
             };
-            if query
-                .score_threshold()
-                .is_some_and(|threshold| score < threshold)
-            {
+            // Online threshold pruning: a candidate below the bound never
+            // enters the TopK selection, reducing work before the sort.
+            if threshold.is_some_and(|bound| score < bound) {
                 continue;
             }
             scored.push((slot, score));

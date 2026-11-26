@@ -4,8 +4,8 @@ use std::ffi::{c_char, c_int};
 
 use crate::types::PointId;
 use crate::{
-    NamedVectorQuery, PayloadSelector, QuantizationSearchParams, SearchMode, SearchQuery,
-    VectorData, VectorFilter,
+    FusionConfig, NamedVectorQuery, PayloadSelector, QuantizationSearchParams, SearchMode,
+    SearchQuery, VectorData, VectorFilter,
 };
 
 /// FFI query shape. The convenience fields mirror the Rust builders while
@@ -41,6 +41,10 @@ struct QueryDto {
     payload_selector: Option<PayloadSelector>,
     #[serde(default)]
     quantization: Option<QuantizationSearchParams>,
+    #[serde(default)]
+    fusion: Option<FusionConfig>,
+    #[serde(default)]
+    vector_spaces: Option<Vec<String>>,
 }
 
 impl QueryDto {
@@ -72,6 +76,8 @@ impl QueryDto {
             search_mode: self.search_mode,
             payload_selector: self.payload_selector,
             quantization: self.quantization,
+            fusion: self.fusion,
+            vector_spaces: self.vector_spaces,
         }
     }
 }

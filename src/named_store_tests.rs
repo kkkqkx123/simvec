@@ -13,21 +13,11 @@ fn spaces() -> BTreeMap<String, VectorSpaceConfig> {
     BTreeMap::from([
         (
             "text".to_string(),
-            VectorSpaceConfig {
-                kind: crate::types::VectorKind::Dense,
-                vector_size: 4,
-                distance: DistanceMetric::Cosine,
-                multi_config: None,
-            },
+            VectorSpaceConfig::dense(4, DistanceMetric::Cosine),
         ),
         (
             "keywords".to_string(),
-            VectorSpaceConfig {
-                kind: crate::types::VectorKind::Sparse,
-                vector_size: 16,
-                distance: DistanceMetric::Dot,
-                multi_config: None,
-            },
+            VectorSpaceConfig::sparse(DistanceMetric::Dot),
         ),
     ])
 }
@@ -388,4 +378,94 @@ fn named_multi_space_and_multi_target_fusion() {
         .unwrap();
     assert_eq!(fused.len(), 1);
     assert_eq!(fused[0].vectors.len(), 3);
+}
+
+#[test]
+fn fusion_configs_are_configurable_and_effective() {
+    use crate::types::{FusionConfig, SearchResult};
+
+    let a = || vec![
+        SearchResult::new("p1", 1.0).with_named_vector("s1", VectorData::dense(vec![1.0])),
+        SearchResult::new("p2", 0.5).with_named_vector("s1", VectorData::dense(vec![0.0])),
+    ];
+    let b = || vec![
+        SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0])),
+        SearchResult::new("p1", 0.5).with_named_vector("s2", VectorData::dense(vec![0.0])),
+    ];
+
+    // Equal weights: both appear once at the top; union carries both spaces.
+    let even = crate::types::query::fuse_rankings(
+        vec![a(), b()],
+        &FusionConfig::Rrf { k: None, weights: vec![] },
+        0,
+        10,
+    );
+    assert_eq!(even.len(), 2);
+    assert!(even.iter().all(|r| r.vectors.len() == 2));
+
+    // Weighting a disjoint second list heavily promotes its sole result.
+    let only_p2 = || vec![
+        SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0])),
+    ];
+    let weighted = crate::types::query::fuse_rankings(
+        vec![a(), only_p2()],
+        &FusionConfig::Rrf { k: None, weights: vec![1.0, 100.0] },
+        0,
+        10,
+    );
+    assert_eq!(weighted[0].id, PointId::from("p2"));
+
+    // DBSF is a usable alternative fusion that still returns both points.
+    let dbsf = crate::types::query::fuse_rankings(
+        vec![a(), b()],
+        &FusionConfig::Dbsf { weights: vec![] },
+        0,
+        10,
+    );
+    assert_eq!(dbsf.len(), 2);
+}
+
+#[test]
+fn with_vector_spaces_filters_echoed_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LocalVectorEngine::open(dir.path()).unwrap();
+    engine.create_collection("named", &named_config()).unwrap();
+    engine
+        .upsert(
+            "named",
+            point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]),
+        )
+        .unwrap();
+    let query = named_query("text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]))
+        .with_vector(true)
+        .with_vector_spaces(vec!["keywords".to_string()]);
+    let hits = engine.search("named", &query).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].vectors.contains_key("keywords"));
+    assert!(!hits[0].vectors.contains_key("text"));
+}
+
+#[test]
+fn invalid_patch_never_reaches_wal_and_reopen_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = LocalVectorEngine::open(dir.path()).unwrap();
+        engine.create_collection("named", &named_config()).unwrap();
+        engine
+            .upsert(
+                "named",
+                point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]),
+            )
+            .unwrap();
+        // Patching an unknown space is rejected before the WAL append.
+        let bad = BTreeMap::from([(
+            "nope".to_string(),
+            VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]),
+        )]);
+        assert!(engine
+            .update_named_vectors("named", &PointId::from("p1"), bad)
+            .is_err());
+    }
+    let reopened = LocalVectorEngine::open(dir.path()).unwrap();
+    assert_eq!(reopened.count("named").unwrap(), 1);
 }

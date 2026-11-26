@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use crate::error::Result;
 use crate::types::{DistanceMetric, VectorData};
 
 /// Score a (query, stored) payload pair under the collection metric.
@@ -31,23 +32,34 @@ pub(crate) fn score_pair(
 /// Accumulate dot contributions directly from posting lists.
 ///
 /// This avoids reconstructing and merging every candidate's sparse vector.
-/// Cosine divides by the cached stored norm and the query norm. When an
-/// allow-list is given, postings for other slots are skipped so filtered
-/// points never enter the candidate map.
+/// `accept` is evaluated lazily for each posting hit that first appears and
+/// its verdict cached per slot, so a filter never forces a full scan of live
+/// slots — only slots that actually share a query term are tested. A `None`
+/// accept means no filter and every posting hit is accumulated.
 pub(crate) fn sparse_candidate_scores(
     inverted: &HashMap<u32, Vec<(u32, f32)>>,
     norms: &HashMap<u32, f32>,
     indices: &[u32],
     values: &[f32],
     metric: DistanceMetric,
-    allowed: Option<&HashSet<u32>>,
-) -> Vec<(u32, f32)> {
+    mut accept: Option<&mut dyn FnMut(u32) -> Result<bool>>,
+) -> Result<Vec<(u32, f32)>> {
     let mut scores: HashMap<u32, f32> = HashMap::new();
+    let mut verdicts: HashMap<u32, bool> = HashMap::new();
     for (index, weight) in indices.iter().zip(values.iter()) {
         if let Some(postings) = inverted.get(index) {
             for (slot, stored_weight) in postings {
-                if allowed.is_some_and(|set| !set.contains(slot)) {
-                    continue;
+                if let Some(accept) = accept.as_mut() {
+                    let keep = match verdicts.entry(*slot) {
+                        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let verdict = accept(*slot)?;
+                            *entry.insert(verdict)
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
                 }
                 *scores.entry(*slot).or_default() += *weight * *stored_weight;
             }
@@ -56,7 +68,7 @@ pub(crate) fn sparse_candidate_scores(
     if metric == DistanceMetric::Cosine {
         let query_norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
         if query_norm == 0.0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         for (slot, score) in scores.iter_mut() {
             let stored_norm = norms.get(slot).copied().unwrap_or(0.0);
@@ -67,7 +79,25 @@ pub(crate) fn sparse_candidate_scores(
             };
         }
     }
-    scores.into_iter().collect()
+    // Zero-contribution candidates are not results: an all-zero query must
+    // not surface every point sharing a term with a score of zero.
+    Ok(scores
+        .into_iter()
+        .filter(|(_, score)| *score != 0.0)
+        .collect())
+}
+
+/// Estimate whether direct posting accumulation is cheaper than a full scan
+/// of live points. Uses only posting length and the live-point count — both
+/// local statistics — so no global term-frequency table is needed.
+pub(crate) fn posting_hits(
+    inverted: &HashMap<u32, Vec<(u32, f32)>>,
+    indices: &[u32],
+) -> usize {
+    indices
+        .iter()
+        .map(|index| inverted.get(index).map_or(0, Vec::len))
+        .sum()
 }
 
 /// Keep only the best `offset + limit` entries in score order, leaving the
@@ -132,41 +162,34 @@ pub(crate) fn sparse_score(
 }
 
 /// Dense similarity remapped onto the crate-wide higher-is-better contract.
+/// Uses the single shared conversion so exact-scan stores and multi spaces
+/// report scores comparable with the dense ANN path under the same metric.
 fn dense_similarity(query: &[f32], stored: &[f32], metric: crate::types::DistanceMetric) -> f32 {
     let distance = crate::distance::distance(metric, query, stored);
-    match metric {
-        crate::types::DistanceMetric::Cosine => 1.0 - distance,
-        crate::types::DistanceMetric::Dot => -distance,
-        crate::types::DistanceMetric::Euclid | crate::types::DistanceMetric::Manhattan => {
-            1.0 / (1.0 + distance)
-        }
-    }
+    crate::distance::to_score(metric, distance)
 }
 
 /// Exact MaxSim: for every query sub-vector take the best-matching stored
-/// sub-vector and sum the per-query bests. Inner dense operations reuse the
-/// shared SIMD kernel dispatch.
+/// sub-vector and sum the per-query bests. The metric branch is resolved once
+/// into a score-conversion function pointer rather than re-matched for every
+/// sub-vector pair, and inner dense operations reuse the shared SIMD kernel.
 fn max_sim(
     query: &crate::types::MultiVector,
     stored: &crate::types::MultiVector,
     metric: crate::types::DistanceMetric,
 ) -> f32 {
-    let similarity = |q: &[f32], d: &[f32]| -> f32 {
-        let distance = crate::distance::distance(metric, q, d);
-        match metric {
-            crate::types::DistanceMetric::Cosine => 1.0 - distance,
-            crate::types::DistanceMetric::Dot => -distance,
-            crate::types::DistanceMetric::Euclid | crate::types::DistanceMetric::Manhattan => {
-                1.0 / (1.0 + distance)
-            }
-        }
+    use crate::types::DistanceMetric::{Cosine, Dot, Euclid, Manhattan};
+    let to_score: fn(f32) -> f32 = match metric {
+        Dot => |d| -d,
+        Cosine => |d| 1.0 - d,
+        Euclid | Manhattan => |d| 1.0 / (1.0 + d.sqrt()),
     };
     let mut total = 0f32;
     for q in query.vectors() {
         let Some(best) = stored
             .vectors()
-            .map(|d| similarity(q, d))
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|d| to_score(crate::distance::distance(metric, q, d)))
+            .max_by(|a, b| a.total_cmp(b))
         else {
             return 0.0;
         };

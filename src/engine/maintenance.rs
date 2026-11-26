@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use super::*;
-use super::{LocalVectorEngine, MaintenanceJob};
+use super::{LocalVectorEngine, MaintenanceJob, StoreRegistry};
 use crate::error::Result;
 use crate::metrics::MetricsSnapshot;
 use crate::storage::CollectionStore;
@@ -185,7 +185,7 @@ impl LocalVectorEngine {
         let Some(jobs) = self.jobs.as_ref() else {
             return;
         };
-        maintenance_sweep(&self.collections, jobs, &self.in_flight);
+        maintenance_sweep(&self.stores, jobs, &self.in_flight);
     }
 
     /// Enqueue an index build unless one is already scheduled/running for the
@@ -208,14 +208,14 @@ impl LocalVectorEngine {
 
 pub(super) fn maintenance_loop(
     rx: Receiver<MaintenanceJob>,
-    collections: Arc<RwLock<HashMap<String, Arc<CollectionStore>>>>,
+    stores: StoreRegistry,
     jobs: Sender<MaintenanceJob>,
     in_flight: Arc<Mutex<HashSet<String>>>,
 ) {
     loop {
         match rx.recv_timeout(MAINTENANCE_TICK) {
             Ok(MaintenanceJob::Build(name)) => {
-                let store = collections.read().get(&name).cloned();
+                let store = stores.read().get(&name).and_then(|h| h.as_dense().cloned());
                 if let Some(store) = store {
                     match store.build_index() {
                         Ok(published) => {
@@ -231,7 +231,7 @@ pub(super) fn maintenance_loop(
                 in_flight.lock().remove(&name);
             }
             Ok(MaintenanceJob::Compact(name)) => {
-                let store = collections.read().get(&name).cloned();
+                let store = stores.read().get(&name).and_then(|h| h.as_dense().cloned());
                 if let Some(store) = store {
                     match store.compact() {
                         Ok(live) => tracing::debug!(
@@ -249,7 +249,7 @@ pub(super) fn maintenance_loop(
                 in_flight.lock().remove(&format!("compact:{name}"));
             }
             Ok(MaintenanceJob::Checkpoint(name)) => {
-                let store = collections.read().get(&name).cloned();
+                let store = stores.read().get(&name).and_then(|h| h.as_dense().cloned());
                 if let Some(store) = store {
                     match store.checkpoint() {
                         Ok(live) => tracing::debug!(
@@ -267,7 +267,7 @@ pub(super) fn maintenance_loop(
                 in_flight.lock().remove(&format!("checkpoint:{name}"));
             }
             Ok(MaintenanceJob::Drain(name)) => {
-                let store = collections.read().get(&name).cloned();
+                let store = stores.read().get(&name).and_then(|h| h.as_dense().cloned());
                 if let Some(store) = store {
                     store.drain_pending_hnsw();
                 }
@@ -279,14 +279,14 @@ pub(super) fn maintenance_loop(
                 // into the graph structure (the sweep may then decide
                 // whether a full rebuild is warranted).
                 {
-                    let stores = collections.read().clone();
-                    for store in stores.values() {
-                        if matches!(store.meta().index, IndexConfig::Hnsw(_)) {
-                            store.drain_pending_hnsw();
+                    let handles = stores.read();
+                    for handle in handles.values().filter_map(|h| h.as_dense()) {
+                        if matches!(handle.meta().index, IndexConfig::Hnsw(_)) {
+                            handle.drain_pending_hnsw();
                         }
                     }
                 }
-                maintenance_sweep(&collections, &jobs, &in_flight);
+                maintenance_sweep(&stores, &jobs, &in_flight);
             }
             Err(RecvTimeoutError::Disconnected) => break,
             Ok(MaintenanceJob::Shutdown) => break,
@@ -296,29 +296,34 @@ pub(super) fn maintenance_loop(
 
 /// One periodic pass over all collections.
 pub(super) fn maintenance_sweep(
-    collections: &Arc<RwLock<HashMap<String, Arc<CollectionStore>>>>,
+    stores: &StoreRegistry,
     jobs: &Sender<MaintenanceJob>,
     in_flight: &Arc<Mutex<HashSet<String>>>,
 ) {
-    let stores = collections.read().clone();
-    for (name, store) in stores {
+    let handles = stores.read();
+    for (name, handle) in handles.iter() {
         // Scratch, backup, and quarantine handles are never maintained:
         // only serving collections get builds and compactions.
         if name.contains(".rebuild-") || name.contains(".old-") || name.contains(".suspect-") {
             continue;
         }
+        // Only dense collections own an ANN index; sparse/multi/named stores
+        // are exact-scan only and have no build/promotion lifecycle.
+        let Some(store) = handle.as_dense() else {
+            continue;
+        };
         // Compaction invalidated a previously published index: restore it
         // regardless of promotion switches.
         if store.take_needs_rebuild() {
-            LocalVectorEngine::schedule_build(&name, jobs, in_flight);
+            LocalVectorEngine::schedule_build(name, jobs, in_flight);
             continue;
         }
 
         let meta = store.meta();
         match meta.index {
             IndexConfig::Flat => continue,
-            IndexConfig::Ivf(_) => sweep_ivf(&name, &store, jobs, in_flight),
-            IndexConfig::Hnsw(_) => sweep_hnsw(&name, &store, jobs, in_flight),
+            IndexConfig::Ivf(_) => sweep_ivf(name, store, jobs, in_flight),
+            IndexConfig::Hnsw(_) => sweep_hnsw(name, store, jobs, in_flight),
         }
     }
 }

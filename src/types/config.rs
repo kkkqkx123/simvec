@@ -80,9 +80,11 @@ impl CollectionConfig {
         }
     }
 
-    /// Declare a `VectorKind::Sparse` collection. `vector_size` is the
-    /// vocabulary bound: every sparse index must be smaller than it.
-    pub fn with_sparse(_vector_size: usize, distance: DistanceMetric) -> Self {
+    /// Declare a `VectorKind::Sparse` collection. Sparse ids live in an open
+    /// `u32` domain, so there is no vocabulary-bound parameter; the legacy
+    /// two-argument form is kept only as a JSON/binding boundary adapter and
+    /// its size argument is ignored.
+    pub fn with_sparse(distance: DistanceMetric) -> Self {
         let mut config = Self::new(SPARSE_DIM_BOUND, distance);
         config.kind = VectorKind::Sparse;
         config.vectors = VectorsConfig::from([(
@@ -116,45 +118,30 @@ impl CollectionConfig {
             ));
         }
         for (name, space) in &self.vectors {
-            match space.kind {
-                VectorKind::Dense => {
-                    if space.multi_config.is_some() {
-                        return Err(VectorSearchError::InvalidConfig(format!(
-                            "space {name:?} is dense but declares multi parameters"
-                        )));
-                    }
-                    if space.vector_size == 0 {
+            match space {
+                VectorSpaceConfig::Dense {
+                    vector_size,
+                    distance,
+                    multi_config,
+                } => {
+                    if *vector_size == 0 {
                         return Err(VectorSearchError::InvalidConfig(format!(
                             "space {name:?} vector_size must be >= 1"
                         )));
                     }
-                }
-                VectorKind::Sparse => {
-                    if space.multi_config.is_some() {
-                        return Err(VectorSearchError::InvalidConfig(format!(
-                            "space {name:?} is sparse but declares multi parameters"
-                        )));
+                    let _ = distance;
+                    if let Some(multi) = multi_config {
+                        if multi.max_vectors_per_point == 0 {
+                            return Err(VectorSearchError::InvalidConfig(format!(
+                                "space {name:?} max_vectors_per_point must be >= 1"
+                            )));
+                        }
                     }
-                    validate_sparse_distance(space.distance).map_err(|e| {
+                }
+                VectorSpaceConfig::Sparse { distance } => {
+                    validate_sparse_distance(*distance).map_err(|e| {
                         VectorSearchError::InvalidConfig(format!("space {name:?}: {e}"))
                     })?;
-                }
-                VectorKind::Multi => {
-                    let Some(multi) = space.multi_config else {
-                        return Err(VectorSearchError::InvalidConfig(format!(
-                            "multi space {name:?} must declare multi parameters"
-                        )));
-                    };
-                    if space.vector_size == 0 {
-                        return Err(VectorSearchError::InvalidConfig(format!(
-                            "space {name:?} sub-vector dimension must be >= 1"
-                        )));
-                    }
-                    if multi.max_vectors_per_point == 0 {
-                        return Err(VectorSearchError::InvalidConfig(format!(
-                            "space {name:?} max_vectors_per_point must be >= 1"
-                        )));
-                    }
                 }
             }
         }
@@ -171,25 +158,25 @@ impl CollectionConfig {
                 ));
             }
         } else if let Some(space) = self.default_space() {
-            if self.vector_size != space.vector_size
-                || self.distance != space.distance
-                || self.kind != space.kind
-                || self.multi_config != space.multi_config
+            if self.vector_size != space.vector_size()
+                || self.distance != space.distance()
+                || self.kind != space.kind()
+                || self.multi_config != space.multi_config()
             {
                 return Err(VectorSearchError::InvalidConfig(
                     "single-space fields disagree with the declared default space".to_string(),
                 ));
             }
-            if space.kind != VectorKind::Dense && !matches!(self.index, IndexConfig::Flat) {
+            if space.kind() != VectorKind::Dense && !matches!(self.index, IndexConfig::Flat) {
                 return Err(VectorSearchError::InvalidConfig(format!(
                     "{} collections do not support ANN indexes; use IndexConfig::Flat",
-                    space.kind.as_name()
+                    space.kind().as_name()
                 )));
             }
-            if space.kind != VectorKind::Dense && self.quantization_config.is_some() {
+            if space.kind() != VectorKind::Dense && self.quantization_config.is_some() {
                 return Err(VectorSearchError::InvalidConfig(format!(
                     "{} collections do not support quantization",
-                    space.kind.as_name()
+                    space.kind().as_name()
                 )));
             }
         }

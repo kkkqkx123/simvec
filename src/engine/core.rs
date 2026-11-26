@@ -7,7 +7,7 @@ use std::thread::Builder as ThreadBuilder;
 use parking_lot::{Mutex, RwLock};
 
 use super::maintenance::maintenance_loop;
-use super::{LocalVectorEngine, MaintenanceJob};
+use super::{LocalVectorEngine, MaintenanceJob, SpaceHandle};
 use crate::error::{Result, VectorSearchError};
 use crate::storage::CollectionStore;
 use crate::types::{
@@ -39,9 +39,7 @@ impl LocalVectorEngine {
             crate::distance::kernel::selected()
         );
 
-        let mut collections = HashMap::new();
-        let mut kind_collections = HashMap::new();
-        let mut named_collections = HashMap::new();
+        let mut stores: HashMap<String, SpaceHandle> = HashMap::new();
         for entry in std::fs::read_dir(&root_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -60,55 +58,43 @@ impl LocalVectorEngine {
             }
             if path.join("kind.bin").exists() {
                 let store = crate::kind_store::KindStore::open(&path, &storage)?;
-                kind_collections.insert(name, store);
+                stores.insert(name, SpaceHandle::Kind(store));
                 continue;
             }
             if path.join("named.bin").exists() {
                 let store = crate::named_store::NamedStore::open(&path, &storage)?;
-                named_collections.insert(name, store);
+                stores.insert(name, SpaceHandle::Named(store));
                 continue;
             }
             let store = CollectionStore::open_with_storage(&path, &storage)?;
-            collections.insert(name, store);
+            stores.insert(name, SpaceHandle::Dense(store));
         }
 
-        Ok(Self::assemble(
-            root_dir,
-            collections,
-            kind_collections,
-            named_collections,
-            storage,
-        ))
+        Ok(Self::assemble(root_dir, stores, storage))
     }
 
     pub(super) fn assemble(
         root_dir: PathBuf,
-        collections: HashMap<String, Arc<CollectionStore>>,
-        kind_collections: HashMap<String, Arc<crate::kind_store::KindStore>>,
-        named_collections: HashMap<String, Arc<crate::named_store::NamedStore>>,
+        stores: HashMap<String, SpaceHandle>,
         storage: StorageConfig,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<MaintenanceJob>();
-        let collections = Arc::new(RwLock::new(collections));
-        let kind_collections = Arc::new(RwLock::new(kind_collections));
-        let named_collections = Arc::new(RwLock::new(named_collections));
+        let stores = Arc::new(RwLock::new(stores));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
 
-        let worker_collections = Arc::clone(&collections);
+        let worker_stores = Arc::clone(&stores);
         let worker_in_flight = Arc::clone(&in_flight);
         let worker_jobs = tx.clone();
         let handle = ThreadBuilder::new()
             .name("vector-maintenance".to_string())
             .spawn(move || {
-                maintenance_loop(rx, worker_collections, worker_jobs, worker_in_flight);
+                maintenance_loop(rx, worker_stores, worker_jobs, worker_in_flight);
             })
             .expect("spawn vector-maintenance thread");
 
         Self {
             root_dir,
-            collections,
-            kind_collections,
-            named_collections,
+            stores,
             storage,
             default_ivf: RwLock::new(None),
             default_hnsw: RwLock::new(None),
@@ -129,18 +115,12 @@ impl LocalVectorEngine {
     /// (`.suspect-*`) handles are tracked separately and never appear here,
     /// so metrics and maintenance sweeps only see serving data.
     pub fn collection_names(&self) -> Vec<String> {
-        let mut names: std::collections::HashSet<String> =
-            self.collections.read().keys().cloned().collect();
-        names.extend(self.kind_collections.read().keys().cloned());
-        names.extend(self.named_collections.read().keys().cloned());
-        let mut names: Vec<String> = names
-            .into_iter()
-            .filter(|name| {
-                !name.contains(".rebuild-")
-                    && !name.contains(".old-")
-                    && !name.contains(".suspect-")
-            })
-            .collect();
+        let mut names: Vec<String> = self.stores.read().keys().cloned().collect();
+        names.retain(|name| {
+            !name.contains(".rebuild-")
+                && !name.contains(".old-")
+                && !name.contains(".suspect-")
+        });
         names.sort_unstable();
         names
     }
@@ -167,9 +147,9 @@ impl LocalVectorEngine {
                 config.max_points,
                 &self.storage,
             )?;
-            self.named_collections
+            self.stores
                 .write()
-                .insert(name.to_string(), store);
+                .insert(name.to_string(), SpaceHandle::Named(store));
             return Ok(());
         }
         let mut effective = config;
@@ -206,13 +186,15 @@ impl LocalVectorEngine {
             effective.quantization_config = None;
             let store =
                 crate::kind_store::KindStore::create(&dir, name, &effective, &self.storage)?;
-            self.kind_collections
+            self.stores
                 .write()
-                .insert(name.to_string(), store);
+                .insert(name.to_string(), SpaceHandle::Kind(store));
             return Ok(());
         }
         let store = CollectionStore::create_with_storage(&dir, name, &effective, &self.storage)?;
-        self.collections.write().insert(name.to_string(), store);
+        self.stores
+            .write()
+            .insert(name.to_string(), SpaceHandle::Dense(store));
         Ok(())
     }
 
@@ -230,15 +212,10 @@ impl LocalVectorEngine {
     /// be writing derived files while the directory is torn down.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
         let dir = {
-            let mut collections = self.collections.write();
-            if let Some(store) = collections.remove(name) {
-                store.dir().to_path_buf()
-            } else if let Some(store) = self.kind_collections.write().remove(name) {
-                store.dir().to_path_buf()
-            } else if let Some(store) = self.named_collections.write().remove(name) {
-                store.dir().to_path_buf()
-            } else {
-                self.root_dir.join(name)
+            let mut stores = self.stores.write();
+            match stores.remove(name) {
+                Some(handle) => handle.dir().to_path_buf(),
+                None => self.root_dir.join(name),
             }
         };
         if !dir.exists() {
@@ -281,9 +258,7 @@ impl LocalVectorEngine {
     /// to find orphaned temps without adopting them as logical indexes.
     pub fn list_collections(&self) -> Vec<String> {
         let mut names: std::collections::HashSet<String> =
-            self.collections.read().keys().cloned().collect();
-        names.extend(self.kind_collections.read().keys().cloned());
-        names.extend(self.named_collections.read().keys().cloned());
+            self.stores.read().keys().cloned().collect();
         if let Ok(entries) = std::fs::read_dir(&self.root_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -304,18 +279,29 @@ impl LocalVectorEngine {
 
     /// Whether a collection exists.
     pub fn collection_exists(&self, name: &str) -> bool {
-        self.collections.read().contains_key(name)
-            || self.kind_collections.read().contains_key(name)
-            || self.named_collections.read().contains_key(name)
+        self.stores.read().contains_key(name)
     }
 
     /// The named store behind `collection`, when it is a named-vectors
     /// collection.
+    /// Resolve the single handle for a collection. This is the one registry
+    /// lookup every read/write entry point starts from.
+    pub(super) fn handle(&self, collection: &str) -> Option<SpaceHandle> {
+        self.stores.read().get(collection).cloned()
+    }
+
+    /// Require a collection handle, returning the standard not-found error.
+    /// This is the single lookup every read/write entry point starts from.
+    pub(super) fn require_handle(&self, collection: &str) -> Result<SpaceHandle> {
+        self.handle(collection)
+            .ok_or_else(|| VectorSearchError::CollectionNotFound(collection.to_string()))
+    }
+
     pub fn named_store(
         &self,
         collection: &str,
     ) -> Result<Option<Arc<crate::named_store::NamedStore>>> {
-        Ok(self.named_collections.read().get(collection).cloned())
+        Ok(self.handle(collection).and_then(|h| h.as_named().cloned()))
     }
 
     /// The kind store behind `collection`, when it is a Sparse/Multi
@@ -324,7 +310,7 @@ impl LocalVectorEngine {
         &self,
         collection: &str,
     ) -> Result<Option<Arc<crate::kind_store::KindStore>>> {
-        Ok(self.kind_collections.read().get(collection).cloned())
+        Ok(self.handle(collection).and_then(|h| h.as_kind().cloned()))
     }
 
     /// Collection configuration, or `None` if the collection does not exist.
@@ -356,17 +342,17 @@ impl LocalVectorEngine {
             config.max_points = store.max_points();
             return Ok(Some(config));
         }
-        let collections = self.collections.read();
-        Ok(collections.get(name).map(|store| {
-            let meta = store.meta();
-            let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
-            config.index = meta.index.clone();
-            config.quantization_config = meta.quantization_config.clone();
-            config.max_points = meta.max_points;
-            config.vectors_on_disk = meta.vectors_on_disk;
-            config.storage_hints = meta.storage_hints.clone();
-            config
-        }))
+        let Some(store) = self.handle(name).and_then(|h| h.as_dense().cloned()) else {
+            return Ok(None);
+        };
+        let meta = store.meta();
+        let mut config = CollectionConfig::new(meta.vector_size, meta.distance);
+        config.index = meta.index.clone();
+        config.quantization_config = meta.quantization_config.clone();
+        config.max_points = meta.max_points;
+        config.vectors_on_disk = meta.vectors_on_disk;
+        config.storage_hints = meta.storage_hints.clone();
+        Ok(Some(config))
     }
 
     /// Detailed collection info.
@@ -412,9 +398,9 @@ impl LocalVectorEngine {
                 memory_bytes: store.memory_bytes(),
             });
         }
-        let collections = self.collections.read();
-        let store = collections
-            .get(name)
+        let store = self
+            .handle(name)
+            .and_then(|h| h.as_dense().cloned())
             .ok_or_else(|| VectorSearchError::CollectionNotFound(name.to_string()))?;
         let meta = store.meta();
         let live = store.count();
@@ -439,10 +425,8 @@ impl LocalVectorEngine {
     }
 
     pub(super) fn store(&self, collection: &str) -> Result<Arc<CollectionStore>> {
-        self.collections
-            .read()
-            .get(collection)
-            .cloned()
+        self.handle(collection)
+            .and_then(|h| h.as_dense().cloned())
             .ok_or_else(|| VectorSearchError::CollectionNotFound(collection.to_string()))
     }
 }

@@ -50,6 +50,143 @@ pub struct NamedVectorQuery {
     pub data: VectorData,
 }
 
+pub const DEFAULT_RRF_K: usize = 2;
+
+/// How multiple target rankings are fused into one result list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FusionConfig {
+    /// Reciprocal rank fusion. Weights are per target; a missing weight
+    /// defaults to 1.0. `k` defaults to [`DEFAULT_RRF_K`] when omitted.
+    Rrf {
+        #[serde(default)]
+        k: Option<usize>,
+        #[serde(default)]
+        weights: Vec<f32>,
+    },
+    /// Distribution-based score fusion: each list is normalized to [0,1]
+    /// using mean ± 3σ, then the (optionally weighted) scores are summed.
+    Dbsf {
+        #[serde(default)]
+        weights: Vec<f32>,
+    },
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self::Rrf {
+            k: None,
+            weights: Vec::new(),
+        }
+    }
+}
+
+fn fusion_weight(weights: &[f32], target: usize) -> f32 {
+    weights.get(target).copied().unwrap_or(1.0)
+}
+
+/// Fuse per-target result lists into one ranked list. Each input list is
+/// already ordered by its own score (best first). Vector maps of repeated ids
+/// are merged so callers receive the union of all targeted spaces.
+pub fn fuse_rankings(
+    rankings: Vec<Vec<SearchResult>>,
+    config: &FusionConfig,
+    offset: usize,
+    limit: usize,
+) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+
+    let mut fused: HashMap<PointId, (f32, SearchResult)> = HashMap::new();
+    match config {
+        FusionConfig::Rrf { k, weights } => {
+            let k = k.unwrap_or(DEFAULT_RRF_K);
+            for (target, list) in rankings.into_iter().enumerate() {
+                let weight = fusion_weight(weights, target);
+                if weight <= 0.0 {
+                    continue;
+                }
+                for (rank, result) in list.into_iter().enumerate() {
+                    let contribution = 1.0 / ((rank as f32 + 1.0) / weight + k as f32 - 1.0);
+                    merge_fused(&mut fused, result, contribution);
+                }
+            }
+        }
+        FusionConfig::Dbsf { weights } => {
+            let normalized: Vec<(f32, Vec<SearchResult>)> = rankings
+                .into_iter()
+                .enumerate()
+                .map(|(target, list)| (fusion_weight(weights, target), normalize_distr(list)))
+                .collect();
+            for (weight, list) in normalized {
+                for result in list {
+                    merge_fused(&mut fused, result, weight);
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(f32, SearchResult)> = fused.into_values().collect();
+    ranked.sort_unstable_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.id.to_string().cmp(&b.1.id.to_string()))
+    });
+    ranked
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(score, mut result)| {
+            result.score = score;
+            result
+        })
+        .collect()
+}
+
+fn merge_fused(
+    fused: &mut std::collections::HashMap<PointId, (f32, SearchResult)>,
+    result: SearchResult,
+    contribution: f32,
+) {
+    match fused.get_mut(&result.id) {
+        Some((score, best)) => {
+            *score += contribution;
+            for (space, data) in result.vectors {
+                best.vectors.insert(space, data);
+            }
+        }
+        None => {
+            fused.insert(result.id.clone(), (contribution, result));
+        }
+    }
+}
+
+/// Normalize a scored list to [0,1] using mean ± 3σ (Welford one-pass).
+fn normalize_distr(mut list: Vec<SearchResult>) -> Vec<SearchResult> {
+    if list.len() < 2 {
+        if let Some(one) = list.first_mut() {
+            one.score = 0.5;
+        }
+        return list;
+    }
+    let n = list.len() as f32;
+    let mean = list.iter().map(|r| r.score).sum::<f32>() / n;
+    let variance = list
+        .iter()
+        .map(|r| (r.score - mean) * (r.score - mean))
+        .sum::<f32>()
+        / (n - 1.0);
+    let std_dev = variance.sqrt();
+    let min = mean - 3.0 * std_dev;
+    let max = mean + 3.0 * std_dev;
+    if min == max {
+        for r in &mut list {
+            r.score = 0.5;
+        }
+        return list;
+    }
+    for r in &mut list {
+        r.score = (r.score - min) / (max - min);
+    }
+    list
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// Query vectors, one per targeted space. Single-space collections carry
@@ -65,6 +202,14 @@ pub struct SearchQuery {
     pub search_mode: Option<SearchMode>,
     pub payload_selector: Option<PayloadSelector>,
     pub quantization: Option<QuantizationSearchParams>,
+    /// How multiple target rankings are combined. Defaults to weighted RRF
+    /// when absent. Serde-defaulted to keep the JSON boundary compatible.
+    #[serde(default)]
+    pub fusion: Option<FusionConfig>,
+    /// When `with_vector` is set, restrict the echoed spaces to this list.
+    /// Empty/absent means all spaces.
+    #[serde(default)]
+    pub vector_spaces: Option<Vec<String>>,
 }
 
 impl SearchQuery {
@@ -81,6 +226,8 @@ impl SearchQuery {
             search_mode: None,
             payload_selector: None,
             quantization: None,
+            fusion: None,
+            vector_spaces: None,
         }
     }
 
@@ -180,6 +327,18 @@ impl SearchQuery {
 
     pub fn with_vector(mut self, with_vector: bool) -> Self {
         self.with_vector = Some(with_vector);
+        self
+    }
+
+    /// Restrict the echoed named spaces when `with_vector` is enabled.
+    pub fn with_vector_spaces(mut self, spaces: Vec<String>) -> Self {
+        self.vector_spaces = Some(spaces);
+        self
+    }
+
+    /// Configure how multiple target rankings are fused.
+    pub fn with_fusion(mut self, fusion: FusionConfig) -> Self {
+        self.fusion = Some(fusion);
         self
     }
 

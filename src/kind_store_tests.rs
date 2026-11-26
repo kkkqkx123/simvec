@@ -11,7 +11,7 @@ use crate::types::{
 use crate::{LocalVectorEngine, VectorEngine};
 
 fn sparse_config() -> CollectionConfig {
-    CollectionConfig::with_sparse(100, DistanceMetric::Dot)
+    CollectionConfig::with_sparse(DistanceMetric::Dot)
 }
 
 fn multi_config() -> CollectionConfig {
@@ -37,7 +37,7 @@ fn kind_configs_validate() {
     config.distance = DistanceMetric::Euclid;
     assert!(config.validate_kind().is_err());
 
-    assert!(CollectionConfig::with_sparse(100, DistanceMetric::Cosine)
+    assert!(CollectionConfig::with_sparse(DistanceMetric::Cosine)
         .validate_kind()
         .is_ok());
 
@@ -57,9 +57,36 @@ fn dense_config_rejects_kind_params() {
 }
 
 #[test]
-fn sparse_weights_must_be_non_negative() {
+fn sparse_weights_allow_negative() {
+    // Negative weights are valid: without posting pruning they cannot hide
+    // an otherwise-matching candidate.
     let data = VectorData::sparse(vec![1, 2], vec![1.0, -0.5]);
-    assert!(data.validate(100, 1).is_err());
+    assert!(data.validate(100, 1).is_ok());
+}
+
+#[test]
+fn sparse_empty_and_zero_weight_queries_return_no_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+    engine.create_collection("kb", &sparse_config()).unwrap();
+    engine
+        .upsert_batch(
+            "kb",
+            &[sparse_point("p1", &[(1, 1.0), (2, 2.0)])],
+        )
+        .unwrap();
+
+    let empty = SearchQuery::with_data(
+        VectorData::sparse(vec![], vec![]),
+        10,
+    );
+    assert!(engine.search("kb", &empty).unwrap().is_empty());
+
+    let zero = SearchQuery::with_data(
+        VectorData::sparse(vec![1, 2], vec![0.0, 0.0]),
+        10,
+    );
+    assert!(engine.search("kb", &zero).unwrap().is_empty());
 }
 
 #[test]
@@ -267,4 +294,94 @@ fn exact_store_compaction_reclaims_slots_and_cap_is_enforced() {
     drop(engine);
     let reopened = LocalVectorEngine::open(tmp.path()).unwrap();
     assert_eq!(reopened.count("kb").unwrap(), 1);
+}
+
+#[test]
+fn multi_vector_try_new_rejects_ragged_and_zero_dimension() {
+    assert!(VectorData::try_multi(vec![vec![1.0, 0.0], vec![0.0, 1.0]]).is_ok());
+    assert!(VectorData::try_multi(vec![vec![1.0, 0.0], vec![0.0]]).is_err());
+    assert!(VectorData::try_multi(vec![vec![]]).is_err());
+    assert!(VectorData::try_multi(vec![]).is_err());
+
+    // A deserialized ragged payload must be rejected by validation too.
+    let ragged = VectorData::Multi(crate::types::MultiVector {
+        flat: vec![1.0, 0.0, 1.0],
+        dim: 2,
+    });
+    assert!(ragged.validate(2, 4).is_err());
+}
+
+#[test]
+fn filtered_sparse_search_matches_post_filter_and_cost_paths_agree() {
+    use crate::types::{FilterCondition, PayloadSelector, VectorFilter};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+    engine.create_collection("kb", &sparse_config()).unwrap();
+    let mut points = Vec::new();
+    for i in 0..40u32 {
+        let lang = if i % 2 == 0 { "en" } else { "fr" };
+        points.push(
+            sparse_point(&format!("p{i}",), &[(i % 5, 1.0 + (i % 3) as f32)])
+                .with_payload_kv("lang", serde_json::json!(lang)),
+        );
+    }
+    engine.upsert_batch("kb", &points).unwrap();
+
+    let query_vec = VectorData::sparse(vec![0, 1, 2, 3, 4], vec![1.0; 5]);
+    let filter = VectorFilter::new().must(FilterCondition::match_value("lang", "en"));
+
+    // Filtered path (lazy accept over posting hits).
+    let filtered = engine
+        .search("kb", &SearchQuery::with_data(query_vec.clone(), 100).with_filter(filter.clone()))
+        .unwrap();
+    // Post-filter path: search everything, then keep matching payloads.
+    let unfiltered = engine
+        .search(
+            "kb",
+            &SearchQuery::with_data(query_vec.clone(), 100)
+                .with_payload_selector(PayloadSelector::default()),
+        )
+        .unwrap();
+    let mut expected: Vec<_> = unfiltered
+        .into_iter()
+        .filter(|r| {
+            r.payload
+                .as_ref()
+                .and_then(|p| p.get("lang"))
+                .and_then(|v| v.as_str())
+                == Some("en")
+        })
+        .collect();
+    // Engine tie-break is ascending insertion slot, which here follows the
+    // numeric suffix of the id (p0, p1, ... inserted in order).
+    let slot_order = |r: &crate::types::SearchResult| -> u64 {
+        r.id
+            .to_string()
+            .trim_start_matches('p')
+            .parse()
+            .unwrap_or(u64::MAX)
+    };
+    expected.sort_by(|a, b| b.score.total_cmp(&a.score).then(slot_order(a).cmp(&slot_order(b))));
+
+    let got_ids: Vec<_> = filtered.iter().map(|r| r.id.to_string()).collect();
+    let expected_ids: Vec<_> = expected.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(got_ids, expected_ids);
+    assert!(filtered.iter().all(|r| r.score != 0.0));
+}
+
+#[test]
+fn invalid_upsert_never_reaches_wal_and_reopen_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+        engine.create_collection("kb", &sparse_config()).expect("create");
+        // A dense payload on a sparse collection is rejected before append.
+        let bad = VectorPoint::with_data("bad", VectorData::Dense(vec![1.0, 2.0]));
+        assert!(engine.upsert("kb", bad).is_err());
+        assert_eq!(engine.count("kb").unwrap(), 0);
+    }
+    // Replay of a WAL with no committed bad record opens cleanly.
+    let reopened = LocalVectorEngine::open(tmp.path()).unwrap();
+    assert_eq!(reopened.count("kb").unwrap(), 0);
 }

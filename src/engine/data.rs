@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{LocalVectorEngine, TxnOp};
+use super::{LocalVectorEngine, SpaceHandle, TxnOp};
 use crate::error::{Result, VectorSearchError};
 use crate::storage::{WalPoint, WalRecord};
 use crate::types::{
@@ -10,63 +10,61 @@ use crate::types::{
 impl LocalVectorEngine {
     /// Upsert a point (WAL-backed).
     pub fn upsert(&self, collection: &str, point: VectorPoint) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .upsert_batch(std::slice::from_ref(&point))
-                .inspect_err(|_| named.metrics().record_upsert_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_upsert_error()),
+            SpaceHandle::Kind(kind) => kind
                 .upsert_batch(std::slice::from_ref(&point))
-                .inspect_err(|_| kind.metrics().record_upsert_error());
+                .inspect_err(|_| kind.metrics().record_upsert_error()),
+            SpaceHandle::Dense(store) => {
+                let result = store.apply_ops(&[WalRecord::Upsert {
+                    point: WalPoint::from_point(&point)?,
+                }]);
+                if result.is_err() {
+                    store.metrics().record_upsert_error();
+                }
+                result?;
+                self.after_mutation(collection, &store);
+                Ok(())
+            }
         }
-        let store = self.store(collection)?;
-        let result = store.apply_ops(&[WalRecord::Upsert {
-            point: WalPoint::from_point(&point)?,
-        }]);
-        if result.is_err() {
-            store.metrics().record_upsert_error();
-        }
-        result?;
-        self.after_mutation(collection, &store);
-        Ok(())
     }
 
     /// Upsert a batch of points (WAL-backed, single transaction).
     pub fn upsert_batch(&self, collection: &str, points: &[VectorPoint]) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .upsert_batch(points)
-                .inspect_err(|_| named.metrics().record_upsert_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_upsert_error()),
+            SpaceHandle::Kind(kind) => kind
                 .upsert_batch(points)
-                .inspect_err(|_| kind.metrics().record_upsert_error());
-        }
-        let store = self.store(collection)?;
-        let ops: Result<Vec<_>> = points
-            .iter()
-            .map(|p| {
-                Ok(WalRecord::Upsert {
-                    point: WalPoint::from_point(p)?,
-                })
-            })
-            .collect();
-        let ops = match ops {
-            Ok(ops) => ops,
-            Err(e) => {
-                store.metrics().record_upsert_error();
-                return Err(e);
+                .inspect_err(|_| kind.metrics().record_upsert_error()),
+            SpaceHandle::Dense(store) => {
+                let ops: Result<Vec<_>> = points
+                    .iter()
+                    .map(|p| {
+                        Ok(WalRecord::Upsert {
+                            point: WalPoint::from_point(p)?,
+                        })
+                    })
+                    .collect();
+                let ops = match ops {
+                    Ok(ops) => ops,
+                    Err(e) => {
+                        store.metrics().record_upsert_error();
+                        return Err(e);
+                    }
+                };
+                let result = store.apply_ops(&ops);
+                if result.is_err() {
+                    store.metrics().record_upsert_error();
+                }
+                result?;
+                self.after_mutation(collection, &store);
+                Ok(())
             }
-        };
-        let result = store.apply_ops(&ops);
-        if result.is_err() {
-            store.metrics().record_upsert_error();
         }
-        result?;
-        self.after_mutation(collection, &store);
-        Ok(())
     }
 
     /// Replace selected named spaces of an existing point.
@@ -76,84 +74,81 @@ impl LocalVectorEngine {
         point_id: &PointId,
         vectors: std::collections::BTreeMap<String, crate::types::VectorData>,
     ) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.patch_named(point_id, vectors);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.patch_named(point_id, vectors),
+            _ => Err(VectorSearchError::InvalidConfig(format!(
+                "collection {collection} is not a named-vectors collection"
+            ))),
         }
-        Err(VectorSearchError::InvalidConfig(format!(
-            "collection {collection} is not a named-vectors collection"
-        )))
     }
 
     /// Delete a point by id (WAL-backed). Deleting a missing id is a no-op.
     pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .delete(point_id)
-                .inspect_err(|_| named.metrics().record_delete_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_delete_error()),
+            SpaceHandle::Kind(kind) => kind
                 .delete(point_id)
-                .inspect_err(|_| kind.metrics().record_delete_error());
+                .inspect_err(|_| kind.metrics().record_delete_error()),
+            SpaceHandle::Dense(store) => {
+                let result = store.apply_ops(&[WalRecord::Delete {
+                    point_id: point_id.to_string(),
+                }]);
+                if result.is_err() {
+                    store.metrics().record_delete_error();
+                }
+                result?;
+                self.after_mutation(collection, &store);
+                Ok(())
+            }
         }
-        let store = self.store(collection)?;
-        let result = store.apply_ops(&[WalRecord::Delete {
-            point_id: point_id.to_string(),
-        }]);
-        if result.is_err() {
-            store.metrics().record_delete_error();
-        }
-        result?;
-        self.after_mutation(collection, &store);
-        Ok(())
     }
 
     /// Delete a batch of points (WAL-backed, single transaction).
     pub fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .delete_batch(point_ids)
-                .inspect_err(|_| named.metrics().record_delete_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_delete_error()),
+            SpaceHandle::Kind(kind) => kind
                 .delete_batch(point_ids)
-                .inspect_err(|_| kind.metrics().record_delete_error());
+                .inspect_err(|_| kind.metrics().record_delete_error()),
+            SpaceHandle::Dense(store) => {
+                let result = store.apply_ops(&[WalRecord::DeleteBatch {
+                    point_ids: point_ids.iter().map(|id| id.to_string()).collect(),
+                }]);
+                if result.is_err() {
+                    store.metrics().record_delete_error();
+                }
+                result?;
+                self.after_mutation(collection, &store);
+                Ok(())
+            }
         }
-        let store = self.store(collection)?;
-        let result = store.apply_ops(&[WalRecord::DeleteBatch {
-            point_ids: point_ids.iter().map(|id| id.to_string()).collect(),
-        }]);
-        if result.is_err() {
-            store.metrics().record_delete_error();
-        }
-        result?;
-        self.after_mutation(collection, &store);
-        Ok(())
     }
 
     /// Delete every point matching `filter`. Returns the number deleted.
     pub fn delete_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .delete_by_filter(filter)
-                .inspect_err(|_| named.metrics().record_delete_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_delete_error()),
+            SpaceHandle::Kind(kind) => kind
                 .delete_by_filter(filter)
-                .inspect_err(|_| kind.metrics().record_delete_error());
-        }
-        let store = self.store(collection)?;
-        let deleted = match store.delete_by_filter(filter) {
-            Ok(deleted) => deleted,
-            Err(e) => {
-                store.metrics().record_delete_error();
-                return Err(e);
+                .inspect_err(|_| kind.metrics().record_delete_error()),
+            SpaceHandle::Dense(store) => {
+                let deleted = match store.delete_by_filter(filter) {
+                    Ok(deleted) => deleted,
+                    Err(e) => {
+                        store.metrics().record_delete_error();
+                        return Err(e);
+                    }
+                };
+                self.after_mutation(collection, &store);
+                Ok(deleted)
             }
-        };
-        self.after_mutation(collection, &store);
-        Ok(deleted)
+        }
     }
 
     /// Exact full-scan search.
@@ -163,56 +158,48 @@ impl LocalVectorEngine {
     /// Remote Qdrant engines normalize their raw Euclid distances to the
     /// same contract at the client boundary.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
-        if let Some(named) = self.named_store(collection)? {
-            return named
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named
                 .search(query)
-                .inspect_err(|_| named.metrics().record_search_error());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind
+                .inspect_err(|_| named.metrics().record_search_error()),
+            SpaceHandle::Kind(kind) => kind
                 .search(query)
-                .inspect_err(|_| kind.metrics().record_search_error());
+                .inspect_err(|_| kind.metrics().record_search_error()),
+            SpaceHandle::Dense(store) => {
+                let results = store.search(query);
+                if results.is_err() {
+                    store.metrics().record_search_error();
+                }
+                results
+            }
         }
-        let store = self.store(collection)?;
-        let results = store.search(query);
-        if results.is_err() {
-            store.metrics().record_search_error();
-        }
-        results
     }
 
     /// Fetch a point by id.
     pub fn get(&self, collection: &str, point_id: &PointId) -> Result<Option<VectorPoint>> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.get(point_id);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.get(point_id),
+            SpaceHandle::Kind(kind) => kind.get(point_id),
+            SpaceHandle::Dense(store) => store.get(point_id),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.get(point_id);
-        }
-        let store = self.store(collection)?;
-        store.get(point_id)
     }
 
     /// Number of live points in a collection.
     pub fn count(&self, collection: &str) -> Result<u64> {
-        if let Some(named) = self.named_store(collection)? {
-            return Ok(named.count());
-        }
-        if let Some(kind) = self.kind_store(collection)? {
-            return Ok(kind.count());
-        }
-        Ok(self.store(collection)?.count())
+        Ok(match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.count(),
+            SpaceHandle::Kind(kind) => kind.count(),
+            SpaceHandle::Dense(store) => store.count(),
+        })
     }
 
     /// Number of live points matching `filter`. Pure read.
     pub fn count_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.count_by_filter(filter);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.count_by_filter(filter),
+            SpaceHandle::Kind(kind) => kind.count_by_filter(filter),
+            SpaceHandle::Dense(store) => store.count_by_filter(filter),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.count_by_filter(filter);
-        }
-        self.store(collection)?.count_by_filter(filter)
     }
 
     /// Replace the payload for a single point. The point must exist and not
@@ -223,14 +210,11 @@ impl LocalVectorEngine {
         point_id: &PointId,
         payload: Payload,
     ) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.set_payload(point_id, payload);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.set_payload(point_id, payload),
+            SpaceHandle::Kind(kind) => kind.set_payload(point_id, payload),
+            SpaceHandle::Dense(store) => store.set_payload(point_id, payload),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.set_payload(point_id, payload);
-        }
-        let store = self.store(collection)?;
-        store.set_payload(point_id, payload)
     }
 
     /// Remove specific keys from a point's payload. The remaining keys are
@@ -241,14 +225,11 @@ impl LocalVectorEngine {
         point_id: &PointId,
         keys: Vec<String>,
     ) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.delete_payload_keys(point_id, &keys);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.delete_payload_keys(point_id, &keys),
+            SpaceHandle::Kind(kind) => kind.delete_payload_keys(point_id, &keys),
+            SpaceHandle::Dense(store) => store.delete_payload_keys(point_id, keys),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.delete_payload_keys(point_id, &keys);
-        }
-        let store = self.store(collection)?;
-        store.delete_payload_keys(point_id, keys)
     }
 
     /// Set a single field on a point's payload (merge semantics). A missing
@@ -273,14 +254,11 @@ impl LocalVectorEngine {
         point_id: &PointId,
         fields: Payload,
     ) -> Result<()> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.set_payload_fields(point_id, fields);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.set_payload_fields(point_id, fields),
+            SpaceHandle::Kind(kind) => kind.set_payload_fields(point_id, fields),
+            SpaceHandle::Dense(store) => store.set_payload_fields(point_id, fields),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.set_payload_fields(point_id, fields);
-        }
-        let store = self.store(collection)?;
-        store.set_payload_fields(point_id, fields)
     }
 
     /// Create a payload field index on a collection. The index is populated
@@ -291,22 +269,22 @@ impl LocalVectorEngine {
         field: &str,
         schema: PayloadSchemaType,
     ) -> Result<()> {
-        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
-            return Err(VectorSearchError::InvalidConfig(
+        match self.require_handle(collection)? {
+            SpaceHandle::Dense(store) => store.create_payload_index(field, schema),
+            _ => Err(VectorSearchError::InvalidConfig(
                 "exact-scan collections do not support payload field indexes".to_string(),
-            ));
+            )),
         }
-        self.store(collection)?.create_payload_index(field, schema)
     }
 
     /// Drop the payload field index on `field`. Returns whether it existed.
     pub fn delete_payload_index(&self, collection: &str, field: &str) -> Result<bool> {
-        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
-            return Err(VectorSearchError::InvalidConfig(
+        match self.require_handle(collection)? {
+            SpaceHandle::Dense(store) => store.delete_payload_index(field),
+            _ => Err(VectorSearchError::InvalidConfig(
                 "exact-scan collections do not support payload field indexes".to_string(),
-            ));
+            )),
         }
-        self.store(collection)?.delete_payload_index(field)
     }
 
     /// All declared payload indexes as `(field, schema_type)` pairs.
@@ -314,10 +292,10 @@ impl LocalVectorEngine {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, PayloadSchemaType)>> {
-        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
-            return Ok(Vec::new());
+        match self.require_handle(collection)? {
+            SpaceHandle::Dense(store) => Ok(store.list_payload_indexes()),
+            _ => Ok(Vec::new()),
         }
-        Ok(self.store(collection)?.list_payload_indexes())
     }
 
     /// Paginated scan over live points in slot order.
@@ -332,14 +310,11 @@ impl LocalVectorEngine {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.scroll(limit, offset, with_payload, with_vector);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => named.scroll(limit, offset, with_payload, with_vector),
+            SpaceHandle::Kind(kind) => kind.scroll(limit, offset, with_payload, with_vector),
+            SpaceHandle::Dense(store) => store.scroll(limit, offset, with_payload, with_vector),
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.scroll(limit, offset, with_payload, with_vector);
-        }
-        let store = self.store(collection)?;
-        store.scroll(limit, offset, with_payload, with_vector)
     }
 
     /// Paginated scan over live points matching `filter`, in slot order.
@@ -354,14 +329,17 @@ impl LocalVectorEngine {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
-        if let Some(named) = self.named_store(collection)? {
-            return named.scroll_by_filter(filter, limit, offset, with_payload, with_vector);
+        match self.require_handle(collection)? {
+            SpaceHandle::Named(named) => {
+                named.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
+            }
+            SpaceHandle::Kind(kind) => {
+                kind.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
+            }
+            SpaceHandle::Dense(store) => {
+                store.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
+            }
         }
-        if let Some(kind) = self.kind_store(collection)? {
-            return kind.scroll_by_filter(filter, limit, offset, with_payload, with_vector);
-        }
-        let store = self.store(collection)?;
-        store.scroll_by_filter(filter, limit, offset, with_payload, with_vector)
     }
 
     /// Commit protocol entry for coordinated transactions.
@@ -383,24 +361,16 @@ impl LocalVectorEngine {
         for op in ops {
             match op {
                 TxnOp::Upsert { collection, point } => {
-                    if self.named_store(&collection)?.is_some() {
-                        by_collection
-                            .entry(collection)
-                            .or_default()
-                            .push(crate::named_store::named_upsert_record(&point)?);
-                    } else if self.kind_store(&collection)?.is_some() {
-                        by_collection
-                            .entry(collection)
-                            .or_default()
-                            .push(kind_upsert_record(&point)?);
-                    } else {
-                        by_collection
-                            .entry(collection)
-                            .or_default()
-                            .push(WalRecord::Upsert {
-                                point: WalPoint::from_point(&point)?,
-                            });
-                    }
+                    let record = match self.require_handle(&collection)? {
+                        SpaceHandle::Named(_) => {
+                            crate::named_store::named_upsert_record(&point)?
+                        }
+                        SpaceHandle::Kind(_) => kind_upsert_record(&point)?,
+                        SpaceHandle::Dense(_) => WalRecord::Upsert {
+                            point: WalPoint::from_point(&point)?,
+                        },
+                    };
+                    by_collection.entry(collection).or_default().push(record);
                 }
                 TxnOp::Delete {
                     collection,
@@ -418,17 +388,14 @@ impl LocalVectorEngine {
         names.sort_unstable();
         for name in names {
             let ops = by_collection.remove(&name).expect("key present");
-            if let Some(named) = self.named_store(&name)? {
-                named.apply_records(&ops)?;
-                continue;
+            match self.require_handle(&name)? {
+                SpaceHandle::Named(named) => named.apply_records(&ops)?,
+                SpaceHandle::Kind(kind) => kind.apply_records(&ops)?,
+                SpaceHandle::Dense(store) => {
+                    store.apply_txn(&ops)?;
+                    self.maybe_schedule_compaction(&name, &store);
+                }
             }
-            if let Some(kind) = self.kind_store(&name)? {
-                kind.apply_records(&ops)?;
-                continue;
-            }
-            let store = self.store(&name)?;
-            store.apply_txn(&ops)?;
-            self.maybe_schedule_compaction(&name, &store);
         }
         Ok(())
     }

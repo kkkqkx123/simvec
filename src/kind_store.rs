@@ -36,6 +36,7 @@ mod score;
 mod state;
 mod write;
 
+pub(crate) use self::score::posting_hits;
 pub(crate) use self::score::score_pair;
 pub(crate) use self::score::sparse_candidate_scores;
 pub(crate) use self::score::truncate_topk;

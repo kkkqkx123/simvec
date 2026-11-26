@@ -83,17 +83,69 @@ pub use self::api::VectorEngine;
 /// A background worker thread performs IVF scheduling: index builds,
 /// post-compaction rebuilds and periodic drift checks. It holds only shared
 /// handles to the collection map, so dropping the engine shuts it down.
+/// A handle to one opened collection, regardless of its storage engine.
+///
+/// All three store kinds register here under a single collection name, so a
+/// read or write dispatch resolves the collection once and matches a single
+/// enum instead of probing three independent maps.
+#[derive(Clone)]
+pub enum SpaceHandle {
+    Dense(Arc<CollectionStore>),
+    Kind(Arc<crate::kind_store::KindStore>),
+    Named(Arc<crate::named_store::NamedStore>),
+}
+
+impl SpaceHandle {
+    /// The dense store, when this handle is a dense collection. Maintenance
+    /// and graph promotion are dense-only and use this accessor.
+    pub fn as_dense(&self) -> Option<&Arc<CollectionStore>> {
+        match self {
+            Self::Dense(store) => Some(store),
+            _ => None,
+        }
+    }
+
+    pub fn as_named(&self) -> Option<&Arc<crate::named_store::NamedStore>> {
+        match self {
+            Self::Named(store) => Some(store),
+            _ => None,
+        }
+    }
+
+    pub fn as_kind(&self) -> Option<&Arc<crate::kind_store::KindStore>> {
+        match self {
+            Self::Kind(store) => Some(store),
+            _ => None,
+        }
+    }
+
+    /// Directory backing the collection, independent of store kind.
+    pub fn dir(&self) -> &std::path::Path {
+        match self {
+            Self::Dense(store) => store.dir(),
+            Self::Kind(store) => store.dir(),
+            Self::Named(store) => store.dir(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SpaceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(_) => f.write_str("SpaceHandle::Dense"),
+            Self::Kind(_) => f.write_str("SpaceHandle::Kind"),
+            Self::Named(_) => f.write_str("SpaceHandle::Named"),
+        }
+    }
+}
+
+/// The single collection registry. A name maps to exactly one handle.
+pub type StoreRegistry = Arc<RwLock<HashMap<String, SpaceHandle>>>;
+
 pub struct LocalVectorEngine {
     root_dir: PathBuf,
-    collections: Arc<RwLock<HashMap<String, Arc<CollectionStore>>>>,
-    /// Sparse / Multi kind collections, served by the exact-scan kind store
-    /// instead of the dense HNSW/IVF pipeline. Keyed by collection name; a
-    /// name lives in at most one of the two maps.
-    kind_collections: Arc<RwLock<HashMap<String, Arc<crate::kind_store::KindStore>>>>,
-    /// Named-vectors collections, served by the exact-scan named store.
-    /// Keyed by collection name; a name lives in at most one of the three
-    /// maps.
-    named_collections: Arc<RwLock<HashMap<String, Arc<crate::named_store::NamedStore>>>>,
+    /// Single registry of every opened collection, keyed by name.
+    stores: StoreRegistry,
     /// Engine-level storage tuning applied to every collection this engine
     /// opens or creates.
     storage: StorageConfig,
@@ -113,7 +165,7 @@ impl std::fmt::Debug for LocalVectorEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalVectorEngine")
             .field("root_dir", &self.root_dir)
-            .field("collection_count", &self.collections.read().len())
+            .field("collection_count", &self.stores.read().len())
             .finish()
     }
 }

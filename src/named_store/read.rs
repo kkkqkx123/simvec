@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
@@ -16,15 +16,18 @@ impl NamedStore {
         self.spaces
             .iter()
             .map(|(name, meta)| {
-                (
-                    name.clone(),
-                    VectorSpaceConfig {
-                        kind: meta.kind,
-                        vector_size: meta.vector_size,
-                        distance: meta.distance,
-                        multi_config: meta.multi_config,
-                    },
-                )
+                let space = match meta.kind {
+                    crate::types::VectorKind::Sparse => VectorSpaceConfig::sparse(meta.distance),
+                    crate::types::VectorKind::Multi => VectorSpaceConfig::multi(
+                        meta.vector_size,
+                        meta.distance,
+                        meta.multi_config.unwrap_or_else(|| crate::types::MultiConfig::new(1)),
+                    ),
+                    crate::types::VectorKind::Dense => {
+                        VectorSpaceConfig::dense(meta.vector_size, meta.distance)
+                    }
+                };
+                (name.clone(), space)
             })
             .collect()
     }
@@ -114,67 +117,73 @@ impl NamedStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let allowed: Option<HashSet<u32>> = match &query.filter {
-            Some(filter) => {
-                let mut set = HashSet::new();
-                for (slot, point) in inner.points.iter().enumerate() {
-                    if let Some(point) = point {
-                        if filter::matches(filter, &point.id, point.payload.as_ref())? {
-                            set.insert(slot as u32);
-                        }
-                    }
-                }
-                Some(set)
+        // Filter verdicts are computed lazily and cached per slot; only slots
+        // a posting reaches (or a full scan visits) are ever tested.
+        let mut verdicts: HashMap<u32, bool> = HashMap::new();
+        let mut accept = |slot: u32| -> Result<bool> {
+            if let Some(verdict) = verdicts.get(&slot) {
+                return Ok(*verdict);
             }
-            None => None,
+            let verdict = match (&query.filter, inner.points[slot as usize].as_ref()) {
+                (Some(filter), Some(point)) => {
+                    filter::matches(filter, &point.id, point.payload.as_ref())?
+                }
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            verdicts.insert(slot, verdict);
+            Ok(verdict)
         };
 
-        // Sparse scores accumulate from postings; other spaces scan all slots.
         let metric = space.distance;
-        let candidates: Vec<(u32, f32)> = match &owned {
-            VectorData::Sparse { indices, values } => {
-                let space_index = inner.inverted.get(target);
-                let norms = inner.norms.get(target);
-                match (space_index, norms) {
-                    (Some(space_index), Some(norms)) => {
-                        sparse_scores(space_index, norms, indices, values, metric, allowed.as_ref())
-                    }
-                    _ => Vec::new(),
+        let threshold = query.score_threshold();
+        let mut candidates: Vec<(u32, f32)> = Vec::new();
+        let mut full_scan = false;
+        if let VectorData::Sparse { indices, values } = &owned {
+            let space_index = inner.inverted.get(target);
+            let norms = inner.norms.get(target);
+            if let (Some(space_index), Some(norms)) = (space_index, norms) {
+                let hits = crate::kind_store::posting_hits(space_index, indices);
+                full_scan = hits > inner.live_count.saturating_mul(2) as usize;
+                if !full_scan {
+                    candidates = sparse_scores(
+                        space_index,
+                        norms,
+                        indices,
+                        values,
+                        metric,
+                        Some(&mut accept),
+                    )?;
                 }
+            } else {
+                candidates = Vec::new();
             }
-            _ => (0..inner.points.len() as u32)
+        }
+        if full_scan || !matches!(owned, VectorData::Sparse { .. }) {
+            candidates = (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
                 .map(|slot| (slot, 0.0))
-                .collect(),
-        };
+                .collect();
+        }
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
-            if allowed.is_some() && !allowed.as_ref().is_some_and(|set| set.contains(&slot)) {
+            if !accept(slot)? {
                 continue;
             }
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
-            if allowed.is_none() {
-                if let Some(filter) = &query.filter {
-                    if !filter::matches(filter, &point.id, point.payload.as_ref())? {
-                        continue;
-                    }
-                }
-            }
-            let stored = point
-                .vectors
-                .get(target)
-                .expect("validated point carries every space");
+            // A point missing the target space is not a candidate for it.
+            let Some(stored) = point.vectors.get(target) else {
+                continue;
+            };
             let score = match &owned {
+                VectorData::Sparse { .. } if full_scan => score_pair(&owned, stored, metric),
                 VectorData::Sparse { .. } => sparse_score,
                 _ => score_pair(&owned, stored, metric),
             };
-            if query
-                .score_threshold()
-                .is_some_and(|threshold| score < threshold)
-            {
+            if threshold.is_some_and(|bound| score < bound) {
                 continue;
             }
             scored.push((slot, score));
@@ -204,6 +213,13 @@ impl NamedStore {
                 }
                 if with_vector {
                     for (space, data) in &point.vectors {
+                        if query
+                            .vector_spaces
+                            .as_ref()
+                            .is_some_and(|allowed| !allowed.contains(space))
+                        {
+                            continue;
+                        }
                         result = result.with_named_vector(space, data.clone());
                     }
                 }
@@ -222,38 +238,19 @@ impl NamedStore {
     /// filters, paging and payload projection; only the vector target differs.
     fn search_fused(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         let started = std::time::Instant::now();
-        let mut fused: HashMap<PointId, (f32, SearchResult)> = HashMap::new();
+        // Each target is searched independently with its own filter, threshold
+        // and per-target candidate budget; only the final paging is applied by
+        // the query-layer fusion of these per-target rankings.
+        let mut rankings: Vec<Vec<SearchResult>> = Vec::with_capacity(query.vectors.len());
         for target in &query.vectors {
             let mut single = query.clone();
             single.vectors = vec![target.clone()];
-            for (rank, result) in self.search(&single)?.into_iter().enumerate() {
-                let contribution = 1.0 / (60.0 + rank as f32 + 1.0);
-                match fused.get_mut(&result.id) {
-                    Some((score, best)) => {
-                        *score += contribution;
-                        for (space, data) in &result.vectors {
-                            best.vectors.insert(space.clone(), data.clone());
-                        }
-                    }
-                    None => {
-                        fused.insert(result.id.clone(), (contribution, result));
-                    }
-                }
-            }
+            rankings.push(self.search(&single)?);
         }
-        let mut ranked: Vec<(f32, SearchResult)> = fused.into_values().collect();
-        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.id.to_string().cmp(&b.1.id.to_string())));
+        let config = query.fusion.clone().unwrap_or_default();
         let limit = query.effective_limit();
         let offset = query.offset.unwrap_or(0);
-        let results = ranked
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(score, mut result)| {
-                result.score = score;
-                result
-            })
-            .collect();
+        let results = crate::types::query::fuse_rankings(rankings, &config, offset, limit);
         self.metrics.record_search(
             crate::metrics::SearchPath::Exact,
             query.filter.is_some(),

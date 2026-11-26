@@ -241,6 +241,12 @@ impl KindStore {
         Ok(())
     }
 
+    /// Apply an already-validated upsert as a pure state transition.
+    ///
+    /// Shape, kind, capacity and payload JSON were checked in
+    /// `write::validate_records` before the record was appended to the WAL.
+    /// Replay therefore never re-validates and cannot reject a persisted
+    /// transaction; decoding trusted bytes is the only fallible step left.
     pub(super) fn apply_upsert(
         &self,
         inner: &mut Inner,
@@ -252,18 +258,6 @@ impl KindStore {
             .as_ref()
             .map(|p| serde_json::from_str(p))
             .transpose()?;
-        self.validate_data(&data)?;
-        if !inner.reverse.contains_key(&id) {
-            if let Some(cap) = self.max_points {
-                if inner.live_count >= cap {
-                    return Err(VectorSearchError::CapacityExceeded {
-                        collection: self.name.clone(),
-                        max_points: cap,
-                        requested: inner.live_count.saturating_add(1),
-                    });
-                }
-            }
-        }
         // Idempotent overwrite: a replayed or repeated upsert of the same id
         // replaces the stored point in place (the old slot is tombstoned and
         // its postings dropped).

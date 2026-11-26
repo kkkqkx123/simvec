@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::LocalVectorEngine;
+use super::{LocalVectorEngine, SpaceHandle};
 use crate::error::{Result, VectorSearchError};
 use crate::storage::CollectionStore;
 
@@ -28,8 +28,8 @@ impl LocalVectorEngine {
         }
         let backup_name = format!("{live}{backup_suffix}");
         let backup_dir = self.root_dir.join(&backup_name);
-        let live_store = self.collections.write().remove(live);
-        let temp_store = self.collections.write().remove(temp);
+        let live_store = self.stores.write().remove(live);
+        let temp_store = self.stores.write().remove(temp);
         let _ = temp_store;
         let rename_result: Result<()> = (|| {
             if live_dir.exists() {
@@ -44,33 +44,39 @@ impl LocalVectorEngine {
         if let Err(error) = rename_result {
             if live_dir.exists() {
                 if let Ok(store) = CollectionStore::open_with_storage(&live_dir, &self.storage) {
-                    self.collections.write().insert(live.to_string(), store);
+                    self.stores
+                        .write()
+                        .insert(live.to_string(), SpaceHandle::Dense(store));
                 } else if let Some(store) = live_store {
-                    self.collections.write().insert(live.to_string(), store);
+                    self.stores.write().insert(live.to_string(), store);
                 }
             } else if backup_dir.exists() {
                 let _ = std::fs::rename(&backup_dir, &live_dir);
                 if let Ok(store) = CollectionStore::open_with_storage(&live_dir, &self.storage) {
-                    self.collections.write().insert(live.to_string(), store);
+                    self.stores
+                        .write()
+                        .insert(live.to_string(), SpaceHandle::Dense(store));
                 } else if let Some(store) = live_store {
-                    self.collections.write().insert(live.to_string(), store);
+                    self.stores.write().insert(live.to_string(), store);
                 }
             } else if let Some(store) = live_store {
-                self.collections.write().insert(live.to_string(), store);
+                self.stores.write().insert(live.to_string(), store);
             }
             return Err(error);
         }
         let store = CollectionStore::open_with_storage(&live_dir, &self.storage)?;
-        self.collections.write().insert(live.to_string(), store);
+        self.stores
+            .write()
+            .insert(live.to_string(), SpaceHandle::Dense(store));
         // Keep the backup handle loaded for inspection (`count`, reverse
         // recovery) without exposing it to search: nothing routes to
         // `.old-*` names and `collection_names` hides them.
         if backup_dir.exists() {
             if let Ok(backup_store) = CollectionStore::open_with_storage(&backup_dir, &self.storage)
             {
-                self.collections
+                self.stores
                     .write()
-                    .insert(backup_name.clone(), backup_store);
+                    .insert(backup_name.clone(), SpaceHandle::Dense(backup_store));
             }
         }
         self.prune_old_backups(live, Some(&backup_name));
@@ -89,8 +95,8 @@ impl LocalVectorEngine {
         };
         let live_dir = self.root_dir.join(live);
         let backup_dir = self.root_dir.join(&backup_name);
-        self.collections.write().remove(live);
-        self.collections.write().remove(&backup_name);
+        self.stores.write().remove(live);
+        self.stores.write().remove(&backup_name);
         if live_dir.exists() {
             let suspect = format!(
                 "{live}.suspect-{}",
@@ -103,7 +109,9 @@ impl LocalVectorEngine {
         }
         std::fs::rename(&backup_dir, &live_dir)?;
         let store = CollectionStore::open_with_storage(&live_dir, &self.storage)?;
-        self.collections.write().insert(live.to_string(), store);
+        self.stores
+            .write()
+            .insert(live.to_string(), SpaceHandle::Dense(store));
         Ok(backup_name)
     }
 
@@ -143,7 +151,7 @@ impl LocalVectorEngine {
             if keep.is_some_and(|keep| keep == backup) {
                 continue;
             }
-            self.collections.write().remove(&backup);
+            self.stores.write().remove(&backup);
             if let Err(error) = std::fs::remove_dir_all(self.root_dir.join(&backup)) {
                 tracing::warn!("failed to prune vector promote backup {backup}: {error}");
             }

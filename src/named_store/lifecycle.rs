@@ -34,10 +34,10 @@ impl NamedStore {
                     (
                         name.clone(),
                         NamedSpaceMeta {
-                            kind: config.kind,
-                            vector_size: config.vector_size,
-                            distance: config.distance,
-                            multi_config: config.multi_config,
+                            kind: config.kind(),
+                            vector_size: config.vector_size(),
+                            distance: config.distance(),
+                            multi_config: config.multi_config(),
                         },
                     )
                 })
@@ -268,6 +268,11 @@ impl NamedStore {
         Ok(())
     }
 
+    /// Apply an already-validated upsert as a pure state transition.
+    ///
+    /// Space names, kinds, dimensions, capacity and payload JSON were checked
+    /// in `write::validate_records` before the WAL append, so replay never
+    /// re-validates a persisted transaction.
     pub(super) fn apply_upsert(
         &self,
         inner: &mut Inner,
@@ -279,18 +284,6 @@ impl NamedStore {
             .as_ref()
             .map(|p| serde_json::from_str(p))
             .transpose()?;
-        self.validate_vectors(&vectors)?;
-        if !inner.reverse.contains_key(&id) {
-            if let Some(cap) = self.max_points {
-                if inner.live_count >= cap {
-                    return Err(VectorSearchError::CapacityExceeded {
-                        collection: self.name.clone(),
-                        max_points: cap,
-                        requested: inner.live_count.saturating_add(1),
-                    });
-                }
-            }
-        }
         // Idempotent overwrite: a replayed or repeated upsert of the same id
         // replaces the stored point in place (the old slot is tombstoned and
         // its postings dropped).
@@ -313,18 +306,20 @@ impl NamedStore {
         Ok(())
     }
 
+    /// Apply an already-validated named-space patch as a pure state transition.
+    ///
+    /// Validation ran in `write::validate_records` before the WAL append.
+    /// The slot lookup is a state read, not a request validation: it is a
+    /// no-op-safe guard for a point removed by an earlier record in the batch.
     pub(super) fn apply_patch(
         &self,
         inner: &mut Inner,
         id: String,
         vectors: BTreeMap<String, VectorData>,
     ) -> Result<()> {
-        self.validate_patch(&vectors)?;
-        let slot = inner
-            .reverse
-            .get(&id)
-            .copied()
-            .ok_or_else(|| VectorSearchError::InvalidConfig(format!("point {id} not found")))?;
+        let Some(slot) = inner.reverse.get(&id).copied() else {
+            return Ok(());
+        };
         let mut point = inner.points[slot as usize]
             .take()
             .ok_or_else(|| VectorSearchError::CorruptData(format!("point {id} has no slot")))?;

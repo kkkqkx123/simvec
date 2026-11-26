@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::error::Result;
 use crate::kind_store::{score_pair as kind_score_pair, sparse_candidate_scores};
 use crate::types::DistanceMetric;
 
@@ -22,7 +23,7 @@ pub(crate) fn sparse_scores(
     indices: &[u32],
     values: &[f32],
     metric: DistanceMetric,
-    allowed: Option<&std::collections::HashSet<u32>>,
-) -> Vec<(u32, f32)> {
-    sparse_candidate_scores(space_index, norms, indices, values, metric, allowed)
+    accept: Option<&mut dyn FnMut(u32) -> Result<bool>>,
+) -> Result<Vec<(u32, f32)>> {
+    sparse_candidate_scores(space_index, norms, indices, values, metric, accept)
 }

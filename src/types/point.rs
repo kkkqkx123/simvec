@@ -17,20 +17,38 @@ pub struct MultiVector {
 }
 
 impl MultiVector {
-    pub fn new(vectors: Vec<Vec<f32>>) -> Self {
+    /// Fallible constructor. Rejects ragged sub-vectors, zero dimensions and
+    /// an empty set so an invalid payload cannot enter the store or a query.
+    pub fn try_new(vectors: Vec<Vec<f32>>) -> Result<Self> {
         let dim = vectors.first().map_or(0, Vec::len);
-        Self {
+        if dim == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "multi vector requires at least one non-zero sub-vector".to_string(),
+            ));
+        }
+        if vectors.iter().any(|v| v.len() != dim) {
+            return Err(VectorSearchError::InvalidConfig(
+                "multi vector sub-vectors must have equal length".to_string(),
+            ));
+        }
+        Ok(Self {
             flat: vectors.into_iter().flatten().collect(),
             dim,
-        }
+        })
+    }
+
+    /// Convenience constructor for trusted inputs; panics on malformed data.
+    /// Use [`Self::try_new`] at any untrusted boundary.
+    pub fn new(vectors: Vec<Vec<f32>>) -> Self {
+        Self::try_new(vectors).expect("invalid multi vector")
     }
 
     pub fn vectors(&self) -> impl Iterator<Item = &[f32]> {
-        self.flat.chunks_exact(self.dim.max(1))
+        self.flat.chunks_exact(self.dim)
     }
 
     pub fn count(&self) -> usize {
-        self.flat.len() / self.dim.max(1)
+        self.flat.len() / self.dim
     }
 }
 
@@ -57,6 +75,11 @@ impl VectorData {
 
     pub fn sparse(indices: Vec<u32>, values: Vec<f32>) -> Self {
         Self::Sparse { indices, values }
+    }
+
+    /// Fallible multi-vector constructor for untrusted payloads.
+    pub fn try_multi(vectors: Vec<Vec<f32>>) -> Result<Self> {
+        Ok(Self::Multi(MultiVector::try_new(vectors)?))
     }
 
     pub fn multi(vectors: Vec<Vec<f32>>) -> Self {
@@ -97,11 +120,8 @@ impl VectorData {
                         values.len()
                     )));
                 }
-                if indices.is_empty() {
-                    return Err(VectorSearchError::InvalidConfig(
-                        "sparse vector must not be empty".to_string(),
-                    ));
-                }
+                // Empty sparse vectors are valid: they contribute no postings
+                // and an empty sparse query returns an empty result set.
                 let mut seen = std::collections::HashSet::with_capacity(indices.len());
                 for index in indices.iter() {
                     if !seen.insert(*index) {
@@ -118,23 +138,30 @@ impl VectorData {
                         });
                     }
                 }
+                // Negative weights are allowed: there is no posting pruning,
+                // so negative contributions cannot hide valid candidates.
                 validate_finite(values)?;
-                if values.iter().any(|value| *value < 0.0) {
-                    return Err(VectorSearchError::InvalidConfig(
-                        "sparse weights must be non-negative".to_string(),
-                    ));
-                }
             }
             VectorData::Multi(multi) => {
-                if multi.count() == 0 {
+                if multi.dim == 0 {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi vector requires a non-zero sub-vector dimension".to_string(),
+                    ));
+                }
+                if multi.flat.is_empty() {
                     return Err(VectorSearchError::InvalidConfig(
                         "multi vector must contain at least one sub-vector".to_string(),
                     ));
                 }
-                if multi.count() > max_vectors {
+                if multi.flat.len() % multi.dim != 0 {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "multi vector flat payload is ragged".to_string(),
+                    ));
+                }
+                let count = multi.count();
+                if count > max_vectors {
                     return Err(VectorSearchError::InvalidConfig(format!(
-                        "multi vector count {} exceeds configured limit {max_vectors}",
-                        multi.count()
+                        "multi vector count {count} exceeds configured limit {max_vectors}"
                     )));
                 }
                 if multi.dim != dim {

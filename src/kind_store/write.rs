@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use crate::error::{Result, VectorSearchError};
@@ -7,6 +7,15 @@ use crate::storage::{WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData, VectorFilter, VectorPoint};
 
 use super::{Inner, KindStore};
+
+/// Decode a serialized payload to confirm it is valid before it reaches the
+/// WAL. Applying already-validated records then only decodes trusted bytes.
+fn validate_payload(payload: Option<&str>) -> Result<()> {
+    if let Some(payload) = payload {
+        serde_json::from_str::<Payload>(payload)?;
+    }
+    Ok(())
+}
 
 impl KindStore {
     /// WAL-backed upsert of a batch of points.
@@ -105,6 +114,10 @@ impl KindStore {
         records: Vec<WalRecord>,
         started: Instant,
     ) -> Result<()> {
+        // Validate everything that can reject a request (shape, kind,
+        // capacity, payload JSON) before the WAL append. Once appended,
+        // apply is a pure state transition that cannot fail on bad input.
+        self.validate_records(inner, &records)?;
         let upserts = records
             .iter()
             .filter(|record| matches!(record, WalRecord::UpsertVectors { .. }))
@@ -186,6 +199,72 @@ impl KindStore {
         if self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes {
             if let Err(error) = self.checkpoint_from_locked(inner) {
                 tracing::warn!(error = %error, "kind store checkpoint failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a whole record batch before any byte reaches the WAL.
+    ///
+    /// Capacity is checked against a simulated live set so a batch that adds
+    /// more points than `max_points` allows is rejected as a unit. Replay of
+    /// an appended batch never re-runs these checks: only validated records
+    /// can be persisted, and applying them is a pure state transition.
+    fn validate_records(&self, inner: &Inner, records: &[WalRecord]) -> Result<()> {
+        let mut present: HashSet<String> = inner.reverse.keys().cloned().collect();
+        let mut projected_live = inner.live_count;
+        for record in records {
+            match record {
+                WalRecord::UpsertVectors {
+                    id,
+                    vectors,
+                    payload,
+                } => {
+                    let data = kind_data(vectors)?;
+                    self.validate_data(&data)?;
+                    validate_payload(payload.as_deref())?;
+                    if !present.contains(id) {
+                        if let Some(cap) = self.max_points {
+                            if projected_live >= cap {
+                                return Err(VectorSearchError::CapacityExceeded {
+                                    collection: self.name.clone(),
+                                    max_points: cap,
+                                    requested: projected_live.saturating_add(1),
+                                });
+                            }
+                        }
+                        present.insert(id.clone());
+                        projected_live = projected_live.saturating_add(1);
+                    }
+                }
+                WalRecord::Delete { point_id } => {
+                    if present.remove(point_id) {
+                        projected_live = projected_live.saturating_sub(1);
+                    }
+                }
+                WalRecord::DeleteBatch { point_ids } => {
+                    for point_id in point_ids {
+                        if present.remove(point_id) {
+                            projected_live = projected_live.saturating_sub(1);
+                        }
+                    }
+                }
+                WalRecord::SetPayload { payload, .. } => {
+                    validate_payload(payload.as_deref())?;
+                }
+                WalRecord::SetPayloadField { value, .. } => {
+                    serde_json::from_str::<serde_json::Value>(value)?;
+                }
+                WalRecord::DeletePayloadKeys { .. } => {}
+                WalRecord::Upsert { .. }
+                | WalRecord::PatchNamedVectors { .. }
+                | WalRecord::Compact
+                | WalRecord::Quantize
+                | WalRecord::DropCollection => {
+                    return Err(VectorSearchError::Internal(
+                        "kind store commit received an unsupported record".to_string(),
+                    ));
+                }
             }
         }
         Ok(())

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use crate::error::{Result, VectorSearchError};
@@ -7,6 +7,15 @@ use crate::storage::{WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData, VectorFilter, VectorPoint};
 
 use super::{Inner, NamedStore};
+
+/// Decode a serialized payload to confirm it is valid before it reaches the
+/// WAL. Applying already-validated records then only decodes trusted bytes.
+fn validate_payload(payload: Option<&str>) -> Result<()> {
+    if let Some(payload) = payload {
+        serde_json::from_str::<Payload>(payload)?;
+    }
+    Ok(())
+}
 
 impl NamedStore {
     /// WAL-backed upsert of a batch of named points. Each point must carry
@@ -124,6 +133,9 @@ impl NamedStore {
         records: Vec<WalRecord>,
         started: Instant,
     ) -> Result<()> {
+        // Validate the entire batch before the WAL append so an illegal
+        // upsert/patch can never be persisted (and then fail on replay).
+        self.validate_records(inner, &records)?;
         let upserts = records
             .iter()
             .filter(|record| matches!(record, WalRecord::UpsertVectors { .. }))
@@ -206,6 +218,77 @@ impl NamedStore {
         if self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes {
             if let Err(error) = self.checkpoint_from_locked(inner) {
                 tracing::warn!(error = %error, "named store checkpoint failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a whole record batch before any byte reaches the WAL.
+    ///
+    /// Space names, kinds, dimensions, capacity and payload JSON are all
+    /// checked here against a simulated live set. Replay of an appended batch
+    /// skips these checks: only validated records are ever persisted.
+    fn validate_records(&self, inner: &Inner, records: &[WalRecord]) -> Result<()> {
+        let mut present: HashSet<String> = inner.reverse.keys().cloned().collect();
+        let mut projected_live = inner.live_count;
+        for record in records {
+            match record {
+                WalRecord::UpsertVectors {
+                    id,
+                    vectors,
+                    payload,
+                } => {
+                    self.validate_vectors(vectors)?;
+                    validate_payload(payload.as_deref())?;
+                    if !present.contains(id) {
+                        if let Some(cap) = self.max_points {
+                            if projected_live >= cap {
+                                return Err(VectorSearchError::CapacityExceeded {
+                                    collection: self.name.clone(),
+                                    max_points: cap,
+                                    requested: projected_live.saturating_add(1),
+                                });
+                            }
+                        }
+                        present.insert(id.clone());
+                        projected_live = projected_live.saturating_add(1);
+                    }
+                }
+                WalRecord::PatchNamedVectors { id, vectors } => {
+                    self.validate_patch(vectors)?;
+                    if !present.contains(id) {
+                        return Err(VectorSearchError::InvalidConfig(format!(
+                            "patch targets missing point {id}"
+                        )));
+                    }
+                }
+                WalRecord::Delete { point_id } => {
+                    if present.remove(point_id) {
+                        projected_live = projected_live.saturating_sub(1);
+                    }
+                }
+                WalRecord::DeleteBatch { point_ids } => {
+                    for point_id in point_ids {
+                        if present.remove(point_id) {
+                            projected_live = projected_live.saturating_sub(1);
+                        }
+                    }
+                }
+                WalRecord::SetPayload { payload, .. } => {
+                    validate_payload(payload.as_deref())?;
+                }
+                WalRecord::SetPayloadField { value, .. } => {
+                    serde_json::from_str::<serde_json::Value>(value)?;
+                }
+                WalRecord::DeletePayloadKeys { .. } => {}
+                WalRecord::Upsert { .. }
+                | WalRecord::Compact
+                | WalRecord::Quantize
+                | WalRecord::DropCollection => {
+                    return Err(VectorSearchError::Internal(
+                        "named store commit received an unsupported record".to_string(),
+                    ));
+                }
             }
         }
         Ok(())

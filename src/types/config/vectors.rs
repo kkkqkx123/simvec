@@ -34,53 +34,48 @@ impl VectorKind {
     }
 }
 
-/// How a multi-vector space compares two points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum MultiComparator {
-    #[default]
-    MaxSim,
-}
-
-/// Parameters of a multi-vector space.
+/// Parameters of a multi-vector space. MaxSim is the only comparison rule,
+/// so there is no comparator knob to configure; reserved capacity is a
+/// resource guard rather than a scoring choice.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MultiConfig {
-    /// Maximum number of sub-vectors stored per point. Resource guard only;
-    /// it does not change MaxSim semantics.
+    /// Maximum number of sub-vectors stored per point.
     pub max_vectors_per_point: usize,
-    /// Comparison rule applied to two points in this space.
-    #[serde(default)]
-    pub comparator: MultiComparator,
 }
 
 impl MultiConfig {
     pub fn new(max_vectors_per_point: usize) -> Self {
         Self {
             max_vectors_per_point,
-            comparator: MultiComparator::MaxSim,
         }
     }
 }
 
 /// Immutable parameters of one named vector space.
 ///
-/// A space is dense, sparse or multi-dense; multi is a dense space with an
-/// optional `multi_config` rather than a separate point payload kind.
+/// Dense and multi are the same storage kind: multi is a dense space carrying
+/// a `multi_config`, not a separate payload kind. Sparse declares no dimension
+/// at all — its ids are open `u32` — so there is no placeholder `vector_size`
+/// to keep in sync. The internally-tagged JSON shape stays compatible with
+/// the flat `{ kind, vector_size, distance, multi_config }` form accepted at
+/// the FFI boundary; a legacy sparse `vector_size` is simply ignored on input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VectorSpaceConfig {
-    pub kind: VectorKind,
-    /// Dense / multi sub-vector dimension. Sparse spaces use
-    /// [`SPARSE_DIM_BOUND`] and do not declare a vocabulary bound.
-    pub vector_size: usize,
-    pub distance: DistanceMetric,
-    /// Present exactly when `kind` is `Multi`.
-    #[serde(default)]
-    pub multi_config: Option<MultiConfig>,
+#[serde(tag = "kind")]
+pub enum VectorSpaceConfig {
+    Dense {
+        vector_size: usize,
+        distance: DistanceMetric,
+        #[serde(default)]
+        multi_config: Option<MultiConfig>,
+    },
+    Sparse {
+        distance: DistanceMetric,
+    },
 }
 
 impl VectorSpaceConfig {
     pub fn dense(vector_size: usize, distance: DistanceMetric) -> Self {
-        Self {
-            kind: VectorKind::Dense,
+        Self::Dense {
             vector_size,
             distance,
             multi_config: None,
@@ -88,8 +83,7 @@ impl VectorSpaceConfig {
     }
 
     pub fn multi(vector_size: usize, distance: DistanceMetric, config: MultiConfig) -> Self {
-        Self {
-            kind: VectorKind::Multi,
+        Self::Dense {
             vector_size,
             distance,
             multi_config: Some(config),
@@ -97,21 +91,47 @@ impl VectorSpaceConfig {
     }
 
     pub fn sparse(distance: DistanceMetric) -> Self {
-        Self {
-            kind: VectorKind::Sparse,
-            vector_size: SPARSE_DIM_BOUND,
-            distance,
-            multi_config: None,
+        Self::Sparse { distance }
+    }
+
+    /// Payload kind derived from the variant. A dense space with multi params
+    /// reports [`VectorKind::Multi`].
+    pub fn kind(&self) -> VectorKind {
+        match self {
+            Self::Dense {
+                multi_config: Some(_),
+                ..
+            } => VectorKind::Multi,
+            Self::Dense { .. } => VectorKind::Dense,
+            Self::Sparse { .. } => VectorKind::Sparse,
+        }
+    }
+
+    pub fn distance(&self) -> DistanceMetric {
+        match self {
+            Self::Dense { distance, .. } | Self::Sparse { distance } => *distance,
+        }
+    }
+
+    pub fn multi_config(&self) -> Option<MultiConfig> {
+        match self {
+            Self::Dense { multi_config, .. } => *multi_config,
+            Self::Sparse { .. } => None,
+        }
+    }
+
+    /// Declared dense sub-vector dimension, or the open-domain validation
+    /// bound for sparse spaces (which declare no dimension themselves).
+    pub fn vector_size(&self) -> usize {
+        match self {
+            Self::Dense { vector_size, .. } => *vector_size,
+            Self::Sparse { .. } => SPARSE_DIM_BOUND,
         }
     }
 
     /// Dimension used by payload validation.
     pub fn effective_dim(&self) -> usize {
-        if self.kind == VectorKind::Sparse {
-            SPARSE_DIM_BOUND
-        } else {
-            self.vector_size
-        }
+        self.vector_size()
     }
 }
 
@@ -132,30 +152,36 @@ impl CollectionConfig {
     }
 
     /// Fill an empty map from the single-space convenience fields, then make
-    /// those fields mirror the default space. The map is authoritative for
-    /// every store; the mirrors exist for dense metadata and callers that
-    /// construct configurations from a dimension and distance pair.
+    /// those fields mirror the default space. The `vectors` map is the sole
+    /// authority for named / multi-space layouts. The flat convenience fields
+    /// exist only as a JSON/struct-literal boundary adapter: for a single
+    /// default-space collection they are consumed into the map so callers that
+    /// build a config from a dimension and distance pair take effect. Queries
+    /// (`collection_config` / `collection_info`) always read back from the map.
     pub fn normalize(&mut self) {
         if self.vectors.is_empty() {
             let space = self.space_from_primary_fields();
             self.vectors.insert(DEFAULT_VECTOR_NAME.to_string(), space);
         } else if !self.is_named_layout() {
-            // Struct-literal configs can override the mirror fields without
-            // rebuilding the map. The explicit single-space fields win for a
-            // single-space collection; validate_kind still rejects conflicts
-            // when called directly on an unnormalized config.
+            // Single-space struct-literal configs override the mirror fields
+            // (e.g. `CollectionConfig { vector_size: 128, ..Default::default() }`).
+            // The explicit single-space fields win for the default space; a
+            // named layout never gets rewritten this way. This keeps the
+            // convenience boundary adapter working while the map stays the
+            // authority for reads and for multi-space layouts.
             let disagree = self
                 .vectors
                 .get(DEFAULT_VECTOR_NAME)
                 .is_some_and(|space| {
-                    self.vector_size != space.vector_size
-                        || self.distance != space.distance
-                        || self.kind != space.kind
-                        || self.multi_config != space.multi_config
+                    self.vector_size != space.vector_size()
+                        || self.distance != space.distance()
+                        || self.kind != space.kind()
+                        || self.multi_config != space.multi_config()
                 });
             if disagree {
                 let space = self.space_from_primary_fields();
-                self.vectors.insert(DEFAULT_VECTOR_NAME.to_string(), space);
+                self.vectors
+                    .insert(DEFAULT_VECTOR_NAME.to_string(), space);
             }
         }
         self.sync_primary_fields();
@@ -179,10 +205,10 @@ impl CollectionConfig {
             .get(DEFAULT_VECTOR_NAME)
             .or_else(|| self.vectors.values().next());
         if let Some(space) = primary {
-            self.vector_size = space.vector_size;
-            self.distance = space.distance;
-            self.kind = space.kind;
-            self.multi_config = space.multi_config;
+            self.vector_size = space.vector_size();
+            self.distance = space.distance();
+            self.kind = space.kind();
+            self.multi_config = space.multi_config();
         }
     }
 
