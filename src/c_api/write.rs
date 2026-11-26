@@ -3,19 +3,43 @@
 use std::ffi::{c_char, c_int};
 
 use crate::types::PointId;
-use crate::{Payload, PayloadSchemaType, TxnOp, VectorFilter, VectorPoint};
+use crate::{Payload, PayloadSchemaType, TxnOp, VectorData, VectorFilter, VectorPoint};
 
 use super::error::{
     emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json, simvec_error_code_t,
 };
 use super::types::simvec_engine_t;
 
-/// One batch point as carried by `simvec_upsert_batch` JSON.
+/// FFI point shape. `vector` is the dense shortcut; `vectors` is the
+/// unified named-space form and takes precedence when present.
 #[derive(serde::Deserialize)]
-struct BatchPoint {
+struct PointDto {
     id: String,
+    #[serde(default)]
     vector: Vec<f32>,
+    #[serde(default)]
+    vectors: std::collections::BTreeMap<String, VectorData>,
+    #[serde(default)]
     payload: Option<Payload>,
+}
+
+impl PointDto {
+    fn into_point(self) -> VectorPoint {
+        let mut point = VectorPoint {
+            id: PointId::from(self.id.as_str()),
+            vectors: if self.vectors.is_empty() {
+                std::collections::BTreeMap::from([(
+                    crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                    VectorData::Dense(self.vector),
+                )])
+            } else {
+                self.vectors
+            },
+            payload: self.payload,
+        };
+        point.normalize();
+        point
+    }
 }
 
 /// Translate a schema name into its declared payload type.
@@ -103,19 +127,13 @@ pub unsafe extern "C" fn simvec_upsert_batch(
             Ok(raw) => raw,
             Err(code) => return handle.fail_code(code, "invalid points string".to_string()),
         };
-        let batch: Vec<BatchPoint> = match parse_input_json(raw) {
+        let batch: Vec<PointDto> = match parse_input_json(raw) {
             Ok(batch) => batch,
             Err(code) => return handle.fail_code(code, "invalid points JSON".to_string()),
         };
         let points: Vec<VectorPoint> = batch
             .into_iter()
-            .map(|item| {
-                let mut point = VectorPoint::new(item.id, item.vector);
-                if let Some(payload) = item.payload {
-                    point = point.with_payload(payload);
-                }
-                point
-            })
+            .map(PointDto::into_point)
             .collect();
         match handle.engine.upsert_batch(collection, &points) {
             Ok(()) => handle.ok(),
@@ -479,7 +497,7 @@ pub unsafe extern "C" fn simvec_set_payload_field(
 enum TxnOpDto {
     Upsert {
         collection: String,
-        point: VectorPoint,
+        point: PointDto,
     },
     Delete {
         collection: String,
@@ -510,7 +528,10 @@ pub unsafe extern "C" fn simvec_apply_txn(
         let ops: Vec<TxnOp> = ops
             .into_iter()
             .map(|item| match item {
-                TxnOpDto::Upsert { collection, point } => TxnOp::Upsert { collection, point },
+                TxnOpDto::Upsert { collection, point } => TxnOp::Upsert {
+                    collection,
+                    point: point.into_point(),
+                },
                 TxnOpDto::Delete { collection, id } => TxnOp::Delete {
                     collection,
                     point_id: PointId::from(id.as_str()),

@@ -67,7 +67,7 @@ fn test_point_id_serialize_deserialize_uuid() {
 fn test_vector_point_new() {
     let p = VectorPoint::new(42u64, vec![1.0, 2.0, 3.0]);
     assert_eq!(p.id, PointId::Num(42));
-    assert_eq!(p.vector, vec![1.0, 2.0, 3.0]);
+    assert_eq!(p.vector(), vec![1.0, 2.0, 3.0]);
     assert!(p.payload.is_none());
 }
 

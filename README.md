@@ -69,6 +69,12 @@ let query = SearchQuery::new(vec![0.1; 384], 10)
 | `metrics` | `MetricsSnapshot` and search-path instrumentation |
 | `types` | Shared type surface (also used by the remote Qdrant backend) |
 
+### Vector space model
+
+A collection declares a `name -> space parameters` map. Each space independently selects dense, sparse or multi vectors with its own dimension and distance; a single-vector collection is just the map with the default empty-name space. Points carry every space in one `vectors` map, queries target one or more spaces, and multi-target searches fuse rankings with RRF. `VectorPoint::vector()` and `SearchQuery::primary_vector()` are read-only shortcuts for the dense single-space path.
+
+Sparse spaces have no vocabulary bound and accept unsorted indices, which are normalized on write; posting weights are accumulated directly during search. Multi vectors are stored as `flat + dim` and currently use MaxSim. Named dense spaces still use exact scan — ANN and quantization remain single-space-only, and unsupported combinations are rejected at configuration time.
+
 ### Storage layout
 
 Each collection is a directory under the engine root containing `vectors.bin` (mmap'd raw f32 rows), the WAL segment files, payload store, metadata, and index artifacts. Deletes are tombstones; compaction rewrites the directory. Rebuild scratch (`*.rebuild-*`), publish backups (`*.old-*`), and quarantined (`.suspect-*`) directories are never loaded into the serving registry — they exist only for crash recovery and inspection.

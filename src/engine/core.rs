@@ -151,23 +151,28 @@ impl LocalVectorEngine {
         if self.collection_exists(name) {
             return Err(VectorSearchError::CollectionAlreadyExists(name.to_string()));
         }
+        let mut config = config.clone();
+        config.normalize();
         // Named layouts are exact-scan only. Validate before applying engine
         // defaults so a requested ANN tier or quantization is never silently
         // replaced by a default.
-        if matches!(&config.vectors, crate::types::VectorsConfig::Named(_)) {
+        if config.is_named_layout() {
             config.validate_kind()?;
-            let spaces = match &config.vectors {
-                crate::types::VectorsConfig::Named(spaces) => spaces.clone(),
-                _ => unreachable!("checked above"),
-            };
+            let spaces = config.vectors.clone();
             let dir = self.root_dir.join(name);
-            let store = crate::named_store::NamedStore::create(&dir, name, &spaces, &self.storage)?;
+            let store = crate::named_store::NamedStore::create(
+                &dir,
+                name,
+                &spaces,
+                config.max_points,
+                &self.storage,
+            )?;
             self.named_collections
                 .write()
                 .insert(name.to_string(), store);
             return Ok(());
         }
-        let mut effective = config.clone();
+        let mut effective = config;
         match &mut effective.index {
             IndexConfig::Hnsw(cfg) => {
                 if *cfg == HnswConfig::default() {
@@ -332,8 +337,9 @@ impl LocalVectorEngine {
             // Named layouts keep the single-space fields at their defaults;
             // callers must read every parameter from `vectors` instead.
             let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
-            config.vectors = crate::types::VectorsConfig::Named(store.spaces());
+            config.vectors = store.spaces();
             config.index = IndexConfig::Flat;
+            config.max_points = store.max_points();
             return Ok(Some(config));
         }
         if let Some(store) = self.kind_store(name)? {
@@ -342,13 +348,12 @@ impl LocalVectorEngine {
             match store.kind() {
                 crate::types::VectorKind::Sparse => {}
                 crate::types::VectorKind::Multi => {
-                    config.multi_config = Some(crate::types::MultiConfig {
-                        max_vectors_per_point: store.max_vectors_per_point(),
-                    });
+                    config.multi_config = Some(crate::types::MultiConfig::new(store.max_vectors_per_point()));
                 }
                 crate::types::VectorKind::Dense => {}
             }
             config.index = IndexConfig::Flat;
+            config.max_points = store.max_points();
             return Ok(Some(config));
         }
         let collections = self.collections.read();
@@ -371,8 +376,9 @@ impl LocalVectorEngine {
             // Single-space fields carry no meaning for named layouts; the
             // authoritative layout is the per-space map.
             let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
-            config.vectors = crate::types::VectorsConfig::Named(store.spaces());
+            config.vectors = store.spaces();
             config.index = IndexConfig::Flat;
+            config.max_points = store.max_points();
             return Ok(CollectionInfo {
                 name: name.to_string(),
                 vector_count: live,
@@ -390,11 +396,10 @@ impl LocalVectorEngine {
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());
             config.kind = store.kind();
             if store.kind() == crate::types::VectorKind::Multi {
-                config.multi_config = Some(crate::types::MultiConfig {
-                    max_vectors_per_point: store.max_vectors_per_point(),
-                });
+                config.multi_config = Some(crate::types::MultiConfig::new(store.max_vectors_per_point()));
             }
             config.index = IndexConfig::Flat;
+            config.max_points = store.max_points();
             return Ok(CollectionInfo {
                 name: name.to_string(),
                 vector_count: live,

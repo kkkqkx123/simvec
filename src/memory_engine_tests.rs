@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::types::{CollectionConfig, DistanceMetric, SearchQuery, VectorPoint};
 
@@ -129,4 +131,21 @@ fn memory_export_orders_points_by_id() {
         .map(|p| p.id.to_string())
         .collect();
     assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn memory_engine_rejects_non_dense_configs() {
+    let engine = MemoryEngine::new();
+    assert!(engine
+        .create_collection("sparse", &CollectionConfig::with_sparse(16, DistanceMetric::Dot))
+        .is_err());
+    assert!(engine
+        .create_collection(
+            "named",
+            &CollectionConfig::with_named(BTreeMap::from([(
+                "text".to_string(),
+                crate::types::VectorSpaceConfig::dense(2, DistanceMetric::Dot),
+            )]))
+        )
+        .is_err());
 }

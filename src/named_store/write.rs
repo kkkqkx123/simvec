@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+use std::time::Instant;
+
 use crate::error::{Result, VectorSearchError};
 use crate::filter;
 use crate::storage::{WalRecord, WalTxn};
-use crate::types::{Payload, PointId, VectorFilter, VectorPoint};
+use crate::types::{Payload, PointId, VectorData, VectorFilter, VectorPoint};
 
-use super::NamedStore;
+use super::{Inner, NamedStore};
 
 impl NamedStore {
     /// WAL-backed upsert of a batch of named points. Each point must carry
@@ -59,41 +62,71 @@ impl NamedStore {
         Ok(deleted)
     }
 
-    /// Apply already-encoded WAL records without re-logging them. Used by
-    /// the engine's coordinated-transaction path.
-    pub fn apply_records(&self, records: &[WalRecord]) -> Result<()> {
-        let mut inner = self.inner.lock();
-        for record in records {
-            match record {
-                WalRecord::UpsertNamed {
-                    id,
-                    vectors,
-                    payload,
-                } => {
-                    self.apply_upsert(&mut inner, id.clone(), vectors.clone(), payload.clone())?;
-                }
-                WalRecord::Delete { point_id } => {
-                    if let Some(slot) = inner.reverse.get(point_id).copied() {
-                        inner.tombstone_slot(slot, &self.sparse_space_names());
-                    }
-                }
-                _ => {
-                    return Err(VectorSearchError::Internal(
-                        "named store transaction received an unsupported record".to_string(),
-                    ));
-                }
-            }
+    /// Replace selected named spaces of an existing point, preserving the
+    /// point id, payload, slot and every undeclared space.
+    pub fn patch_named(
+        &self,
+        point_id: &PointId,
+        vectors: BTreeMap<String, VectorData>,
+    ) -> Result<()> {
+        if vectors.is_empty() {
+            return Ok(());
         }
-        inner.next_lsn += 1;
-        Ok(())
+        let mut normalized = vectors;
+        for data in normalized.values_mut() {
+            *data = data.clone().normalized();
+        }
+        self.commit(vec![WalRecord::PatchNamedVectors {
+            id: point_id.to_string(),
+            vectors: normalized,
+        }])
+    }
+
+    /// Apply a coordinated transaction. Records are pre-split per collection
+    /// but are still appended to this collection's WAL before being applied.
+    pub fn apply_records(&self, records: &[WalRecord]) -> Result<()> {
+        self.commit(records.to_vec())
     }
 
     /// Commit `records` to the WAL and apply them in order.
     fn commit(&self, records: Vec<WalRecord>) -> Result<()> {
-        let started = std::time::Instant::now();
+        self.commit_records(records, Instant::now())
+    }
+
+    fn commit_records(&self, records: Vec<WalRecord>, started: Instant) -> Result<()> {
+        let _gate = self.gate.lock();
+        let mut inner = self.inner.lock();
+        self.commit_records_locked(&mut inner, records, started)
+    }
+
+    fn commit_for_point(
+        &self,
+        point_id: &PointId,
+        build: impl FnOnce(u32) -> Result<Vec<WalRecord>>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let _gate = self.gate.lock();
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .reverse
+            .get(&point_id.to_string())
+            .copied()
+            .ok_or_else(|| {
+                VectorSearchError::InvalidConfig(format!("point {point_id} not found"))
+            })?;
+        let records = build(slot)?;
+        self.commit_records_locked(&mut inner, records, started)
+    }
+
+    fn commit_records_locked(
+        &self,
+        inner: &mut Inner,
+        records: Vec<WalRecord>,
+        started: Instant,
+    ) -> Result<()> {
         let upserts = records
             .iter()
-            .filter(|record| matches!(record, WalRecord::UpsertNamed { .. }))
+            .filter(|record| matches!(record, WalRecord::UpsertVectors { .. }))
             .count() as u64;
         let deletes = records
             .iter()
@@ -104,7 +137,6 @@ impl NamedStore {
                 )
             })
             .count() as u64;
-        let mut inner = self.inner.lock();
         let txn_id = inner.next_lsn;
         inner.next_lsn += 1;
         self.wal.append(&WalTxn {
@@ -113,12 +145,15 @@ impl NamedStore {
         })?;
         for record in records {
             match record {
-                WalRecord::UpsertNamed {
+                WalRecord::UpsertVectors {
                     id,
                     vectors,
                     payload,
                 } => {
-                    self.apply_upsert(&mut inner, id, vectors, payload)?;
+                    self.apply_upsert(inner, id, vectors, payload)?;
+                }
+                WalRecord::PatchNamedVectors { id, vectors } => {
+                    self.apply_patch(inner, id, vectors)?;
                 }
                 WalRecord::Delete { point_id } => {
                     if let Some(slot) = inner.reverse.get(&point_id).copied() {
@@ -157,7 +192,6 @@ impl NamedStore {
                     }
                 }
                 WalRecord::Upsert { .. }
-                | WalRecord::UpsertKind { .. }
                 | WalRecord::Compact
                 | WalRecord::Quantize
                 | WalRecord::DropCollection => {
@@ -169,10 +203,8 @@ impl NamedStore {
         }
         self.metrics()
             .record_apply_txn(upserts, deletes, started.elapsed());
-        let checkpoint = self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes;
-        drop(inner);
-        if checkpoint {
-            if let Err(error) = self.checkpoint() {
+        if self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes {
+            if let Err(error) = self.checkpoint_from_locked(inner) {
                 tracing::warn!(error = %error, "named store checkpoint failed");
             }
         }
@@ -183,61 +215,57 @@ impl NamedStore {
 impl NamedStore {
     /// Replace the payload for a single point.
     pub fn set_payload(&self, point_id: &PointId, payload: Payload) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        self.commit(vec![WalRecord::SetPayload {
-            slot,
-            payload: Some(serde_json::to_string(&payload)?),
-        }])
+        let payload = Some(serde_json::to_string(&payload)?);
+        self.commit_for_point(point_id, |slot| {
+            Ok(vec![WalRecord::SetPayload { slot, payload }])
+        })
     }
 
     /// Remove specific keys from a point's payload.
     pub fn delete_payload_keys(&self, point_id: &PointId, keys: &[String]) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        self.commit(vec![WalRecord::DeletePayloadKeys {
-            slot,
-            keys: keys.to_vec(),
-        }])
+        self.commit_for_point(point_id, |slot| {
+            Ok(vec![WalRecord::DeletePayloadKeys {
+                slot,
+                keys: keys.to_vec(),
+            }])
+        })
     }
 
     /// Merge the given fields into a point's payload.
     pub fn set_payload_fields(&self, point_id: &PointId, fields: Payload) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        let mut records = Vec::with_capacity(fields.len());
-        for (key, value) in fields {
-            records.push(WalRecord::SetPayloadField {
-                slot,
-                key,
-                value: serde_json::to_string(&value)?,
-            });
-        }
-        self.commit(records)
-    }
-
-    fn require_slot(&self, point_id: &PointId) -> Result<u32> {
-        let inner = self.inner.lock();
-        inner
-            .reverse
-            .get(&point_id.to_string())
-            .copied()
-            .ok_or_else(|| VectorSearchError::InvalidConfig(format!("point {point_id} not found")))
+        let encoded: Result<Vec<_>> = fields
+            .into_iter()
+            .map(|(key, value)| Ok((key, serde_json::to_string(&value)?)))
+            .collect();
+        let encoded = encoded?;
+        self.commit_for_point(point_id, |slot| {
+            Ok(encoded
+                .into_iter()
+                .map(|(key, value)| WalRecord::SetPayloadField { slot, key, value })
+                .collect())
+        })
     }
 }
 
 /// Build the WAL upsert record for a named point.
 pub fn named_upsert_record(point: &VectorPoint) -> Result<WalRecord> {
-    if point.named.is_empty() {
+    if point.vectors.is_empty() {
         return Err(VectorSearchError::InvalidConfig(
             "named collection upserts must carry named-space vectors".to_string(),
         ));
     }
-    if !point.vector.is_empty() || point.data.is_some() {
+    if point.vectors.len() == 1 && point.vectors.contains_key(crate::types::DEFAULT_VECTOR_NAME) {
         return Err(VectorSearchError::InvalidConfig(
-            "named collection upserts must not carry single-space payloads".to_string(),
+            "named collection upserts must target declared named spaces".to_string(),
         ));
     }
-    Ok(WalRecord::UpsertNamed {
+    let mut vectors = point.vectors.clone();
+    for data in vectors.values_mut() {
+        *data = data.clone().normalized();
+    }
+    Ok(WalRecord::UpsertVectors {
         id: point.id.to_string(),
-        vectors: point.named.clone(),
+        vectors,
         payload: point
             .payload
             .as_ref()

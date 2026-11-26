@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
@@ -8,7 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorPoint, VectorSpaceConfig,
 };
 
-use super::{score_pair, sparse_postings, NamedStore};
+use super::{score_pair, sparse_scores, NamedStore};
 
 impl NamedStore {
     /// Declared named-vector spaces.
@@ -22,6 +22,7 @@ impl NamedStore {
                         kind: meta.kind,
                         vector_size: meta.vector_size,
                         distance: meta.distance,
+                        multi_config: meta.multi_config,
                     },
                 )
             })
@@ -36,6 +37,11 @@ impl NamedStore {
     /// Engine-level storage tuning.
     pub fn storage_config(&self) -> &crate::types::StorageConfig {
         &self.storage
+    }
+
+    /// Admission cap mirrored from the collection configuration.
+    pub fn max_points(&self) -> Option<u64> {
+        self.max_points
     }
 
     /// Number of live points.
@@ -77,24 +83,14 @@ impl NamedStore {
         Ok(count)
     }
 
-    /// Exact-scan top-k search over one named space.
+    /// Exact-scan search. A query with multiple named targets fuses their
+    /// per-space rankings with reciprocal rank fusion.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
-        let started = std::time::Instant::now();
-        let target = query.target.as_deref().ok_or_else(|| {
-            VectorSearchError::InvalidConfig(
-                "named collection queries must declare a target space".to_string(),
-            )
-        })?;
-        let data = query.named_vector.as_ref().ok_or_else(|| {
-            VectorSearchError::InvalidConfig(
-                "named collection queries must carry a named query vector".to_string(),
-            )
-        })?;
-        if !query.vector.is_empty() || query.data.is_some() {
-            return Err(VectorSearchError::InvalidConfig(
-                "named collection queries must not carry single-space payloads".to_string(),
-            ));
+        if query.vectors.len() > 1 {
+            return self.search_fused(query);
         }
+        let started = std::time::Instant::now();
+        let (target, data) = query.single_target()?;
         reject_exact_query_controls(query)?;
         let space = self.spaces.get(target).ok_or_else(|| {
             VectorSearchError::InvalidConfig(format!("unknown named-vector space {target}"))
@@ -106,7 +102,10 @@ impl NamedStore {
                 data.kind().as_name()
             )));
         }
-        data.validate(space.vector_size, 1)?;
+        let max_vectors = space
+            .multi_config
+            .map_or(1, |multi| multi.max_vectors_per_point);
+        data.validate(space.vector_size, max_vectors)?;
 
         let inner = self.inner.lock();
         let limit = query.effective_limit();
@@ -115,22 +114,27 @@ impl NamedStore {
             return Ok(Vec::new());
         }
 
-        // Candidate set: inverted postings for sparse spaces, every live
-        // slot for dense spaces.
-        let candidates: Vec<u32> = match data {
-            VectorData::Sparse { indices, .. } => inner
-                .inverted
-                .get(target)
-                .and_then(|space_index| sparse_postings(space_index, indices, inner.points.len()))
-                .unwrap_or_default(),
+        // Sparse scores accumulate from postings; other spaces scan all slots.
+        let metric = space.distance;
+        let candidates: Vec<(u32, f32)> = match data {
+            VectorData::Sparse { indices, values } => {
+                let space_index = inner.inverted.get(target);
+                let norms = inner.norms.get(target);
+                match (space_index, norms) {
+                    (Some(space_index), Some(norms)) => {
+                        sparse_scores(space_index, norms, indices, values, metric)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             _ => (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
+                .map(|slot| (slot, 0.0))
                 .collect(),
         };
 
-        let metric = space.distance;
         let mut scored: Vec<(u32, f32)> = Vec::new();
-        for slot in candidates {
+        for (slot, sparse_score) in candidates {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
@@ -143,7 +147,10 @@ impl NamedStore {
                 .vectors
                 .get(target)
                 .expect("validated point carries every space");
-            let score = score_pair(data, stored, metric);
+            let score = match data {
+                VectorData::Sparse { .. } => sparse_score,
+                _ => score_pair(data, stored, metric),
+            };
             if query
                 .score_threshold()
                 .is_some_and(|threshold| score < threshold)
@@ -180,9 +187,53 @@ impl NamedStore {
                         .vectors
                         .get(target)
                         .expect("validated point carries every space");
-                    result = result.with_data(stored.clone());
+                    result = result.with_named_vector(target, stored.clone());
                 }
                 Some(result)
+            })
+            .collect();
+        self.metrics.record_search(
+            crate::metrics::SearchPath::Exact,
+            query.filter.is_some(),
+            started.elapsed(),
+        );
+        Ok(results)
+    }
+
+    /// Fuse per-space rankings with RRF. Each target shares the query's
+    /// filters, paging and payload projection; only the vector target differs.
+    fn search_fused(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        let started = std::time::Instant::now();
+        let mut fused: HashMap<PointId, (f32, SearchResult)> = HashMap::new();
+        for target in &query.vectors {
+            let mut single = query.clone();
+            single.vectors = vec![target.clone()];
+            for (rank, result) in self.search(&single)?.into_iter().enumerate() {
+                let contribution = 1.0 / (60.0 + rank as f32 + 1.0);
+                match fused.get_mut(&result.id) {
+                    Some((score, best)) => {
+                        *score += contribution;
+                        for (space, data) in &result.vectors {
+                            best.vectors.insert(space.clone(), data.clone());
+                        }
+                    }
+                    None => {
+                        fused.insert(result.id.clone(), (contribution, result));
+                    }
+                }
+            }
+        }
+        let mut ranked: Vec<(f32, SearchResult)> = fused.into_values().collect();
+        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.id.to_string().cmp(&b.1.id.to_string())));
+        let limit = query.effective_limit();
+        let offset = query.offset.unwrap_or(0);
+        let results = ranked
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(score, mut result)| {
+                result.score = score;
+                result
             })
             .collect();
         self.metrics.record_search(
@@ -199,15 +250,11 @@ impl NamedStore {
         let Some(&slot) = inner.reverse.get(&point_id.to_string()) else {
             return Ok(None);
         };
-        Ok(inner.points[slot as usize]
-            .as_ref()
-            .map(|point| VectorPoint {
-                id: point.id.clone(),
-                vector: Vec::new(),
-                data: None,
-                named: point.vectors.clone(),
-                payload: point.payload.clone(),
-            }))
+        Ok(inner.points[slot as usize].as_ref().map(|point| VectorPoint {
+            id: point.id.clone(),
+            vectors: point.vectors.clone(),
+            payload: point.payload.clone(),
+        }))
     }
 
     /// Paginated scan over live points in slot order.
@@ -266,9 +313,7 @@ impl NamedStore {
             }
             points.push(VectorPoint {
                 id: point.id.clone(),
-                vector: Vec::new(),
-                data: None,
-                named: if with_vector {
+                vectors: if with_vector {
                     point.vectors.clone()
                 } else {
                     Default::default()
@@ -290,8 +335,6 @@ fn vector_data_bytes(data: &VectorData) -> usize {
         VectorData::Sparse { indices, values } => {
             indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
         }
-        VectorData::Multi(vectors) => {
-            vectors.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
-        }
+        VectorData::Multi(multi) => multi.flat.len() * std::mem::size_of::<f32>(),
     }
 }

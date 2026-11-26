@@ -58,7 +58,7 @@ impl CollectionStore {
                 .unwrap_or(default_oversample);
             let rescore = params.default_rescore(&quant.config().quant_type);
             let snap: Arc<Vec<Arc<Mmap>>> = Arc::clone(&quant.snapshot());
-            let qq = quant.encode_query(&query.vector, metric)?;
+            let qq = quant.encode_query(query.primary_vector(), metric)?;
             (bytes, snap, oversample, rescore, qq)
         };
         let k = query.offset.unwrap_or(0).saturating_add(query.limit);
@@ -144,7 +144,7 @@ impl CollectionStore {
                 else {
                     continue;
                 };
-                let dist = crate::distance::distance(metric, &query.vector, v);
+                let dist = crate::distance::distance(metric, query.primary_vector(), v);
                 let score = crate::distance::to_score(metric, dist);
                 reranked.push((score, slot));
             }

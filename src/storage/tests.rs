@@ -61,10 +61,10 @@ fn test_create_open_roundtrip() {
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(reopened.count(), 2);
     let p1 = reopened.get(&PointId::Num(1)).unwrap().unwrap();
-    assert_eq!(p1.vector.len(), 4);
-    assert_eq!(p1.vector, point(1, 4).vector);
+    assert_eq!(p1.vector().len(), 4);
+    assert_eq!(p1.vector(), point(1, 4).vector());
     let p2 = reopened.get(&PointId::Num(2)).unwrap().unwrap();
-    assert_eq!(p2.vector, point(2, 4).vector);
+    assert_eq!(p2.vector(), point(2, 4).vector());
     assert!(reopened.get(&PointId::Num(99)).unwrap().is_none());
 }
 
@@ -262,9 +262,9 @@ fn test_upsert_overwrite_reuses_slot() {
 
     assert_eq!(store.count(), 2, "overwrite must not grow live count");
     let got = store.get(&PointId::Num(1)).unwrap().unwrap();
-    assert_eq!(got.vector, vec![9.0; 4]);
+    assert_eq!(got.vector(), vec![9.0; 4]);
     let got2 = store.get(&PointId::Num(2)).unwrap().unwrap();
-    assert_eq!(got2.vector, point(2, 4).vector);
+    assert_eq!(got2.vector(), point(2, 4).vector());
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn test_grow_across_segments() {
 
     for i in (0..total).step_by(7) {
         let got = store.get(&PointId::Num(i)).unwrap().unwrap();
-        assert_eq!(got.vector, point(i, 4).vector);
+        assert_eq!(got.vector(), point(i, 4).vector());
     }
 
     drop(store);
@@ -297,7 +297,7 @@ fn test_grow_across_segments() {
     assert_eq!(reopened.count(), total);
     for i in (0..total).step_by(11) {
         let got = reopened.get(&PointId::Num(i)).unwrap().unwrap();
-        assert_eq!(got.vector, point(i, 4).vector);
+        assert_eq!(got.vector(), point(i, 4).vector());
     }
 }
 
@@ -331,12 +331,12 @@ fn test_delete_tombstone_and_reopen() {
     assert_eq!(reopened.count(), 2);
     assert!(reopened.get(&PointId::Num(2)).unwrap().is_none());
     assert_eq!(
-        reopened.get(&PointId::Num(1)).unwrap().unwrap().vector,
-        point(1, 4).vector
+        reopened.get(&PointId::Num(1)).unwrap().unwrap().vector(),
+        point(1, 4).vector()
     );
     assert_eq!(
-        reopened.get(&PointId::Num(3)).unwrap().unwrap().vector,
-        point(3, 4).vector
+        reopened.get(&PointId::Num(3)).unwrap().unwrap().vector(),
+        point(3, 4).vector()
     );
 }
 

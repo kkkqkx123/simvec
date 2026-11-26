@@ -56,6 +56,12 @@ impl LocalVectorEngine {
 
     /// Manually compact a collection (remove tombstoned slots).
     pub fn compact_collection(&self, collection: &str) -> Result<u64> {
+        if let Some(named) = self.named_store(collection)? {
+            return named.compact();
+        }
+        if let Some(kind) = self.kind_store(collection)? {
+            return kind.compact();
+        }
         self.store(collection)?.compact()
     }
 

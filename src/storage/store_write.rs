@@ -174,7 +174,7 @@ impl CollectionStore {
                 // Checkpoint / quantization markers carry no separate mutation.
                 WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
                 // Kind and named payloads never enter a dense collection's log.
-                WalRecord::UpsertKind { .. } | WalRecord::UpsertNamed { .. } => {
+                WalRecord::UpsertVectors { .. } | WalRecord::PatchNamedVectors { .. } => {
                     return Err(VectorSearchError::CorruptData(
                         "non-dense upsert record replayed in a dense collection".to_string(),
                     ));
@@ -192,11 +192,11 @@ impl CollectionStore {
         validate_point(&inner.meta, point)?;
         let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
 
-        self.vectors.write_slot(slot, &point.vector)?;
+        self.vectors.write_slot(slot, point.vector())?;
         // Mirror the vector into quantized storage when ready.
         if let Some(q) = self.quant.read().as_ref() {
             if q.is_ready() {
-                if let Err(e) = q.write_slot(slot, &point.vector) {
+                if let Err(e) = q.write_slot(slot, point.vector()) {
                     tracing::warn!(slot, error = %e, "quant write_slot failed; search falls back to exact until rebuild");
                 }
             } else if matches!(
@@ -206,13 +206,13 @@ impl CollectionStore {
             ) {
                 // Scalar/Binary are always ready after create/rebuild; attempt to
                 // quantize even when `ready` flag races the build.
-                if let Err(e) = q.write_slot(slot, &point.vector) {
+                if let Err(e) = q.write_slot(slot, point.vector()) {
                     tracing::warn!(slot, error = %e, "quant write_slot raced rebuild; code rebuilt on next build_quantization");
                 }
             }
         }
         self.write_payload_at(slot as u32, point.payload.as_ref())?;
-        self.register_slot(slot as u32, &point.vector, inner.meta.segment_slots);
+        self.register_slot(slot as u32, point.vector(), inner.meta.segment_slots);
         inner
             .filter_bitmap
             .register_slot(slot as u32, point.payload.as_ref());

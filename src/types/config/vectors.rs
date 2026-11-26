@@ -4,17 +4,22 @@ use serde::{Deserialize, Serialize};
 
 use super::{CollectionConfig, DistanceMetric, IndexConfig};
 
-/// Collection-level vector kind. `Dense` is the default; `Sparse` and `Multi`
-/// collections are served by the exact-scan kind store (`crate::kind_store`)
-/// instead of the dense HNSW/IVF pipeline.
+/// Name of the single vector space in a non-named collection. Named layouts
+/// use their own explicit names; the default name keeps the dense storage and
+/// WAL paths independent of whether a collection declares one space or many.
+pub const DEFAULT_VECTOR_NAME: &str = "";
+
+/// Sparse dimensions are open `u32` ids. Configurations do not declare a
+/// vocabulary bound; this constant only gives validation a finite upper bound.
+pub const SPARSE_DIM_BOUND: usize = u32::MAX as usize + 1;
+
+/// Payload kind of one vector space. Dense and multi spaces share the dense
+/// storage pipeline; sparse spaces use the inverted index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VectorKind {
-    /// Single dense embedding per point (default).
     #[default]
     Dense,
-    /// Sparse (index, weight) pairs scored with dot or normalized cosine.
     Sparse,
-    /// A bounded sequence of dense vectors per point scored with MaxSim.
     Multi,
 }
 
@@ -29,49 +34,166 @@ impl VectorKind {
     }
 }
 
-/// Parameters for `VectorKind::Multi` collections.
+/// How a multi-vector space compares two points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MultiComparator {
+    #[default]
+    MaxSim,
+}
+
+/// Parameters of a multi-vector space.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MultiConfig {
-    /// Maximum number of sub-vectors stored per point.
+    /// Maximum number of sub-vectors stored per point. Resource guard only;
+    /// it does not change MaxSim semantics.
     pub max_vectors_per_point: usize,
+    /// Comparison rule applied to two points in this space.
+    #[serde(default)]
+    pub comparator: MultiComparator,
 }
 
-/// Parameters of one named vector space inside a named-vectors collection.
+impl MultiConfig {
+    pub fn new(max_vectors_per_point: usize) -> Self {
+        Self {
+            max_vectors_per_point,
+            comparator: MultiComparator::MaxSim,
+        }
+    }
+}
+
+/// Immutable parameters of one named vector space.
 ///
-/// A named space is either dense or sparse; `Multi` is not a valid named
-/// space kind (see `VectorsConfig`).
+/// A space is dense, sparse or multi-dense; multi is a dense space with an
+/// optional `multi_config` rather than a separate point payload kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorSpaceConfig {
-    /// Space payload kind; must be `Dense` or `Sparse`.
     pub kind: VectorKind,
-    /// Dense dimension for `Dense` spaces, vocabulary bound for `Sparse`.
+    /// Dense / multi sub-vector dimension. Sparse spaces use
+    /// [`SPARSE_DIM_BOUND`] and do not declare a vocabulary bound.
     pub vector_size: usize,
-    /// Distance metric scored within this space only.
     pub distance: DistanceMetric,
+    /// Present exactly when `kind` is `Multi`.
+    #[serde(default)]
+    pub multi_config: Option<MultiConfig>,
 }
 
-/// Collection vector layout: a single space (the historical shape, keyed by
-/// `kind`/`vector_size`/`distance`) or a named map of spaces.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub enum VectorsConfig {
-    /// Single-space layout; the fields on `CollectionConfig` apply.
-    #[default]
-    Single,
-    /// Named layout: every point carries one vector per declared space and
-    /// every query targets one space by name. Spaces may mix dense and
-    /// sparse kinds; `Multi` is not allowed.
-    Named(BTreeMap<String, VectorSpaceConfig>),
+impl VectorSpaceConfig {
+    pub fn dense(vector_size: usize, distance: DistanceMetric) -> Self {
+        Self {
+            kind: VectorKind::Dense,
+            vector_size,
+            distance,
+            multi_config: None,
+        }
+    }
+
+    pub fn multi(vector_size: usize, distance: DistanceMetric, config: MultiConfig) -> Self {
+        Self {
+            kind: VectorKind::Multi,
+            vector_size,
+            distance,
+            multi_config: Some(config),
+        }
+    }
+
+    pub fn sparse(distance: DistanceMetric) -> Self {
+        Self {
+            kind: VectorKind::Sparse,
+            vector_size: SPARSE_DIM_BOUND,
+            distance,
+            multi_config: None,
+        }
+    }
+
+    /// Dimension used by payload validation.
+    pub fn effective_dim(&self) -> usize {
+        if self.kind == VectorKind::Sparse {
+            SPARSE_DIM_BOUND
+        } else {
+            self.vector_size
+        }
+    }
 }
+
+/// All vector spaces declared by a collection, keyed by name. A single-space
+/// collection contains only [`DEFAULT_VECTOR_NAME`].
+pub type VectorsConfig = BTreeMap<String, VectorSpaceConfig>;
 
 impl CollectionConfig {
-    /// Declare a named-vectors collection. `vector_size`/`distance`/`kind`
-    /// on the returned config keep their default single-space values; they
-    /// are not interpreted for named layouts.
-    pub fn with_named(spaces: BTreeMap<String, VectorSpaceConfig>) -> Self {
-        Self {
-            vectors: VectorsConfig::Named(spaces),
+    /// Declare a named-vectors collection.
+    pub fn with_named(spaces: VectorsConfig) -> Self {
+        let mut config = Self {
+            vectors: spaces,
             index: IndexConfig::Flat,
             ..Self::new(0, DistanceMetric::Cosine)
+        };
+        config.sync_primary_fields();
+        config
+    }
+
+    /// Fill an empty map from the single-space convenience fields, then make
+    /// those fields mirror the default space. The map is authoritative for
+    /// every store; the mirrors exist for dense metadata and callers that
+    /// construct configurations from a dimension and distance pair.
+    pub fn normalize(&mut self) {
+        if self.vectors.is_empty() {
+            let space = self.space_from_primary_fields();
+            self.vectors.insert(DEFAULT_VECTOR_NAME.to_string(), space);
+        } else if !self.is_named_layout() {
+            // Struct-literal configs can override the mirror fields without
+            // rebuilding the map. The explicit single-space fields win for a
+            // single-space collection; validate_kind still rejects conflicts
+            // when called directly on an unnormalized config.
+            let disagree = self
+                .vectors
+                .get(DEFAULT_VECTOR_NAME)
+                .is_some_and(|space| {
+                    self.vector_size != space.vector_size
+                        || self.distance != space.distance
+                        || self.kind != space.kind
+                        || self.multi_config != space.multi_config
+                });
+            if disagree {
+                let space = self.space_from_primary_fields();
+                self.vectors.insert(DEFAULT_VECTOR_NAME.to_string(), space);
+            }
         }
+        self.sync_primary_fields();
+    }
+
+    fn space_from_primary_fields(&self) -> VectorSpaceConfig {
+        match self.kind {
+            VectorKind::Multi => VectorSpaceConfig::multi(
+                self.vector_size,
+                self.distance,
+                self.multi_config.unwrap_or_else(|| MultiConfig::new(1)),
+            ),
+            VectorKind::Sparse => VectorSpaceConfig::sparse(self.distance),
+            VectorKind::Dense => VectorSpaceConfig::dense(self.vector_size, self.distance),
+        }
+    }
+
+    fn sync_primary_fields(&mut self) {
+        let primary = self
+            .vectors
+            .get(DEFAULT_VECTOR_NAME)
+            .or_else(|| self.vectors.values().next());
+        if let Some(space) = primary {
+            self.vector_size = space.vector_size;
+            self.distance = space.distance;
+            self.kind = space.kind;
+            self.multi_config = space.multi_config;
+        }
+    }
+
+    /// Whether the collection declares more than one space or only named
+    /// spaces other than the default one.
+    pub fn is_named_layout(&self) -> bool {
+        self.vectors.len() != 1 || !self.vectors.contains_key(DEFAULT_VECTOR_NAME)
+    }
+
+    /// The default space, when the collection has one.
+    pub fn default_space(&self) -> Option<&VectorSpaceConfig> {
+        self.vectors.get(DEFAULT_VECTOR_NAME)
     }
 }

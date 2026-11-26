@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+use std::time::Instant;
+
 use crate::error::{Result, VectorSearchError};
 use crate::filter;
 use crate::storage::{WalRecord, WalTxn};
-use crate::types::{Payload, PointId, VectorFilter, VectorPoint};
+use crate::types::{Payload, PointId, VectorData, VectorFilter, VectorPoint};
 
-use super::KindStore;
+use super::{Inner, KindStore};
 
 impl KindStore {
     /// WAL-backed upsert of a batch of points.
@@ -57,38 +60,54 @@ impl KindStore {
         Ok(deleted)
     }
 
-    /// Apply already-encoded WAL records without re-logging them. Used by
-    /// the engine's coordinated-transaction path, which receives the
-    /// records pre-split per collection.
+    /// Apply a coordinated transaction. The records are split per collection
+    /// by the engine, but durability still belongs to this store: they are
+    /// appended to the collection WAL before being applied in memory.
     pub fn apply_records(&self, records: &[WalRecord]) -> Result<()> {
-        let mut inner = self.inner.lock();
-        for record in records {
-            match record {
-                WalRecord::UpsertKind { id, data, payload } => {
-                    self.apply_upsert(&mut inner, id.clone(), data.clone(), payload.clone())?;
-                }
-                WalRecord::Delete { point_id } => {
-                    if let Some(slot) = inner.reverse.get(point_id).copied() {
-                        inner.tombstone_slot(slot);
-                    }
-                }
-                _ => {
-                    return Err(VectorSearchError::Internal(
-                        "kind store transaction received an unsupported record".to_string(),
-                    ));
-                }
-            }
-        }
-        inner.next_lsn += 1;
-        Ok(())
+        self.commit(records.to_vec())
     }
 
     /// Commit `records` to the WAL and apply them in order.
     fn commit(&self, records: Vec<WalRecord>) -> Result<()> {
-        let started = std::time::Instant::now();
+        self.commit_records(records, Instant::now())
+    }
+
+    fn commit_records(&self, records: Vec<WalRecord>, started: Instant) -> Result<()> {
+        let _gate = self.gate.lock();
+        let mut inner = self.inner.lock();
+        self.commit_records_locked(&mut inner, records, started)
+    }
+
+    /// Resolve the target slot and log/apply the payload edit in one gate. A
+    /// concurrent overwrite cannot retire the slot between lookup and commit.
+    fn commit_for_point(
+        &self,
+        point_id: &PointId,
+        build: impl FnOnce(u32) -> Result<Vec<WalRecord>>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let _gate = self.gate.lock();
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .reverse
+            .get(&point_id.to_string())
+            .copied()
+            .ok_or_else(|| {
+                VectorSearchError::Internal(format!("point {point_id} not found"))
+            })?;
+        let records = build(slot)?;
+        self.commit_records_locked(&mut inner, records, started)
+    }
+
+    fn commit_records_locked(
+        &self,
+        inner: &mut Inner,
+        records: Vec<WalRecord>,
+        started: Instant,
+    ) -> Result<()> {
         let upserts = records
             .iter()
-            .filter(|record| matches!(record, WalRecord::UpsertKind { .. }))
+            .filter(|record| matches!(record, WalRecord::UpsertVectors { .. }))
             .count() as u64;
         let deletes = records
             .iter()
@@ -99,7 +118,6 @@ impl KindStore {
                 )
             })
             .count() as u64;
-        let mut inner = self.inner.lock();
         let txn_id = inner.next_lsn;
         inner.next_lsn += 1;
         self.wal.append(&WalTxn {
@@ -108,8 +126,13 @@ impl KindStore {
         })?;
         for record in records {
             match record {
-                WalRecord::UpsertKind { id, data, payload } => {
-                    self.apply_upsert(&mut inner, id, data, payload)?;
+                WalRecord::UpsertVectors {
+                    id,
+                    vectors,
+                    payload,
+                } => {
+                    let data = kind_data(&vectors)?;
+                    self.apply_upsert(inner, id, data, payload)?;
                 }
                 WalRecord::Delete { point_id } => {
                     if let Some(slot) = inner.reverse.get(&point_id).copied() {
@@ -148,7 +171,7 @@ impl KindStore {
                     }
                 }
                 WalRecord::Upsert { .. }
-                | WalRecord::UpsertNamed { .. }
+                | WalRecord::PatchNamedVectors { .. }
                 | WalRecord::Compact
                 | WalRecord::Quantize
                 | WalRecord::DropCollection => {
@@ -160,73 +183,74 @@ impl KindStore {
         }
         self.metrics()
             .record_apply_txn(upserts, deletes, started.elapsed());
-        let checkpoint = self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes;
-        drop(inner);
-        if checkpoint {
-            if let Err(error) = self.checkpoint() {
+        if self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes {
+            if let Err(error) = self.checkpoint_from_locked(inner) {
                 tracing::warn!(error = %error, "kind store checkpoint failed");
             }
         }
         Ok(())
     }
+}
 
+impl KindStore {
     /// Replace the payload for a single point.
     pub fn set_payload(&self, point_id: &PointId, payload: Payload) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        self.commit(vec![WalRecord::SetPayload {
-            slot,
-            payload: Some(serde_json::to_string(&payload)?),
-        }])
+        let payload = Some(serde_json::to_string(&payload)?);
+        self.commit_for_point(point_id, |slot| {
+            Ok(vec![WalRecord::SetPayload { slot, payload }])
+        })
     }
 
     /// Remove specific keys from a point's payload.
     pub fn delete_payload_keys(&self, point_id: &PointId, keys: &[String]) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        self.commit(vec![WalRecord::DeletePayloadKeys {
-            slot,
-            keys: keys.to_vec(),
-        }])
+        self.commit_for_point(point_id, |slot| {
+            Ok(vec![WalRecord::DeletePayloadKeys {
+                slot,
+                keys: keys.to_vec(),
+            }])
+        })
     }
 
     /// Merge the given fields into a point's payload.
     pub fn set_payload_fields(&self, point_id: &PointId, fields: Payload) -> Result<()> {
-        let slot = self.require_slot(point_id)?;
-        let mut records = Vec::with_capacity(fields.len());
-        for (key, value) in fields {
-            records.push(WalRecord::SetPayloadField {
-                slot,
-                key,
-                value: serde_json::to_string(&value)?,
-            });
-        }
-        self.commit(records)
+        let encoded: Result<Vec<_>> = fields
+            .into_iter()
+            .map(|(key, value)| Ok((key, serde_json::to_string(&value)?)))
+            .collect();
+        let encoded = encoded?;
+        self.commit_for_point(point_id, |slot| {
+            Ok(encoded
+                .into_iter()
+                .map(|(key, value)| WalRecord::SetPayloadField { slot, key, value })
+                .collect())
+        })
     }
+}
 
-    fn require_slot(&self, point_id: &PointId) -> Result<u32> {
-        let inner = self.inner.lock();
-        inner
-            .reverse
-            .get(&point_id.to_string())
-            .copied()
-            .ok_or_else(|| VectorSearchError::Internal(format!("point {point_id} not found")))
+/// Extract the single default-space payload expected by a kind collection.
+pub(super) fn kind_data(vectors: &BTreeMap<String, VectorData>) -> Result<VectorData> {
+    match vectors.len() {
+        1 => vectors
+            .get(crate::types::DEFAULT_VECTOR_NAME)
+            .cloned()
+            .ok_or_else(|| {
+                VectorSearchError::InvalidConfig(
+                    "kind collections require the default vector space".to_string(),
+                )
+            }),
+        _ => Err(VectorSearchError::InvalidConfig(
+            "kind collections accept exactly one vector space".to_string(),
+        )),
     }
 }
 
 /// Build the WAL upsert record for a non-dense point.
 pub fn kind_upsert_record(point: &VectorPoint) -> Result<WalRecord> {
-    let data = point.data.as_ref().ok_or_else(|| {
-        VectorSearchError::InvalidConfig(
-            "kind collection upserts must carry a non-dense payload".to_string(),
-        )
-    })?;
-    if !point.vector.is_empty() {
-        return Err(VectorSearchError::InvalidConfig(
-            "kind collection upserts must not also carry a dense vector".to_string(),
-        ));
-    }
-    Ok(WalRecord::UpsertKind {
+    let data = kind_data(&point.vectors)?;
+    let data = data.normalized();
+    Ok(WalRecord::UpsertVectors {
         id: point.id.to_string(),
-        data: data.clone(),
+        vectors: BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), data)]),
         payload: point
             .payload
             .as_ref()

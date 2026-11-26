@@ -27,7 +27,7 @@ mod state;
 mod write;
 
 pub(crate) use self::score::score_pair;
-pub(crate) use self::score::sparse_postings;
+pub(crate) use self::score::sparse_scores;
 pub use self::write::named_upsert_record;
 
 /// One live point of a named collection: a full vector per declared space.
@@ -48,6 +48,8 @@ struct Inner {
     /// Per-space sparse inverted index: space -> term -> (slot, weight).
     /// Dense spaces have no entry.
     inverted: HashMap<String, HashMap<u32, Vec<(u32, f32)>>>,
+    /// Cached L2 norms of sparse vectors: space -> slot -> norm.
+    norms: HashMap<String, HashMap<u32, f32>>,
     next_lsn: u64,
     live_count: u64,
 }
@@ -58,6 +60,9 @@ struct NamedMeta {
     collection: String,
     /// Declared spaces keyed by name, in stable (BTreeMap) order.
     spaces: BTreeMap<String, NamedSpaceMeta>,
+    /// Admission cap mirrored from the collection configuration.
+    #[serde(default)]
+    max_points: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -65,6 +70,8 @@ struct NamedSpaceMeta {
     kind: VectorKind,
     vector_size: usize,
     distance: crate::types::DistanceMetric,
+    #[serde(default)]
+    multi_config: Option<crate::types::MultiConfig>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -84,11 +91,16 @@ struct NamedSnapshot {
 /// A single opened named-vectors collection.
 pub struct NamedStore {
     dir: PathBuf,
+    name: String,
     spaces: BTreeMap<String, NamedSpaceMeta>,
     inner: Mutex<Inner>,
     wal: Wal,
     /// Engine-level storage tuning this collection was opened with.
     storage: StorageConfig,
+    /// Admission cap enforced before any mutation is logged.
+    max_points: Option<u64>,
+    /// Serializes WAL append, in-memory apply and checkpoint/truncate.
+    gate: Mutex<()>,
     /// Operational counters for the exact-scan path.
     metrics: Metrics,
     /// Snapshot path; the WAL is replayed on top of this derived state.

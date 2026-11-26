@@ -8,7 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
 
-use super::{score_pair, KindStore};
+use super::{score_pair, sparse_candidate_scores, KindStore};
 
 impl KindStore {
     /// Collection kind served by this store.
@@ -29,6 +29,11 @@ impl KindStore {
     /// Per-point sub-vector cap for Multi collections (`0` for Sparse).
     pub fn max_vectors_per_point(&self) -> usize {
         self.max_vectors_per_point
+    }
+
+    /// Admission cap mirrored from the collection configuration.
+    pub fn max_points(&self) -> Option<u64> {
+        self.max_points
     }
 
     /// Directory backing this collection.
@@ -86,19 +91,10 @@ impl KindStore {
     /// Exact-scan top-k search over the collection.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         let started = std::time::Instant::now();
-        let data = query.data.as_ref().ok_or_else(|| {
-            VectorSearchError::InvalidConfig(
-                "kind collection queries must carry a non-dense payload".to_string(),
-            )
-        })?;
-        if !query.vector.is_empty() {
+        let (space, data) = query.single_target()?;
+        if space != crate::types::DEFAULT_VECTOR_NAME {
             return Err(VectorSearchError::InvalidConfig(
-                "kind collection queries must not also carry a dense vector".to_string(),
-            ));
-        }
-        if query.target.is_some() || query.named_vector.is_some() {
-            return Err(VectorSearchError::InvalidConfig(
-                "kind collection queries must not target a named space".to_string(),
+                "kind collection queries must target the default space".to_string(),
             ));
         }
         reject_exact_query_controls(query)?;
@@ -111,17 +107,24 @@ impl KindStore {
             return Ok(Vec::new());
         }
 
-        // Candidate set: inverted postings for sparse, every live slot for
-        // multi (there is no coarse structure to consult in the latter case).
-        let candidates: Vec<u32> = match data {
-            VectorData::Sparse { indices, .. } => inner.sparse_candidates(indices),
+        // Sparse scores accumulate directly from postings; multi scans every
+        // live slot because there is no coarse structure to consult.
+        let candidates: Vec<(u32, f32)> = match data {
+            VectorData::Sparse { indices, values } => sparse_candidate_scores(
+                &inner.inverted,
+                &inner.norms,
+                indices,
+                values,
+                self.distance,
+            ),
             _ => (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
+                .map(|slot| (slot, 0.0))
                 .collect(),
         };
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
-        for slot in candidates {
+        for (slot, sparse_score) in candidates {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
@@ -130,7 +133,10 @@ impl KindStore {
                     continue;
                 }
             }
-            let score = score_pair(data, &point.data, self.distance);
+            let score = match data {
+                VectorData::Sparse { .. } => sparse_score,
+                _ => score_pair(data, &point.data, self.distance),
+            };
             if query
                 .score_threshold()
                 .is_some_and(|threshold| score < threshold)
@@ -182,15 +188,14 @@ impl KindStore {
         let Some(&slot) = inner.reverse.get(&point_id.to_string()) else {
             return Ok(None);
         };
-        Ok(inner.points[slot as usize]
-            .as_ref()
-            .map(|point| VectorPoint {
-                id: point.id.clone(),
-                vector: Vec::new(),
-                data: Some(point.data.clone()),
-                named: BTreeMap::new(),
-                payload: point.payload.clone(),
-            }))
+        Ok(inner.points[slot as usize].as_ref().map(|point| VectorPoint {
+            id: point.id.clone(),
+            vectors: BTreeMap::from([(
+                crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                point.data.clone(),
+            )]),
+            payload: point.payload.clone(),
+        }))
     }
 
     /// Paginated scan over live points in slot order.
@@ -218,15 +223,16 @@ impl KindStore {
             let Some(point) = inner.points[slot].as_ref() else {
                 continue;
             };
-            if with_vector {
-                let data = point.data.clone();
-                let _ = data;
-            }
             points.push(VectorPoint {
                 id: point.id.clone(),
-                vector: Vec::new(),
-                data: with_vector.then(|| point.data.clone()),
-                named: BTreeMap::new(),
+                vectors: if with_vector {
+                    BTreeMap::from([(
+                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                        point.data.clone(),
+                    )])
+                } else {
+                    BTreeMap::new()
+                },
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -269,9 +275,14 @@ impl KindStore {
             }
             points.push(VectorPoint {
                 id: point.id.clone(),
-                vector: Vec::new(),
-                data: with_vector.then(|| point.data.clone()),
-                named: BTreeMap::new(),
+                vectors: if with_vector {
+                    BTreeMap::from([(
+                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                        point.data.clone(),
+                    )])
+                } else {
+                    BTreeMap::new()
+                },
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -289,8 +300,6 @@ fn vector_data_bytes(data: &VectorData) -> usize {
         VectorData::Sparse { indices, values } => {
             indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
         }
-        VectorData::Multi(vectors) => {
-            vectors.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
-        }
+        VectorData::Multi(multi) => multi.flat.len() * std::mem::size_of::<f32>(),
     }
 }

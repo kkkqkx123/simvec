@@ -54,6 +54,7 @@ impl CollectionStore {
     /// [`Self::finish_candidates`], so scores and semantics are
     /// path-independent.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        query.validate_nonempty()?;
         let started = Instant::now();
         // Take the metadata and all per-file views inside one read-lock
         // acquisition so a concurrent background compaction (which swaps
@@ -81,10 +82,10 @@ impl CollectionStore {
             pending,
         ) = {
             let inner = self.inner.read();
-            if query.vector.len() != inner.meta.vector_size {
+            if query.primary_vector().len() != inner.meta.vector_size {
                 return Err(VectorSearchError::InvalidVectorDimension {
                     expected: inner.meta.vector_size,
-                    actual: query.vector.len(),
+                    actual: query.primary_vector().len(),
                 });
             }
             let mask = query.filter.as_ref().and_then(|f| {

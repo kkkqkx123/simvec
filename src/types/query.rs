@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Result, VectorSearchError};
 use crate::filter_cond::{PayloadSelector, PointId, VectorFilter};
-use crate::types::point::VectorData;
-
-use super::point::Payload;
+use crate::types::config::DEFAULT_VECTOR_NAME;
+use crate::types::point::{Payload, VectorData};
 
 pub const DEFAULT_WITH_PAYLOAD: bool = true;
 
@@ -23,25 +25,12 @@ pub enum SearchMode {
 }
 
 /// Per-search quantization controls (mirrors qdrant's
-/// `QuantizationSearchParams`). The exact-scan quantization path consumes all
-/// fields; HNSW graph traversal consumes `ignore`/`exact` plus `rescore` and
-/// `oversampling` for candidate widening; the IVF path stays exact and
-/// ignores these controls, as do remote backends.
+/// `QuantizationSearchParams`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuantizationSearchParams {
-    /// Skip the quantized scan and use the exact path.
     pub ignore: bool,
-    /// Exact search: same as `ignore`, expressed the way qdrant's
-    /// `SearchRequest.exact` does it. Takes precedence over `ignore`.
     pub exact: bool,
-    /// Rescore quantized coarse candidates with original f32 vectors before
-    /// returning. Default depends on the quant method: Binary defaults to
-    /// true (Hamming ranking is only coarsely monotonic in the true metric),
-    /// Scalar/Product default to false (their quantized distance is already
-    /// in the true metric's units).
     pub rescore: Option<bool>,
-    /// Candidate multiplier for the quantized coarse scan (>= 1.0). When
-    /// unset, a per-method default is used (Scalar 2x, Binary 4x, Product 3x).
     pub oversampling: Option<f64>,
 }
 
@@ -54,50 +43,34 @@ impl QuantizationSearchParams {
     }
 }
 
+/// One query vector and the space it targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedVectorQuery {
+    pub space: String,
+    pub data: VectorData,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
-    pub vector: Vec<f32>,
-    /// Non-dense query payload for Sparse/Multi collections. Exactly one of
-    /// `vector` and `data` must be set, and the shape must match the
-    /// collection kind.
-    #[serde(default)]
-    pub data: Option<VectorData>,
-    /// Target named-vector space for named-vectors collections. Must be set
-    /// together with `named_vector` exactly when the collection is named.
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Query payload for the space named by `target`.
-    #[serde(default)]
-    pub named_vector: Option<VectorData>,
+    /// Query vectors, one per targeted space. Single-space collections carry
+    /// exactly one entry for [`DEFAULT_VECTOR_NAME`].
+    pub vectors: Vec<NamedVectorQuery>,
     pub limit: usize,
     pub offset: Option<usize>,
-    /// Similarity lower bound: results with `score >= score_threshold` are
-    /// kept. Scores are "higher is better" on every backend.
     pub score_threshold: Option<f32>,
     pub filter: Option<VectorFilter>,
     pub with_payload: Option<bool>,
     pub with_vector: Option<bool>,
-    /// Number of IVF cells probed per search. Consumed only when the local
-    /// engine published an IVF index; HNSW and remote backends ignore it.
-    /// For HNSW recall control use `SearchMode::KNN.ef_search` instead.
     pub nprobe: Option<usize>,
     pub search_mode: Option<SearchMode>,
-    /// Returned payload field projection (include / exclude lists).
-    /// `None` returns the whole payload. Applied after the payload read,
-    /// so it only trims serialization cost, never filtering semantics.
     pub payload_selector: Option<PayloadSelector>,
-    /// Quantized-scan controls (`ignore` / `exact` / `rescore` /
-    /// `oversampling`). `None` uses the defaults of [`QuantizationSearchParams`].
     pub quantization: Option<QuantizationSearchParams>,
 }
 
 impl SearchQuery {
-    pub fn new(vector: Vec<f32>, limit: usize) -> Self {
+    fn empty(vectors: Vec<NamedVectorQuery>, limit: usize) -> Self {
         Self {
-            vector,
-            data: None,
-            target: None,
-            named_vector: None,
+            vectors,
             limit,
             offset: None,
             score_threshold: None,
@@ -108,52 +81,86 @@ impl SearchQuery {
             search_mode: None,
             payload_selector: None,
             quantization: None,
+        }
+    }
+
+    pub fn new(vector: Vec<f32>, limit: usize) -> Self {
+        Self::empty(
+            vec![NamedVectorQuery {
+                space: DEFAULT_VECTOR_NAME.to_string(),
+                data: VectorData::Dense(vector),
+            }],
+            limit,
+        )
+    }
+
+    /// Build a non-dense query for a single-space collection.
+    pub fn with_data(data: VectorData, limit: usize) -> Self {
+        Self::empty(
+            vec![NamedVectorQuery {
+                space: DEFAULT_VECTOR_NAME.to_string(),
+                data,
+            }],
+            limit,
+        )
+    }
+
+    /// Build a query targeting one named space.
+    pub fn with_named(name: impl Into<String>, data: VectorData, limit: usize) -> Self {
+        Self::empty(
+            vec![NamedVectorQuery {
+                space: name.into(),
+                data,
+            }],
+            limit,
+        )
+    }
+
+    /// Add another named target. Multi-target searches fuse their rankings.
+    pub fn with_named_vector(mut self, name: impl Into<String>, data: VectorData) -> Self {
+        self.vectors.push(NamedVectorQuery {
+            space: name.into(),
+            data,
+        });
+        self
+    }
+
+    /// Reject a query without any target before a dense path indexes `primary`.
+    pub fn validate_nonempty(&self) -> Result<()> {
+        if self.vectors.is_empty() {
+            return Err(VectorSearchError::InvalidConfig(
+                "query must declare at least one vector".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The first query vector; dense paths always use this one.
+    pub fn primary(&self) -> &VectorData {
+        &self.vectors[0].data
+    }
+
+    /// Dense shortcut for the primary target.
+    pub fn primary_vector(&self) -> &[f32] {
+        match self.primary() {
+            VectorData::Dense(vector) => vector,
+            _ => &[],
+        }
+    }
+
+    /// Exactly one target, used by exact-scan stores.
+    pub fn single_target(&self) -> Result<(&str, &VectorData)> {
+        match self.vectors.as_slice() {
+            [query] => Ok((&query.space, &query.data)),
+            _ => Err(VectorSearchError::InvalidConfig(
+                "this collection accepts exactly one query vector".to_string(),
+            )),
         }
     }
 
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
         self
-    }
-
-    /// Build a non-dense query (Sparse or Multi collections).
-    pub fn with_data(data: VectorData, limit: usize) -> Self {
-        Self {
-            vector: Vec::new(),
-            data: Some(data),
-            target: None,
-            named_vector: None,
-            limit,
-            offset: None,
-            score_threshold: None,
-            filter: None,
-            with_payload: Some(true),
-            with_vector: None,
-            nprobe: None,
-            search_mode: None,
-            payload_selector: None,
-            quantization: None,
-        }
-    }
-
-    /// Build a named-vectors query targeting the space `name`.
-    pub fn with_named(name: impl Into<String>, data: VectorData, limit: usize) -> Self {
-        Self {
-            vector: Vec::new(),
-            data: None,
-            target: Some(name.into()),
-            named_vector: Some(data),
-            limit,
-            offset: None,
-            score_threshold: None,
-            filter: None,
-            with_payload: Some(true),
-            with_vector: None,
-            nprobe: None,
-            search_mode: None,
-            payload_selector: None,
-            quantization: None,
-        }
     }
 
     pub fn with_score_threshold(mut self, threshold: f32) -> Self {
@@ -181,20 +188,17 @@ impl SearchQuery {
         self
     }
 
-    /// Set quantized-scan controls for this search.
     pub fn with_quantization_params(mut self, params: QuantizationSearchParams) -> Self {
         self.quantization = Some(params);
         self
     }
 
-    /// Force exact (non-quantized) search for this query.
     pub fn with_exact(mut self, exact: bool) -> Self {
         let params = self.quantization.get_or_insert_with(Default::default);
         params.exact = exact;
         self
     }
 
-    /// Restrict the returned payload to the given fields (include list).
     pub fn with_payload_include(mut self, fields: Vec<String>) -> Self {
         let mut sel = self.payload_selector.take().unwrap_or_default();
         sel.include = Some(fields);
@@ -202,13 +206,11 @@ impl SearchQuery {
         self
     }
 
-    /// Set an explicit payload projection for the search results.
     pub fn with_payload_selector(mut self, selector: PayloadSelector) -> Self {
         self.payload_selector = Some(selector);
         self
     }
 
-    /// Remove the given fields from the returned payload (exclude list).
     pub fn with_payload_exclude(mut self, fields: Vec<String>) -> Self {
         let mut sel = self.payload_selector.take().unwrap_or_default();
         sel.exclude = Some(fields);
@@ -271,10 +273,13 @@ pub struct SearchResult {
     pub id: PointId,
     pub score: f32,
     pub payload: Option<Payload>,
+    /// Dense payload for FFI convenience. Named results also carry `vectors`.
     pub vector: Option<Vec<f32>>,
-    /// Non-dense payload echoed back when `with_vector` is requested.
     #[serde(default)]
     pub data: Option<VectorData>,
+    /// Full named vector map echoed back when `with_vector` is requested.
+    #[serde(default)]
+    pub vectors: BTreeMap<String, VectorData>,
 }
 
 impl SearchResult {
@@ -285,6 +290,7 @@ impl SearchResult {
             payload: None,
             vector: None,
             data: None,
+            vectors: BTreeMap::new(),
         }
     }
 
@@ -298,16 +304,19 @@ impl SearchResult {
         self
     }
 
-    /// Attach a non-dense payload (Sparse/Multi) to the result.
     pub fn with_data(mut self, data: VectorData) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    pub fn with_named_vector(mut self, space: impl Into<String>, data: VectorData) -> Self {
+        self.vectors.insert(space.into(), data);
         self
     }
 }
 
 /// Reject dense-only search controls on exact-scan collections.
 pub(crate) fn reject_exact_query_controls(query: &SearchQuery) -> crate::error::Result<()> {
-    use crate::error::VectorSearchError;
     if query.search_mode.is_some() || query.nprobe.is_some() || query.quantization.is_some() {
         return Err(VectorSearchError::InvalidConfig(
             "search_mode, nprobe and quantization controls only apply to dense collections"

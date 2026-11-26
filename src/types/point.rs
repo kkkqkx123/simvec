@@ -4,28 +4,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
 use crate::filter_cond::PointId;
-use crate::types::config::VectorKind;
+use crate::types::config::{DEFAULT_VECTOR_NAME, VectorKind};
 
 pub type Payload = std::collections::HashMap<String, serde_json::Value>;
 
-/// Vector payload shape for non-dense collection kinds.
-///
-/// Mirrors `vector-contracts::types::VectorData` field for field: sparse
-/// indices are strictly increasing and paired with finite weights of the
-/// same length; multi holds a non-empty sequence of dense vectors that all
-/// share the collection's single-vector dimension.
+/// Flattened multi-vector payload. Keeping sub-vectors contiguous avoids one
+/// allocation per token and lets scoring walk a single slice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MultiVector {
+    pub flat: Vec<f32>,
+    pub dim: usize,
+}
+
+impl MultiVector {
+    pub fn new(vectors: Vec<Vec<f32>>) -> Self {
+        let dim = vectors.first().map_or(0, Vec::len);
+        Self {
+            flat: vectors.into_iter().flatten().collect(),
+            dim,
+        }
+    }
+
+    pub fn vectors(&self) -> impl Iterator<Item = &[f32]> {
+        self.flat.chunks_exact(self.dim.max(1))
+    }
+
+    pub fn count(&self) -> usize {
+        self.flat.len() / self.dim.max(1)
+    }
+}
+
+/// Payload of one vector space.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VectorData {
-    /// A single dense embedding vector.
     Dense(Vec<f32>),
-    /// Sparse vector: strictly increasing indices paired with finite weights.
     Sparse { indices: Vec<u32>, values: Vec<f32> },
-    /// Multiple dense vectors of identical dimension scored with MaxSim.
-    Multi(Vec<Vec<f32>>),
+    Multi(MultiVector),
 }
 
 impl VectorData {
-    /// Kind described by this payload.
     pub fn kind(&self) -> VectorKind {
         match self {
             VectorData::Dense(_) => VectorKind::Dense,
@@ -34,26 +51,33 @@ impl VectorData {
         }
     }
 
-    /// Dense payload builder.
     pub fn dense(vector: Vec<f32>) -> Self {
         Self::Dense(vector)
     }
 
-    /// Sparse payload builder.
     pub fn sparse(indices: Vec<u32>, values: Vec<f32>) -> Self {
         Self::Sparse { indices, values }
     }
 
-    /// Multi-vector payload builder.
     pub fn multi(vectors: Vec<Vec<f32>>) -> Self {
-        Self::Multi(vectors)
+        Self::Multi(MultiVector::new(vectors))
     }
 
-    /// Validate the payload shape against the collection parameters.
-    ///
-    /// `dim` is the collection `vector_size` (dense dimension, sparse
-    /// vocabulary bound or multi single-vector dimension); `max_vectors`
-    /// bounds the per-point sub-vector count for Multi collections.
+    /// Sort sparse pairs by index so callers do not have to pre-sort input.
+    /// Length, uniqueness and finiteness are still checked by [`Self::validate`].
+    pub fn normalized(self) -> Self {
+        match self {
+            VectorData::Sparse { mut indices, mut values } => {
+                let mut pairs: Vec<(u32, f32)> = indices.drain(..).zip(values.drain(..)).collect();
+                pairs.sort_unstable_by_key(|(index, _)| *index);
+                let (indices, values) = pairs.into_iter().unzip();
+                Self::Sparse { indices, values }
+            }
+            other => other,
+        }
+    }
+
+    /// Validate the payload shape against the space parameters.
     pub fn validate(&self, dim: usize, max_vectors: usize) -> Result<()> {
         match self {
             VectorData::Dense(vector) => {
@@ -79,9 +103,9 @@ impl VectorData {
                     ));
                 }
                 for pair in indices.windows(2) {
-                    if pair[0] >= pair[1] {
+                    if pair[0] == pair[1] {
                         return Err(VectorSearchError::InvalidConfig(
-                            "sparse indices must be strictly increasing".to_string(),
+                            "sparse indices must be unique".to_string(),
                         ));
                     }
                 }
@@ -100,27 +124,25 @@ impl VectorData {
                     ));
                 }
             }
-            VectorData::Multi(vectors) => {
-                if vectors.is_empty() {
+            VectorData::Multi(multi) => {
+                if multi.count() == 0 {
                     return Err(VectorSearchError::InvalidConfig(
                         "multi vector must contain at least one sub-vector".to_string(),
                     ));
                 }
-                if vectors.len() > max_vectors {
+                if multi.count() > max_vectors {
                     return Err(VectorSearchError::InvalidConfig(format!(
                         "multi vector count {} exceeds configured limit {max_vectors}",
-                        vectors.len()
+                        multi.count()
                     )));
                 }
-                for vector in vectors {
-                    if vector.len() != dim {
-                        return Err(VectorSearchError::InvalidVectorDimension {
-                            expected: dim,
-                            actual: vector.len(),
-                        });
-                    }
-                    validate_finite(vector)?;
+                if multi.dim != dim {
+                    return Err(VectorSearchError::InvalidVectorDimension {
+                        expected: dim,
+                        actual: multi.dim,
+                    });
                 }
+                validate_finite(&multi.flat)?;
             }
         }
         Ok(())
@@ -136,71 +158,82 @@ fn validate_finite(values: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// A point carries one vector per declared space. The default space is used
+/// by single-space collections and by the dense storage/WAL paths; named
+/// collections simply add more entries to the same map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorPoint {
     pub id: PointId,
-    pub vector: Vec<f32>,
-    /// Non-dense payload. Exactly one of `vector` and `data` must be set:
-    /// `vector` for Dense collections, `data` for Sparse/Multi collections.
-    #[serde(default)]
-    pub data: Option<VectorData>,
-    /// Named-space payload. Set only for named-vectors collections, where
-    /// exactly one of `vector`, `data` and `named` is non-empty. Each entry
-    /// is validated against the space of the same name.
-    #[serde(default)]
-    pub named: BTreeMap<String, VectorData>,
+    pub vectors: BTreeMap<String, VectorData>,
     pub payload: Option<Payload>,
 }
 
 impl VectorPoint {
     pub fn new(id: impl Into<PointId>, vector: Vec<f32>) -> Self {
-        Self {
-            id: id.into(),
-            vector,
-            data: None,
-            named: BTreeMap::new(),
-            payload: None,
-        }
+        Self::with_data(id, VectorData::Dense(vector))
     }
 
-    /// Build a point carrying a non-dense payload.
+    /// Build a point carrying the payload of one space.
     pub fn with_data(id: impl Into<PointId>, data: VectorData) -> Self {
         Self {
             id: id.into(),
-            vector: Vec::new(),
-            data: Some(data),
-            named: BTreeMap::new(),
+            vectors: BTreeMap::from([(DEFAULT_VECTOR_NAME.to_string(), data)]),
             payload: None,
         }
     }
 
-    /// Build a point carrying a single named-space vector. Additional spaces
-    /// can be appended through [`Self::with_named_vector`]; named-vectors
-    /// collections require every declared space to be present on upsert.
+    /// Build a point carrying one named-space vector.
     pub fn with_named(id: impl Into<PointId>, space: impl Into<String>, data: VectorData) -> Self {
         Self {
             id: id.into(),
-            vector: Vec::new(),
-            data: None,
-            named: BTreeMap::from([(space.into(), data)]),
+            vectors: BTreeMap::from([(space.into(), data)]),
             payload: None,
         }
     }
 
-    /// Attach a vector for one named space, replacing any previous vector
-    /// for that space.
+    /// Attach or replace one named space.
     pub fn with_named_vector(mut self, space: impl Into<String>, data: VectorData) -> Self {
-        self.named.insert(space.into(), data);
+        self.vectors.insert(space.into(), data);
         self
     }
 
-    /// The payload kind this point carries (`None` when both fields are empty).
-    pub fn point_kind(&self) -> Option<VectorKind> {
-        if !self.vector.is_empty() {
-            Some(VectorKind::Dense)
-        } else {
-            self.data.as_ref().map(VectorData::kind)
+    /// Replace the default space's dense vector, preserving other spaces.
+    pub fn set_dense(&mut self, vector: Vec<f32>) {
+        self.vectors
+            .insert(DEFAULT_VECTOR_NAME.to_string(), VectorData::Dense(vector));
+    }
+
+    /// Sort every sparse space so merge-based scoring is always valid.
+    pub fn normalize(&mut self) {
+        for data in self.vectors.values_mut() {
+            *data = data.clone().normalized();
         }
+    }
+
+    /// Default-space vector, empty when the point has no dense default space.
+    pub fn vector(&self) -> &[f32] {
+        match self.vectors.get(DEFAULT_VECTOR_NAME) {
+            Some(VectorData::Dense(vector)) => vector,
+            _ => &[],
+        }
+    }
+
+    /// Default-space payload of any kind.
+    pub fn data(&self) -> Option<&VectorData> {
+        self.vectors.get(DEFAULT_VECTOR_NAME)
+    }
+
+    /// Payload of one named space.
+    pub fn space(&self, name: &str) -> Option<&VectorData> {
+        self.vectors.get(name)
+    }
+
+    /// Kind of the default space, or the first space for named-only points.
+    pub fn point_kind(&self) -> Option<VectorKind> {
+        self.vectors
+            .get(DEFAULT_VECTOR_NAME)
+            .or_else(|| self.vectors.values().next())
+            .map(VectorData::kind)
     }
 
     pub fn with_payload(mut self, payload: Payload) -> Self {
@@ -215,7 +248,11 @@ impl VectorPoint {
     }
 
     pub fn dimension(&self) -> usize {
-        self.vector.len()
+        match self.vectors.get(DEFAULT_VECTOR_NAME) {
+            Some(VectorData::Dense(vector)) => vector.len(),
+            Some(VectorData::Multi(multi)) => multi.dim,
+            _ => 0,
+        }
     }
 }
 

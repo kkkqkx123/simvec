@@ -82,14 +82,15 @@ impl MemoryEngine {
     /// Exact-scan search. Scores follow the crate-wide higher-is-better contract.
     /// Kernel dispatch degrades to the scalar baseline on wasm32.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        query.validate_nonempty()?;
         self.with_collection(collection, |c| {
-            if query.vector.len() != c.config.vector_size {
+            if query.primary_vector().len() != c.config.vector_size {
                 return Err(VectorSearchError::InvalidVectorDimension {
                     expected: c.config.vector_size,
-                    actual: query.vector.len(),
+                    actual: query.primary_vector().len(),
                 });
             }
-            for (idx, v) in query.vector.iter().enumerate() {
+            for (idx, v) in query.primary_vector().iter().enumerate() {
                 if !v.is_finite() {
                     return Err(VectorSearchError::NonFiniteElement(idx));
                 }
@@ -101,7 +102,7 @@ impl MemoryEngine {
                         continue;
                     }
                 }
-                let dist = distance(c.config.distance, &query.vector, &point.vector);
+                let dist = distance(c.config.distance, query.primary_vector(), point.vector());
                 let score = to_score(c.config.distance, dist);
                 if let Some(threshold) = query.score_threshold {
                     if score < threshold {
@@ -113,7 +114,7 @@ impl MemoryEngine {
                     result.payload = project_payload(point.payload.clone(), query);
                 }
                 if query.with_vector.unwrap_or(false) {
-                    result.vector = Some(point.vector.clone());
+                    result.vector = Some(point.vector().to_vec());
                 }
                 scored.push(result);
             }
@@ -175,15 +176,14 @@ impl MemoryEngine {
                 }
                 if let Some(point) = c.points.get(id) {
                     last = Some(id.clone());
+                    let vectors = if with_vector.unwrap_or(false) {
+                        point.vectors.clone()
+                    } else {
+                        Default::default()
+                    };
                     results.push(VectorPoint {
                         id: id.clone(),
-                        vector: if with_vector.unwrap_or(false) {
-                            point.vector.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        data: None,
-                        named: Default::default(),
+                        vectors,
                         payload: if with_payload.unwrap_or(true) {
                             point.payload.clone()
                         } else {
@@ -229,15 +229,14 @@ impl MemoryEngine {
                         continue;
                     }
                     last = Some(id.clone());
+                    let vectors = if with_vector.unwrap_or(false) {
+                        point.vectors.clone()
+                    } else {
+                        Default::default()
+                    };
                     results.push(VectorPoint {
                         id: id.clone(),
-                        vector: if with_vector.unwrap_or(false) {
-                            point.vector.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        data: None,
-                        named: Default::default(),
+                        vectors,
                         payload: if with_payload.unwrap_or(true) {
                             point.payload.clone()
                         } else {

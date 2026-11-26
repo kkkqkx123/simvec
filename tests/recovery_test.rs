@@ -94,8 +94,8 @@ fn test_replay_delete_batch_and_compact_marker() {
     assert!(store.get(&PointId::Num(1)).unwrap().is_none());
     assert!(store.get(&PointId::Num(2)).unwrap().is_none());
     assert_eq!(
-        store.get(&PointId::Num(3)).unwrap().unwrap().vector,
-        point(3).vector
+        store.get(&PointId::Num(3)).unwrap().unwrap().vector(),
+        point(3).vector()
     );
     assert_eq!(store.meta().last_applied_txn, 3);
 }
@@ -155,7 +155,7 @@ fn test_upsert_overwrite_after_replay_does_not_duplicate() {
     {
         let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
         let mut updated = point(1);
-        updated.vector = vec![9.0, 9.0, 9.0, 9.0];
+        updated.set_dense(vec![9.0, 9.0, 9.0, 9.0]);
         wal.append(&WalTxn {
             txn_id: 2,
             ops: vec![WalRecord::Upsert {
@@ -168,7 +168,7 @@ fn test_upsert_overwrite_after_replay_does_not_duplicate() {
     let store = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(store.count(), 1);
     assert_eq!(
-        store.get(&PointId::Num(1)).unwrap().unwrap().vector,
+        store.get(&PointId::Num(1)).unwrap().unwrap().vector(),
         vec![9.0, 9.0, 9.0, 9.0],
         "replay overwrite must win"
     );
@@ -327,7 +327,7 @@ fn test_wal_replay_after_checkpoint_marker_stays_idempotent() {
     );
     for id in 0..4u64 {
         let got = store.get(&PointId::Num(id)).unwrap().unwrap();
-        assert_eq!(got.vector, point(id).vector);
+        assert_eq!(got.vector(), point(id).vector());
     }
 }
 

@@ -69,6 +69,12 @@ let query = SearchQuery::new(vec![0.1; 384], 10)
 | `metrics` | `MetricsSnapshot` 与检索路径埋点 |
 | `types` | 共享类型层（远程 Qdrant 后端同样使用） |
 
+### 向量空间模型
+
+集合声明的是“空间名 -> 空间参数”的映射：每个空间独立选择 dense、sparse 或 multi，以及自己的维度和距离。单向量集合只是只含默认空名空间的特例；`CollectionConfig::new` / `with_sparse` / `with_multi` 是它的便捷构造器。点用同一个 `vectors` map 承载所有空间，查询可指定一个或多个目标；多目标检索按 RRF 融合。`VectorPoint::vector()` / `SearchQuery::primary_vector()` 是 dense 单空间路径的只读快捷方式。
+
+稀疏空间不设词表上界，索引允许乱序输入并在写入时排序；检索直接按 posting 权重累加打分。多向量以 `flat + dim` 扁平存储，比较器目前为 MaxSim。具名集合的 dense 空间仍走精确扫描，ANN / 量化只在单 dense 空间集合上启用；配置层会拒绝不受支持组合。
+
 ### 存储布局
 
 每个集合是引擎根目录下的一个子目录，包含 `vectors.bin`（mmap 的原始 f32 行）、WAL 段文件、payload 存储、元数据和索引产物。删除以墓碑表示；压实会重写整个目录。重建临时目录（`*.rebuild-*`）、发布备份（`*.old-*`）和隔离目录（`.suspect-*`）永远不会被加载进服务注册表——它们仅用于崩溃恢复和排查。

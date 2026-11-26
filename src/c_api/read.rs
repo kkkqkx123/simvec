@@ -3,7 +3,78 @@
 use std::ffi::{c_char, c_int};
 
 use crate::types::PointId;
-use crate::{SearchQuery, VectorFilter};
+use crate::{
+    NamedVectorQuery, PayloadSelector, QuantizationSearchParams, SearchMode, SearchQuery,
+    VectorData, VectorFilter,
+};
+
+/// FFI query shape. The convenience fields mirror the Rust builders while
+/// `vectors` exposes the unified named-space form directly.
+#[derive(serde::Deserialize)]
+struct QueryDto {
+    #[serde(default)]
+    vector: Vec<f32>,
+    #[serde(default)]
+    data: Option<VectorData>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    named_vector: Option<VectorData>,
+    #[serde(default)]
+    vectors: Vec<NamedVectorQuery>,
+    limit: usize,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    score_threshold: Option<f32>,
+    #[serde(default)]
+    filter: Option<VectorFilter>,
+    #[serde(default)]
+    with_payload: Option<bool>,
+    #[serde(default)]
+    with_vector: Option<bool>,
+    #[serde(default)]
+    nprobe: Option<usize>,
+    #[serde(default)]
+    search_mode: Option<SearchMode>,
+    #[serde(default)]
+    payload_selector: Option<PayloadSelector>,
+    #[serde(default)]
+    quantization: Option<QuantizationSearchParams>,
+}
+
+impl QueryDto {
+    fn into_query(self) -> SearchQuery {
+        let vectors = if !self.vectors.is_empty() {
+            self.vectors
+        } else if let (Some(space), Some(data)) = (self.target, self.named_vector) {
+            vec![NamedVectorQuery { space, data }]
+        } else if let Some(data) = self.data {
+            vec![NamedVectorQuery {
+                space: crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                data,
+            }]
+        } else {
+            vec![NamedVectorQuery {
+                space: crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                data: VectorData::Dense(self.vector),
+            }]
+        };
+        SearchQuery {
+            vectors,
+            limit: self.limit,
+            offset: self.offset,
+            score_threshold: self.score_threshold,
+            filter: self.filter,
+            with_payload: self.with_payload,
+            with_vector: self.with_vector,
+            nprobe: self.nprobe,
+            search_mode: self.search_mode,
+            payload_selector: self.payload_selector,
+            quantization: self.quantization,
+        }
+    }
+}
 
 use super::error::{
     emit_json, guard, input_floats, input_str, opt_input_str, parse_input_json, simvec_error_code_t,
@@ -32,8 +103,8 @@ pub unsafe extern "C" fn simvec_search(
             Ok(raw) => raw,
             Err(code) => return handle.fail_code(code, "invalid query string".to_string()),
         };
-        let query: SearchQuery = match parse_input_json(raw) {
-            Ok(query) => query,
+        let query: SearchQuery = match parse_input_json::<QueryDto>(raw) {
+            Ok(query) => query.into_query(),
             Err(code) => return handle.fail_code(code, "invalid query JSON".to_string()),
         };
         match handle.engine.search(collection, &query) {

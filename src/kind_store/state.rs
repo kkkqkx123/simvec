@@ -17,22 +17,17 @@ impl Inner {
                     }
                 }
             }
+            self.norms.remove(&slot);
         }
         self.live_count -= 1;
     }
 
-    /// Candidate slots holding at least one of the query terms.
-    pub(super) fn sparse_candidates(&self, indices: &[u32]) -> Vec<u32> {
-        let mut candidates = Vec::new();
-        for index in indices {
-            if let Some(postings) = self.inverted.get(index) {
-                for (slot, _) in postings {
-                    candidates.push(*slot);
-                }
-            }
+    /// Register one sparse vector in the postings index and cache its norm.
+    pub(super) fn index_sparse(&mut self, slot: u32, indices: &[u32], values: &[f32]) {
+        for (index, value) in indices.iter().zip(values.iter()) {
+            self.inverted.entry(*index).or_default().push((slot, *value));
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates
+        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+        self.norms.insert(slot, norm);
     }
 }

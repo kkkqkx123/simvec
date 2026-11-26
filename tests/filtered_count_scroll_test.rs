@@ -256,7 +256,7 @@ fn filtered_scroll_pagination_matches_full_scan() {
         .unwrap();
     assert_eq!(trimmed.len(), 5);
     assert!(trimmed.iter().all(|p| p.payload.is_none()));
-    assert!(trimmed.iter().all(|p| p.vector.is_empty()));
+    assert!(trimmed.iter().all(|p| p.vector().is_empty()));
 }
 
 #[test]

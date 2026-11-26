@@ -5,7 +5,7 @@ use crate::types::*;
 #[test]
 fn test_search_query_new() {
     let q = SearchQuery::new(vec![1.0, 2.0], 10);
-    assert_eq!(q.vector, vec![1.0, 2.0]);
+    assert_eq!(q.primary_vector(), vec![1.0, 2.0]);
     assert_eq!(q.limit, 10);
     assert_eq!(q.with_payload, Some(true));
     assert!(q.with_vector.is_none());

@@ -327,8 +327,9 @@ impl VectorEngine for LocalVectorEngine {
     fn get_index_metadata(&self, name: &str) -> Option<IndexMetadata> {
         if let Some(named) = self.named_store(name).ok().flatten() {
             let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
-            config.vectors = crate::types::VectorsConfig::Named(named.spaces());
+            config.vectors = named.spaces();
             config.index = crate::types::IndexConfig::Flat;
+            config.max_points = named.max_points();
             return Some(IndexMetadata {
                 name: name.to_string(),
                 config,
@@ -341,11 +342,10 @@ impl VectorEngine for LocalVectorEngine {
             let mut config = CollectionConfig::new(kind.vector_size(), kind.distance());
             config.kind = kind.kind();
             if kind.kind() == crate::types::VectorKind::Multi {
-                config.multi_config = Some(crate::types::MultiConfig {
-                    max_vectors_per_point: kind.max_vectors_per_point(),
-                });
+                config.multi_config = Some(crate::types::MultiConfig::new(kind.max_vectors_per_point()));
             }
             config.index = crate::types::IndexConfig::Flat;
+            config.max_points = kind.max_points();
             return Some(IndexMetadata {
                 name: name.to_string(),
                 config,

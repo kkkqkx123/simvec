@@ -81,7 +81,7 @@ pub(super) fn test_create_open_roundtrip() {
     assert!(reopened.collection_exists("col_a"));
     assert_eq!(reopened.count("col_a").unwrap(), 2);
     let got = reopened.get("col_a", &PointId::from("1")).unwrap().unwrap();
-    assert_eq!(got.vector, point(1, 4).vector);
+    assert_eq!(got.vector(), point(1, 4).vector());
     assert!(reopened
         .get("col_a", &PointId::from("99"))
         .unwrap()
@@ -145,7 +145,7 @@ pub(super) fn test_promote_temp_collection_swaps_live_and_keeps_backup() {
 
     assert_eq!(engine.count("live").unwrap(), 1);
     let got = engine.get("live", &PointId::from("2")).unwrap().unwrap();
-    assert_eq!(got.vector, point(2, 4).vector);
+    assert_eq!(got.vector(), point(2, 4).vector());
     assert!(engine.get("live", &PointId::from("1")).unwrap().is_none());
     assert_eq!(engine.count("live.old-2").unwrap(), 1);
     // Scratch and backups serve no reads through discovery names.
@@ -218,7 +218,7 @@ pub(super) fn test_restore_promote_backup_reverses_bad_publish() {
     assert_eq!(restored, "live.old-2");
     assert_eq!(engine.count("live").unwrap(), 1);
     let got = engine.get("live", &PointId::from("1")).unwrap().unwrap();
-    assert_eq!(got.vector, point(1, 4).vector);
+    assert_eq!(got.vector(), point(1, 4).vector());
 
     let err = engine.restore_promote_backup("live").unwrap_err();
     assert!(matches!(err, VectorSearchError::CollectionNotFound(_)));

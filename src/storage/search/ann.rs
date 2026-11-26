@@ -36,7 +36,7 @@ impl CollectionStore {
             filter_mask: snap.filter_mask,
         };
         loop {
-            let candidates = index.probe_candidates(&query.vector, nprobe, pending, &ivf_ctx)?;
+            let candidates = index.probe_candidates(query.primary_vector(), nprobe, pending, &ivf_ctx)?;
             let results = self.finish_candidates(candidates, query, snap)?;
 
             let short = query.filter.is_some() && results.len() < query.limit;
@@ -83,7 +83,7 @@ impl CollectionStore {
                 let quant_guard = self.quant.read();
                 quant_guard.as_ref().filter(|q| q.is_ready()).and_then(|quant| {
                     let metric = self.inner.read().meta.distance;
-                    match quant.encode_query(&query.vector, metric) {
+                    match quant.encode_query(query.primary_vector(), metric) {
                         Err(e) => {
                             tracing::warn!(error = %e, "quant encode_query failed; HNSW traversal falls back to exact");
                             None
@@ -131,7 +131,7 @@ impl CollectionStore {
             },
         };
         let candidates =
-            index.probe_candidates(&query.vector, ef, query.effective_limit(), &hnsw_ctx)?;
+            index.probe_candidates(query.primary_vector(), ef, query.effective_limit(), &hnsw_ctx)?;
         let candidates = self.merge_pending(candidates, pending, query, snap);
         let candidates = self.rescore_exact(candidates, quant_rescore, query, snap);
 
@@ -151,7 +151,7 @@ impl CollectionStore {
         self.metrics
             .record_search_retry(SearchRetry::IterativeExpansion);
         let iterative_results = index.probe_candidates_iterative(
-            &query.vector,
+            query.primary_vector(),
             ef,
             query.effective_limit(),
             index.iterative_rounds(),
@@ -168,7 +168,7 @@ impl CollectionStore {
         self.metrics.record_search_retry(SearchRetry::EfDoubling);
         ef = (ef * 2).min(cap);
         let candidates =
-            index.probe_candidates(&query.vector, ef, query.effective_limit(), &hnsw_ctx)?;
+            index.probe_candidates(query.primary_vector(), ef, query.effective_limit(), &hnsw_ctx)?;
         let candidates = self.merge_pending(candidates, pending, query, snap);
         let candidates = self.rescore_exact(candidates, quant_rescore, query, snap);
         self.finish_candidates(candidates, query, snap)
@@ -192,7 +192,7 @@ impl CollectionStore {
             .into_iter()
             .filter_map(|(_, slot)| {
                 let v = Vectors::read_slot(snap.vsnap, slot as u64, snap.segment_slots, snap.dim)?;
-                let dist = crate::distance::distance(metric, &query.vector, v);
+                let dist = crate::distance::distance(metric, query.primary_vector(), v);
                 Some((crate::distance::to_score(metric, dist), slot))
             })
             .collect()

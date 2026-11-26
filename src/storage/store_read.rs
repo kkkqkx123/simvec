@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::types::{PointId, VectorPoint};
+use crate::types::{PointId, VectorData, VectorPoint};
 
 use super::*;
 
@@ -116,9 +117,7 @@ impl CollectionStore {
         let payload = self.read_payload_at(slot as u32)?;
         Ok(Some(VectorPoint {
             id: id.clone(),
-            vector,
-            data: None,
-            named: Default::default(),
+            vectors: BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), VectorData::Dense(vector))]),
             payload,
         }))
     }
@@ -199,9 +198,10 @@ impl CollectionStore {
             last_id = Some(id.clone());
             results.push(VectorPoint {
                 id,
-                vector: vector.unwrap_or_default(),
-                data: None,
-                named: Default::default(),
+                vectors: BTreeMap::from([(
+                    crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                    VectorData::Dense(vector.unwrap_or_default()),
+                )]),
                 payload,
             });
             if results.len() >= limit {
@@ -272,9 +272,10 @@ impl CollectionStore {
             last_id = Some(id.clone());
             results.push(VectorPoint {
                 id,
-                vector: vector.unwrap_or_default(),
-                data: None,
-                named: Default::default(),
+                vectors: BTreeMap::from([(
+                    crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                    VectorData::Dense(vector.unwrap_or_default()),
+                )]),
                 payload,
             });
             if results.len() >= limit {

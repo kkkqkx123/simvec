@@ -59,7 +59,7 @@ impl CollectionStore {
         else {
             return;
         };
-        let dist = crate::distance::distance(metric, &query.vector, v);
+        let dist = crate::distance::distance(metric, query.primary_vector(), v);
         let score = crate::distance::to_score(metric, dist);
         let item = ScoredSlot { score, slot };
         if heap.len() < k {

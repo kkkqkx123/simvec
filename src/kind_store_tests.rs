@@ -18,9 +18,7 @@ fn multi_config() -> CollectionConfig {
     CollectionConfig::with_multi(
         2,
         DistanceMetric::Dot,
-        MultiConfig {
-            max_vectors_per_point: 4,
-        },
+        MultiConfig::new(4),
     )
 }
 
@@ -54,9 +52,7 @@ fn kind_configs_validate() {
 #[test]
 fn dense_config_rejects_kind_params() {
     let mut config = CollectionConfig::new(3, DistanceMetric::Cosine);
-    config.multi_config = Some(MultiConfig {
-        max_vectors_per_point: 2,
-    });
+    config.multi_config = Some(MultiConfig::new(2));
     assert!(config.validate_kind().is_err());
 }
 
@@ -156,7 +152,7 @@ fn kind_collections_recover_from_wal() {
     assert!(engine.get("kb", &PointId::from("a")).unwrap().is_none());
 
     let point = engine.get("kb", &PointId::from("b")).unwrap().unwrap();
-    assert!(point.data.is_some());
+    assert!(point.data().is_some());
 
     let query = SearchQuery::with_data(VectorData::sparse(vec![2], vec![1.0]), 10);
     let results = engine.search("kb", &query).unwrap();
@@ -210,4 +206,65 @@ fn local_engine_claims_all_kinds() {
     assert!(kinds.contains(&VectorKind::Dense));
     assert!(kinds.contains(&VectorKind::Sparse));
     assert!(kinds.contains(&VectorKind::Multi));
+}
+
+#[test]
+fn coordinated_upsert_is_durable() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+        engine
+            .create_collection("kb", &sparse_config())
+            .expect("create");
+        engine
+            .apply_txn(vec![crate::TxnOp::Upsert {
+                collection: "kb".to_string(),
+                point: sparse_point("p1", &[(1, 1.0), (3, 2.0)]),
+            }])
+            .expect("apply txn");
+    }
+    let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+    assert_eq!(engine.count("kb").unwrap(), 1);
+    let hits = engine
+        .search("kb", &SearchQuery::with_data(VectorData::sparse(vec![1, 3], vec![1.0, 1.0]), 5))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn sparse_unsorted_input_is_normalized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+    engine
+        .create_collection("kb", &sparse_config())
+        .expect("create");
+    engine
+        .upsert(
+            "kb",
+            VectorPoint::with_data("p1", VectorData::sparse(vec![3, 1, 2], vec![3.0, 1.0, 2.0])),
+        )
+        .expect("unsorted sparse upsert");
+    let hits = engine
+        .search("kb", &SearchQuery::with_data(VectorData::sparse(vec![2], vec![1.0]), 5))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].score, 2.0);
+}
+
+#[test]
+fn exact_store_compaction_reclaims_slots_and_cap_is_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = sparse_config();
+    config.max_points = Some(2);
+    let engine = LocalVectorEngine::open(tmp.path()).unwrap();
+    engine.create_collection("kb", &config).expect("create");
+    engine.upsert("kb", sparse_point("p1", &[(1, 1.0)])).unwrap();
+    engine.upsert("kb", sparse_point("p2", &[(2, 1.0)])).unwrap();
+    assert!(engine.upsert("kb", sparse_point("p3", &[(3, 1.0)])).is_err());
+    engine.delete("kb", &PointId::from("p1")).unwrap();
+    assert!(engine.compact_collection("kb").unwrap() >= 1);
+    assert_eq!(engine.count("kb").unwrap(), 1);
+    drop(engine);
+    let reopened = LocalVectorEngine::open(tmp.path()).unwrap();
+    assert_eq!(reopened.count("kb").unwrap(), 1);
 }

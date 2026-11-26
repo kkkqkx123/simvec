@@ -35,7 +35,7 @@ impl CollectionStore {
             })
             .filter_map(|s| {
                 let v = Vectors::read_slot(snap.vsnap, s as u64, snap.segment_slots, snap.dim)?;
-                let dist = crate::distance::distance(metric, &query.vector, v);
+                let dist = crate::distance::distance(metric, query.primary_vector(), v);
                 Some((crate::distance::to_score(metric, dist), s))
             })
             .collect();

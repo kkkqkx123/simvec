@@ -86,8 +86,8 @@ fn test_apply_txn_roundtrip_and_replay() {
     assert_eq!(reopened.count(), 1);
     assert!(reopened.get(&PointId::Num(1)).unwrap().is_none());
     assert_eq!(
-        reopened.get(&PointId::Num(2)).unwrap().unwrap().vector,
-        point(2, 4).vector
+        reopened.get(&PointId::Num(2)).unwrap().unwrap().vector(),
+        point(2, 4).vector()
     );
     assert_eq!(reopened.meta().last_applied_txn, 2);
 }
@@ -207,7 +207,7 @@ fn test_compact_rebuilds_and_search_stays_correct() {
         if [3, 7, 11, 15].contains(&i) {
             assert!(got.is_none(), "deleted point {i} must stay gone");
         } else {
-            assert_eq!(got.unwrap().vector, point(i, 4).vector, "point {i}");
+            assert_eq!(got.unwrap().vector(), point(i, 4).vector(), "point {i}");
         }
     }
 
@@ -220,7 +220,7 @@ fn test_compact_rebuilds_and_search_stays_correct() {
         if [3, 7, 11, 15].contains(&i) {
             assert!(got.is_none());
         } else {
-            assert_eq!(got.unwrap().vector, point(i, 4).vector);
+            assert_eq!(got.unwrap().vector(), point(i, 4).vector());
         }
     }
 }
@@ -296,8 +296,8 @@ fn test_grow_after_compact() {
     assert_eq!(store.count(), 101);
     for i in 40..120u64 {
         assert_eq!(
-            store.get(&PointId::Num(i)).unwrap().unwrap().vector,
-            point(i, 4).vector,
+            store.get(&PointId::Num(i)).unwrap().unwrap().vector(),
+            point(i, 4).vector(),
             "point {i}"
         );
     }
@@ -342,8 +342,8 @@ fn compaction_under_concurrent_writes_stays_consistent() {
             "live point {id} lost"
         );
         assert_eq!(
-            store.get(&PointId::Num(*id)).unwrap().unwrap().vector,
-            point(*id, 4).vector,
+            store.get(&PointId::Num(*id)).unwrap().unwrap().vector(),
+            point(*id, 4).vector(),
             "point {id} corrupted by a racing compaction"
         );
     }

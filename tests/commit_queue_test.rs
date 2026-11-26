@@ -98,7 +98,7 @@ fn concurrent_writes_reopen_with_identical_slot_numbering() {
             .get(id)
             .unwrap()
             .unwrap_or_else(|| panic!("id {id} must come back from the log"));
-        assert_eq!(&replayed.vector, &point.vector, "id {id} vector drifted");
+        assert_eq!(replayed.vector(), point.vector(), "id {id} vector drifted");
         assert_eq!(&replayed.payload, &point.payload, "id {id} payload drifted");
     }
 }

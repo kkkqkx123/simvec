@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,19 +27,23 @@ impl KindStore {
             vector_size: config.vector_size,
             distance: config.distance,
             max_vectors_per_point: config.multi_config.map_or(0, |c| c.max_vectors_per_point),
+            max_points: config.max_points,
         };
         let bytes = postcard::to_stdvec(&meta)?;
         std::fs::write(dir.join("kind.bin"), &bytes)?;
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
+            name: name.to_string(),
             kind: config.kind,
             dim: config.vector_size,
             max_vectors_per_point: meta.max_vectors_per_point,
             distance: config.distance,
+            max_points: meta.max_points,
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            gate: Mutex::new(()),
             metrics: Metrics::default(),
             snapshot: dir.join("kind_snapshot.bin"),
         }))
@@ -54,13 +59,16 @@ impl KindStore {
         let snapshot = crate::storage::snapshot::read::<KindSnapshot>(&snapshot_path)?;
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
+            name: meta.collection.clone(),
             kind: meta.kind,
             dim: meta.vector_size,
             max_vectors_per_point: meta.max_vectors_per_point,
             distance: meta.distance,
+            max_points: meta.max_points,
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            gate: Mutex::new(()),
             metrics: Metrics::default(),
             snapshot: snapshot_path,
         });
@@ -87,13 +95,7 @@ impl KindStore {
                 .transpose()?;
             self.validate_data(&point.data)?;
             if let VectorData::Sparse { indices, values } = &point.data {
-                for (index, value) in indices.iter().zip(values.iter()) {
-                    inner
-                        .inverted
-                        .entry(*index)
-                        .or_default()
-                        .push((point.slot, *value));
-                }
+                inner.index_sparse(point.slot, indices, values);
             }
             inner.reverse.insert(point.id.clone(), point.slot);
             inner.points[point.slot as usize] = Some(KindPoint {
@@ -108,40 +110,85 @@ impl KindStore {
     }
 
     /// Publish a snapshot of the live state and truncate the covered WAL.
+    ///
+    /// The gate blocks writers for the whole snapshot-and-truncate window: a
+    /// commit appended between the two would otherwise exist only in the log
+    /// that is about to be discarded.
     pub fn checkpoint(&self) -> Result<()> {
-        let snapshot = {
-            let inner = self.inner.lock();
-            KindSnapshot {
-                lsn: inner.next_lsn.saturating_sub(1),
-                points: inner
-                    .points
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, point)| {
-                        point.as_ref().map(|point| KindSnapshotPoint {
-                            slot: slot as u32,
-                            id: point.id.to_string(),
-                            data: point.data.clone(),
-                            payload: point
-                                .payload
-                                .as_ref()
-                                .and_then(|p| serde_json::to_string(p).ok()),
-                        })
+        let _gate = self.gate.lock();
+        let inner = self.inner.lock();
+        self.checkpoint_from_locked(&inner)
+    }
+
+    pub(super) fn checkpoint_from_locked(&self, inner: &Inner) -> Result<()> {
+        let snapshot = KindSnapshot {
+            lsn: inner.next_lsn.saturating_sub(1),
+            points: inner
+                .points
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, point)| {
+                    point.as_ref().map(|point| KindSnapshotPoint {
+                        slot: slot as u32,
+                        id: point.id.to_string(),
+                        data: point.data.clone(),
+                        payload: point
+                            .payload
+                            .as_ref()
+                            .and_then(|p| serde_json::to_string(p).ok()),
                     })
-                    .collect(),
-            }
+                })
+                .collect(),
         };
         crate::storage::snapshot::write(&self.snapshot, &snapshot)?;
         self.wal.truncate()?;
         Ok(())
     }
 
+    /// Reclaim tombstoned slots and publish the compacted state. Slot ids are
+    /// renumbered in the snapshot; the old WAL is truncated in the same gate.
+    pub fn compact(&self) -> Result<u64> {
+        let _gate = self.gate.lock();
+        let mut inner = self.inner.lock();
+        let reclaimed = (inner.points.len() as u64).saturating_sub(inner.live_count);
+        if reclaimed == 0 {
+            return Ok(0);
+        }
+        let mut points = Vec::with_capacity(inner.live_count as usize);
+        let mut reverse = HashMap::with_capacity(inner.live_count as usize);
+        let mut inverted = HashMap::new();
+        let mut norms = HashMap::new();
+        for point in inner.points.drain(..).flatten() {
+            let slot = points.len() as u32;
+            if let VectorData::Sparse { indices, values } = &point.data {
+                for (index, value) in indices.iter().zip(values.iter()) {
+                    inverted.entry(*index).or_insert_with(Vec::new).push((slot, *value));
+                }
+                let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+                norms.insert(slot, norm);
+            }
+            reverse.insert(point.id.to_string(), slot);
+            points.push(Some(point));
+        }
+        inner.points = points;
+        inner.reverse = reverse;
+        inner.inverted = inverted;
+        inner.norms = norms;
+        self.checkpoint_from_locked(&inner)?;
+        Ok(reclaimed)
+    }
+
     fn replay_txn(&self, txn: &WalTxn) -> Result<()> {
         let mut inner = self.inner.lock();
         for record in &txn.ops {
             match record {
-                WalRecord::UpsertKind { id, data, payload } => {
-                    self.apply_upsert(&mut inner, id.clone(), data.clone(), payload.clone())?;
+                WalRecord::UpsertVectors {
+                    id,
+                    vectors,
+                    payload,
+                } => {
+                    let data = super::write::kind_data(vectors)?;
+                    self.apply_upsert(&mut inner, id.clone(), data, payload.clone())?;
                 }
                 WalRecord::Delete { point_id } => {
                     if let Some(slot) = inner.reverse.get(point_id).copied() {
@@ -181,7 +228,7 @@ impl KindStore {
                 }
                 WalRecord::Compact => {}
                 WalRecord::Upsert { .. }
-                | WalRecord::UpsertNamed { .. }
+                | WalRecord::PatchNamedVectors { .. }
                 | WalRecord::Quantize
                 | WalRecord::DropCollection => {
                     return Err(VectorSearchError::CorruptData(format!(
@@ -206,6 +253,17 @@ impl KindStore {
             .map(|p| serde_json::from_str(p))
             .transpose()?;
         self.validate_data(&data)?;
+        if !inner.reverse.contains_key(&id) {
+            if let Some(cap) = self.max_points {
+                if inner.live_count >= cap {
+                    return Err(VectorSearchError::CapacityExceeded {
+                        collection: self.name.clone(),
+                        max_points: cap,
+                        requested: inner.live_count.saturating_add(1),
+                    });
+                }
+            }
+        }
         // Idempotent overwrite: a replayed or repeated upsert of the same id
         // replaces the stored point in place (the old slot is tombstoned and
         // its postings dropped).
@@ -214,13 +272,7 @@ impl KindStore {
         }
         let slot = inner.points.len() as u32;
         if let VectorData::Sparse { indices, values } = &data {
-            for (index, value) in indices.iter().zip(values.iter()) {
-                inner
-                    .inverted
-                    .entry(*index)
-                    .or_default()
-                    .push((slot, *value));
-            }
+            inner.index_sparse(slot, indices, values);
         }
         inner.reverse.insert(id.clone(), slot);
         inner.points.push(Some(KindPoint {

@@ -11,7 +11,7 @@
 //! - weighted dot / Euclid / Manhattan scoring for Sparse and exact MaxSim
 //!   for Multi;
 //! - WAL-backed durability by replaying the shared `wal.bin` record format
-//!   (`WalRecord::UpsertKind` carries the non-dense payload).
+//!   (`WalRecord::UpsertVectors` carries the named payload map).
 //!
 //! The store is a reference implementation on purpose: it keeps every live
 //! point in memory and rebuilds by full WAL replay, mirroring the memory
@@ -37,7 +37,7 @@ mod state;
 mod write;
 
 pub(crate) use self::score::score_pair;
-pub(crate) use self::score::sparse_score;
+pub(crate) use self::score::sparse_candidate_scores;
 pub use self::write::kind_upsert_record;
 
 /// One live point of a Sparse/Multi collection.
@@ -58,6 +58,8 @@ struct Inner {
     /// Sparse-only inverted index: term -> (slot, weight) postings. Empty for
     /// Multi collections.
     inverted: HashMap<u32, Vec<(u32, f32)>>,
+    /// Cached L2 norm of each live sparse vector, indexed by slot.
+    norms: HashMap<u32, f32>,
     next_lsn: u64,
     live_count: u64,
 }
@@ -65,6 +67,7 @@ struct Inner {
 /// A single opened Sparse or Multi collection.
 pub struct KindStore {
     dir: PathBuf,
+    name: String,
     kind: VectorKind,
     /// Dense dimension / sparse vocabulary bound / multi sub-vector dimension.
     dim: usize,
@@ -75,6 +78,10 @@ pub struct KindStore {
     wal: Wal,
     /// Engine-level storage tuning this collection was opened with.
     storage: StorageConfig,
+    /// Admission cap enforced before any mutation is logged.
+    max_points: Option<u64>,
+    /// Serializes WAL append, in-memory apply and checkpoint/truncate.
+    gate: Mutex<()>,
     /// Operational counters for the exact-scan path.
     metrics: Metrics,
     /// Snapshot path; the WAL is replayed on top of this derived state.
@@ -116,4 +123,7 @@ struct KindMeta {
     distance: crate::types::DistanceMetric,
     /// Sub-vector cap for Multi collections; `0` for Sparse.
     max_vectors_per_point: usize,
+    /// Admission cap mirrored from the collection configuration.
+    #[serde(default)]
+    max_points: Option<u64>,
 }

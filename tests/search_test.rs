@@ -78,7 +78,7 @@ fn expected_order(query: &[f32], points: &[u64], exclude: &[u64]) -> Vec<u64> {
         .filter(|i| !exclude.contains(i))
         .map(|i| {
             let p = unit(i, query.len());
-            let sim = 1.0 - naive::distance_cosine(query, &p.vector);
+            let sim = 1.0 - naive::distance_cosine(query, p.vector());
             (sim, i)
         })
         .collect();
@@ -97,7 +97,7 @@ fn test_topk_cosine() {
     .unwrap();
     seed(&store, 10, 8, false);
 
-    let query = unit(3, 8).vector;
+    let query = unit(3, 8).vector().to_vec();
     let results = store
         .search(&SearchQuery::new(query.clone(), 3).with_vector(true))
         .unwrap();
@@ -114,7 +114,7 @@ fn test_topk_cosine() {
         assert!(pair[0].score >= pair[1].score, "scores must descend");
     }
     // with_vector=true returns vectors.
-    assert_eq!(results[0].vector, Some(unit(3, 8).vector));
+    assert_eq!(results[0].vector, Some(unit(3, 8).vector().to_vec()));
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_topk_l2_and_dot() {
     )
     .unwrap();
     seed(&store, 10, 4, false);
-    let query = unit(7, 4).vector;
+    let query = unit(7, 4).vector().to_vec();
     let results = store.search(&SearchQuery::new(query.clone(), 2)).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].id.to_string(), "7");
@@ -141,7 +141,7 @@ fn test_topk_l2_and_dot() {
     )
     .unwrap();
     seed(&store, 10, 4, false);
-    let query = unit(5, 4).vector;
+    let query = unit(5, 4).vector().to_vec();
     let results = store.search(&SearchQuery::new(query.clone(), 2)).unwrap();
     assert_eq!(results[0].id.to_string(), "5");
     // Dot score of the exact match is |v|^2 (the vector is not unit-length).
@@ -162,7 +162,7 @@ fn test_manhattan_topk_and_threshold() {
     seed(&store, 10, 8, false);
 
     // Query is an exact copy of id 4; Manhattan distance to itself is 0 -> score 1.0.
-    let query = unit(4, 8).vector;
+    let query = unit(4, 8).vector().to_vec();
     let results = store.search(&SearchQuery::new(query.clone(), 3)).unwrap();
     assert_eq!(results.len(), 3, "manhattan top-3");
     assert_eq!(results[0].id.to_string(), "4");
@@ -175,7 +175,7 @@ fn test_manhattan_topk_and_threshold() {
     let oracle: Vec<(f32, u64)> = (0..10)
         .map(|i| {
             let p = unit(i, 8);
-            let l1 = naive::distance(DistanceMetric::Manhattan, &query, &p.vector);
+            let l1 = naive::distance(DistanceMetric::Manhattan, &query, p.vector());
             let score = 1.0 / (1.0 + l1.sqrt());
             (score, i)
         })
@@ -196,7 +196,7 @@ fn test_manhattan_topk_and_threshold() {
     // Scores must be 1/(1+sqrt(l1)) and descending.
     for r in &results {
         let pid: u64 = r.id.to_string().parse().unwrap();
-        let l1 = naive::distance(DistanceMetric::Manhattan, &query, &unit(pid, 8).vector);
+        let l1 = naive::distance(DistanceMetric::Manhattan, &query, &unit(pid, 8).vector());
         let expected_score = 1.0 / (1.0 + l1.sqrt());
         assert!(
             (r.score - expected_score).abs() < 1e-4,
@@ -233,7 +233,7 @@ fn test_score_threshold_filters_below() {
 
     // Threshold between the best and second-best score keeps exactly the top
     // hit (the exact match).
-    let query = unit(1, 8).vector;
+    let query = unit(1, 8).vector().to_vec();
     let all = store.search(&SearchQuery::new(query.clone(), 10)).unwrap();
     assert_eq!(all[0].id.to_string(), "1");
     let threshold = (all[0].score + all[1].score) / 2.0;
@@ -255,7 +255,7 @@ fn test_offset_limit_pagination() {
     .unwrap();
     seed(&store, 10, 8, false);
 
-    let query = unit(0, 8).vector;
+    let query = unit(0, 8).vector().to_vec();
     let all = store.search(&SearchQuery::new(query.clone(), 10)).unwrap();
     assert_eq!(all.len(), 10);
 
@@ -295,7 +295,7 @@ fn test_filter_post_filtering() {
 
     // Query is a blue point; the red filter must exclude it and the top red
     // hit must match the oracle restricted to red points.
-    let query = unit(3, 8).vector;
+    let query = unit(3, 8).vector().to_vec();
     let reds: Vec<u64> = (0..10).filter(|i| i % 2 == 0).collect();
     let expected = expected_order(&query, &reds, &[]);
     let filter = VectorFilter::new().must(FilterCondition::match_value("color", "red"));
@@ -323,14 +323,14 @@ fn test_with_payload_false_skips_payload() {
     .unwrap();
     seed(&store, 5, 4, true);
 
-    let query = unit(1, 4).vector;
+    let query = unit(1, 4).vector().to_vec();
     let results = store
         .search(&SearchQuery::new(query, 5).with_payload(false))
         .unwrap();
     assert!(results.iter().all(|r| r.payload.is_none()));
 
     let results = store
-        .search(&SearchQuery::new(unit(1, 4).vector, 5))
+        .search(&SearchQuery::new(unit(1, 4).vector().to_vec(), 5))
         .unwrap();
     assert!(results.iter().all(|r| r.payload.is_some()));
 }
@@ -348,7 +348,7 @@ fn test_deleted_points_are_skipped() {
     delete_logged(&store, &PointId::Num(3));
     delete_logged(&store, &PointId::Num(7));
 
-    let query = unit(3, 8).vector;
+    let query = unit(3, 8).vector().to_vec();
     let results = store.search(&SearchQuery::new(query.clone(), 10)).unwrap();
     let got: Vec<u64> = results
         .iter()
@@ -379,7 +379,7 @@ fn test_search_after_compaction() {
     store.compact().unwrap();
     assert_eq!(store.meta().tombstone_count, 0);
 
-    let query = unit(6, 8).vector;
+    let query = unit(6, 8).vector().to_vec();
     let results = store.search(&SearchQuery::new(query.clone(), 10)).unwrap();
     let got: Vec<u64> = results
         .iter()
@@ -456,7 +456,7 @@ fn test_nested_filter_and_geo() {
             ),
         },
     ));
-    let query = unit(1, 4).vector;
+    let query = unit(1, 4).vector().to_vec();
     let results = store
         .search(&SearchQuery::new(query.clone(), 10).with_filter(nested))
         .unwrap();

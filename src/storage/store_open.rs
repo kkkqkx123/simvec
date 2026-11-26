@@ -358,13 +358,13 @@ impl CollectionStore {
 }
 
 pub(super) fn validate_point(meta: &Meta, point: &VectorPoint) -> Result<()> {
-    if point.vector.len() != meta.vector_size {
+    if point.vector().len() != meta.vector_size {
         return Err(VectorSearchError::InvalidVectorDimension {
             expected: meta.vector_size,
-            actual: point.vector.len(),
+            actual: point.vector().len(),
         });
     }
-    for (i, v) in point.vector.iter().enumerate() {
+    for (i, v) in point.vector().iter().enumerate() {
         if !v.is_finite() {
             return Err(VectorSearchError::NonFiniteElement(i));
         }
@@ -426,8 +426,8 @@ pub(super) fn count_ops(ops: &[WalRecord]) -> (u64, u64) {
             WalRecord::Compact
             | WalRecord::Quantize
             | WalRecord::DropCollection
-            | WalRecord::UpsertKind { .. }
-            | WalRecord::UpsertNamed { .. }
+            | WalRecord::UpsertVectors { .. }
+            | WalRecord::PatchNamedVectors { .. }
             | WalRecord::SetPayload { .. }
             | WalRecord::DeletePayloadKeys { .. }
             | WalRecord::SetPayloadField { .. } => {}

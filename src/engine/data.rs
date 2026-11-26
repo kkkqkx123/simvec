@@ -69,6 +69,21 @@ impl LocalVectorEngine {
         Ok(())
     }
 
+    /// Replace selected named spaces of an existing point.
+    pub fn update_named_vectors(
+        &self,
+        collection: &str,
+        point_id: &PointId,
+        vectors: std::collections::BTreeMap<String, crate::types::VectorData>,
+    ) -> Result<()> {
+        if let Some(named) = self.named_store(collection)? {
+            return named.patch_named(point_id, vectors);
+        }
+        Err(VectorSearchError::InvalidConfig(format!(
+            "collection {collection} is not a named-vectors collection"
+        )))
+    }
+
     /// Delete a point by id (WAL-backed). Deleting a missing id is a no-op.
     pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
         if let Some(named) = self.named_store(collection)? {

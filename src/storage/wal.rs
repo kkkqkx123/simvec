@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
-use crate::types::{PointId, VectorPoint};
+use crate::types::VectorPoint;
 
 /// Maximum accepted single-record size (guards against corrupt length fields).
 const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
@@ -62,9 +62,9 @@ pub struct WalPoint {
 
 impl WalPoint {
     pub fn from_point(point: &VectorPoint) -> Result<Self> {
-        if !point.named.is_empty() {
+        if point.vectors.len() != 1 || !point.vectors.contains_key(crate::types::DEFAULT_VECTOR_NAME) {
             return Err(VectorSearchError::InvalidConfig(
-                "dense WAL upserts must not carry named-space vectors".to_string(),
+                "dense WAL upserts must carry exactly the default vector space".to_string(),
             ));
         }
         let payload = match &point.payload {
@@ -73,7 +73,7 @@ impl WalPoint {
         };
         Ok(Self {
             id: point.id.to_string(),
-            vector: point.vector.clone(),
+            vector: point.vector().to_vec(),
             payload,
         })
     }
@@ -83,13 +83,9 @@ impl WalPoint {
             Some(s) => Some(serde_json::from_str(s)?),
             None => None,
         };
-        Ok(VectorPoint {
-            id: PointId::from(self.id.clone()),
-            vector: self.vector.clone(),
-            data: None,
-            named: BTreeMap::new(),
-            payload,
-        })
+        let mut point = VectorPoint::new(self.id.clone(), self.vector.clone());
+        point.payload = payload;
+        Ok(point)
     }
 }
 
@@ -139,26 +135,20 @@ pub enum WalRecord {
         key: String,
         value: String,
     },
-    /// Upsert a non-dense point (Sparse / Multi kind collections). Kept at
-    /// the end of the enum so postcard's variant indices for the historical
-    /// dense records stay stable. Only replayed by kind stores; the dense
-    /// store rejects it.
-    UpsertKind {
+    /// Upsert a point with one or more named vector spaces. Kind collections
+    /// require exactly the default space; named collections accept the full
+    /// declared map. The dense store rejects this variant.
+    UpsertVectors {
         id: String,
-        data: crate::types::VectorData,
+        vectors: BTreeMap<String, crate::types::VectorData>,
         /// JSON-encoded payload.
         payload: Option<String>,
     },
-    /// Upsert a named-vectors point (one vector per declared space). Kept at
-    /// the end of the enum so every historical variant index stays stable.
-    /// Only replayed by named stores.
-    UpsertNamed {
+    /// Replace selected named spaces of an existing point, preserving all
+    /// other spaces and the point's slot.
+    PatchNamedVectors {
         id: String,
-        /// One vector per named space; upserts replace the point's full
-        /// named map.
-        vectors: std::collections::BTreeMap<String, crate::types::VectorData>,
-        /// JSON-encoded payload.
-        payload: Option<String>,
+        vectors: BTreeMap<String, crate::types::VectorData>,
     },
 }
 

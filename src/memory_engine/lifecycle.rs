@@ -20,6 +20,14 @@ impl MemoryEngine {
     /// Create a collection. Fails when it already exists.
     pub fn create_collection(&self, name: &str, config: &CollectionConfig) -> Result<()> {
         validate_name(name)?;
+        let mut config = config.clone();
+        config.normalize();
+        config.validate_kind()?;
+        if config.kind != crate::types::VectorKind::Dense || config.is_named_layout() {
+            return Err(VectorSearchError::InvalidConfig(
+                "memory engine supports single-space dense collections only".to_string(),
+            ));
+        }
         if config.vector_size == 0 {
             return Err(VectorSearchError::InvalidVectorDimension {
                 expected: 1,
@@ -45,7 +53,7 @@ impl MemoryEngine {
         guard.insert(
             name.to_string(),
             MemoryCollection {
-                config: config.clone(),
+                config,
                 points: HashMap::new(),
                 payload_indexes: Vec::new(),
             },
