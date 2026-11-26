@@ -267,6 +267,8 @@ fn compaction_with_a_non_empty_queue_keeps_every_transaction() {
     }
 
     const TXNS: u64 = 3;
+    // The counter is cumulative and already includes the seed transactions.
+    let enqueued_before = store.queue.enqueued_total();
     let mut handles = Vec::new();
     for txn in 0..TXNS {
         let store = Arc::clone(&store);
@@ -274,7 +276,7 @@ fn compaction_with_a_non_empty_queue_keeps_every_transaction() {
             store.apply_ops(&[upsert_op(&point(100 + txn))]).unwrap();
         }));
     }
-    while store.queue.enqueued_total() < TXNS {
+    while store.queue.enqueued_total() < enqueued_before + TXNS {
         std::thread::yield_now();
     }
 
