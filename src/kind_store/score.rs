@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{DistanceMetric, VectorData};
 
@@ -31,18 +31,24 @@ pub(crate) fn score_pair(
 /// Accumulate dot contributions directly from posting lists.
 ///
 /// This avoids reconstructing and merging every candidate's sparse vector.
-/// Cosine divides by the cached stored norm and the query norm.
+/// Cosine divides by the cached stored norm and the query norm. When an
+/// allow-list is given, postings for other slots are skipped so filtered
+/// points never enter the candidate map.
 pub(crate) fn sparse_candidate_scores(
     inverted: &HashMap<u32, Vec<(u32, f32)>>,
     norms: &HashMap<u32, f32>,
     indices: &[u32],
     values: &[f32],
     metric: DistanceMetric,
+    allowed: Option<&HashSet<u32>>,
 ) -> Vec<(u32, f32)> {
     let mut scores: HashMap<u32, f32> = HashMap::new();
     for (index, weight) in indices.iter().zip(values.iter()) {
         if let Some(postings) = inverted.get(index) {
             for (slot, stored_weight) in postings {
+                if allowed.is_some_and(|set| !set.contains(slot)) {
+                    continue;
+                }
                 *scores.entry(*slot).or_default() += *weight * *stored_weight;
             }
         }
@@ -62,6 +68,22 @@ pub(crate) fn sparse_candidate_scores(
         }
     }
     scores.into_iter().collect()
+}
+
+/// Keep only the best `offset + limit` entries in score order, leaving the
+/// tail unexamined. The surviving prefix is fully sorted so callers can
+/// apply offset and limit directly. Ties break by ascending slot.
+pub(crate) fn truncate_topk(scored: &mut Vec<(u32, f32)>, offset: usize, limit: usize) {
+    let need = offset.saturating_add(limit);
+    if need == 0 || scored.len() <= need {
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        return;
+    }
+    scored.select_nth_unstable_by(need, |a, b| {
+        b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+    });
+    scored.truncate(need);
+    scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 }
 
 /// Sparse similarity: merge two strictly-increasing index lists.

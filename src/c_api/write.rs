@@ -491,6 +491,49 @@ pub unsafe extern "C" fn simvec_set_payload_field(
     })
 }
 
+/// Replace selected named spaces of an existing point.
+///
+/// `vectors_json` holds a JSON object mapping space names to vector payloads.
+/// Unlisted spaces keep their stored values. The point must already exist.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection`, `id` and `vectors_json` must be valid null-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_update_named_vectors(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+    id: *const c_char,
+    vectors_json: *const c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        let id = match input_str(id) {
+            Ok(id) => id,
+            Err(code) => return handle.fail_code(code, "invalid point id".to_string()),
+        };
+        let raw = match input_str(vectors_json) {
+            Ok(raw) => raw,
+            Err(code) => return handle.fail_code(code, "invalid vectors string".to_string()),
+        };
+        let vectors: std::collections::BTreeMap<String, VectorData> =
+            match parse_input_json(raw) {
+                Ok(vectors) => vectors,
+                Err(code) => return handle.fail_code(code, "invalid vectors JSON".to_string()),
+            };
+        match handle
+            .engine
+            .update_named_vectors(collection, &PointId::from(id), vectors)
+        {
+            Ok(()) => handle.ok(),
+            Err(err) => handle.fail(&err),
+        }
+    })
+}
+
 /// One transaction operation as carried by `simvec_apply_txn` JSON.
 #[derive(serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

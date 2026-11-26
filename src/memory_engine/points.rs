@@ -83,6 +83,14 @@ impl MemoryEngine {
     /// Kernel dispatch degrades to the scalar baseline on wasm32.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         query.validate_nonempty()?;
+        if query.vectors.len() != 1
+            || query.vectors[0].space != crate::types::DEFAULT_VECTOR_NAME
+            || query.vectors[0].data.kind() != crate::types::VectorKind::Dense
+        {
+            return Err(VectorSearchError::InvalidConfig(
+                "memory engine supports single-space dense queries only".to_string(),
+            ));
+        }
         self.with_collection(collection, |c| {
             if query.primary_vector().len() != c.config.vector_size {
                 return Err(VectorSearchError::InvalidVectorDimension {

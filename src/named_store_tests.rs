@@ -387,5 +387,5 @@ fn named_multi_space_and_multi_target_fusion() {
         )
         .unwrap();
     assert_eq!(fused.len(), 1);
-    assert_eq!(fused[0].vectors.len(), 2);
+    assert_eq!(fused[0].vectors.len(), 3);
 }

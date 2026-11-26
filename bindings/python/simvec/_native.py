@@ -190,6 +190,11 @@ _lib.simvec_set_default_quantization_config.argtypes = [_engine_p, _c_str]
 _lib.simvec_set_default_quantization_config.restype = ctypes.c_int
 _lib.simvec_get_default_quantization_config.argtypes = [_engine_p, _c_out_str]
 _lib.simvec_get_default_quantization_config.restype = ctypes.c_int
+try:
+    _lib.simvec_update_named_vectors.argtypes = [_engine_p, _c_str, _c_str, _c_str]
+    _lib.simvec_update_named_vectors.restype = ctypes.c_int
+except AttributeError:
+    pass
 
 
 def lib():

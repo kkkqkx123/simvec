@@ -73,7 +73,7 @@ let query = SearchQuery::new(vec![0.1; 384], 10)
 
 A collection declares a `name -> space parameters` map. Each space independently selects dense, sparse or multi vectors with its own dimension and distance; a single-vector collection is just the map with the default empty-name space. Points carry every space in one `vectors` map, queries target one or more spaces, and multi-target searches fuse rankings with RRF. `VectorPoint::vector()` and `SearchQuery::primary_vector()` are read-only shortcuts for the dense single-space path.
 
-Sparse spaces have no vocabulary bound and accept unsorted indices, which are normalized on write; posting weights are accumulated directly during search. Multi vectors are stored as `flat + dim` and currently use MaxSim. Named dense spaces still use exact scan — ANN and quantization remain single-space-only, and unsupported combinations are rejected at configuration time.
+Sparse spaces have no vocabulary bound and accept unsorted unique indices, which are normalized on write and on query; posting weights are accumulated directly during search with filter-aware skipping and top-k truncation. Multi vectors are stored as `flat + dim` and currently use MaxSim. Named dense spaces still use exact scan — ANN and quantization remain single-space-only, and unsupported combinations are rejected at configuration time. Named search echoes the full vector map when `with_vector` is set, full-point writes require every space while selected spaces can be patched incrementally (`update_named_vectors`, also over C ABI), and kind/named compaction stays a manual `compact_collection` operation.
 
 ### Storage layout
 

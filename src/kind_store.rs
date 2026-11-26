@@ -38,6 +38,7 @@ mod write;
 
 pub(crate) use self::score::score_pair;
 pub(crate) use self::score::sparse_candidate_scores;
+pub(crate) use self::score::truncate_topk;
 pub use self::write::kind_upsert_record;
 
 /// One live point of a Sparse/Multi collection.

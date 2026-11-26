@@ -32,6 +32,9 @@ export declare class Engine {
   collectionConfig(name: string): JsonObject;
   upsert(collection: string, id: string | number, vector: number[] | Float32Array, payload?: JsonObject | null): void;
   upsertBatch(collection: string, points: JsonObject[]): void;
+  updateNamedVectors(collection: string, id: string | number, vectors: JsonObject): void;
+  searchNamed(collection: string, space: string, data: JsonValue, limit: number, options?: JsonObject): JsonObject[];
+  searchSparse(collection: string, indices: number[], values: number[], limit: number, options?: JsonObject): JsonObject[];
   delete(collection: string, id: string | number): void;
   deleteBatch(collection: string, ids: Array<string | number>): void;
   deleteByFilter(collection: string, filter: JsonObject): number;

@@ -447,3 +447,55 @@ fn advanced_paths_round_trip() {
         close_engine(handle);
     }
 }
+
+#[test]
+fn named_patch_round_trip() {
+    unsafe {
+        let handle = open_engine();
+        let name = cstr("named");
+        let config = cstr(
+            r#"{"vector_size":2,"distance":"Cosine","kind":"Dense","vectors":{"text":{"kind":"Dense","vector_size":2,"distance":"Cosine"},"tags":{"kind":"Sparse","vector_size":4294967295,"distance":"Dot"}},"index":"Flat"}"#,
+        );
+        assert_eq!(
+            collections::simvec_create_collection(handle, name.as_ptr(), config.as_ptr()),
+            OK
+        );
+        let points = cstr(
+            r#"[{"id":"p1","vectors":{"text":{"Dense":[1.0,0.0]},"tags":{"Sparse":{"indices":[1],"values":[1.0]}}}}]"#,
+        );
+        assert_eq!(
+            write::simvec_upsert_batch(handle, name.as_ptr(), points.as_ptr()),
+            OK
+        );
+        let id = cstr("p1");
+        let patch = cstr(r#"{"tags":{"Sparse":{"indices":[2],"values":[2.0]}}}"#);
+        assert_eq!(
+            write::simvec_update_named_vectors(handle, name.as_ptr(), id.as_ptr(), patch.as_ptr()),
+            OK
+        );
+        let query = cstr(
+            r#"{"vectors":[{"space":"tags","data":{"Sparse":{"indices":[2],"values":[1.0]}}}],"limit":5,"with_vector":true}"#,
+        );
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            read::simvec_search(handle, name.as_ptr(), query.as_ptr(), &mut out),
+            OK
+        );
+        let hits: serde_json::Value =
+            serde_json::from_str(&take_string(out)).expect("named hits");
+        let first = hits.as_array().and_then(|items| items.first()).expect("one hit");
+        let spaces = first.get("vectors").and_then(|v| v.as_object()).expect("vector map");
+        assert!(spaces.contains_key("text"));
+        assert!(spaces.contains_key("tags"));
+        let bad = cstr(r#"{"ghost":{"Dense":[1.0,0.0]}}"#);
+        assert_ne!(
+            write::simvec_update_named_vectors(handle, name.as_ptr(), id.as_ptr(), bad.as_ptr()),
+            OK
+        );
+        assert_eq!(
+            collections::simvec_delete_collection(handle, name.as_ptr()),
+            OK
+        );
+        close_engine(handle);
+    }
+}

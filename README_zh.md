@@ -73,7 +73,7 @@ let query = SearchQuery::new(vec![0.1; 384], 10)
 
 集合声明的是“空间名 -> 空间参数”的映射：每个空间独立选择 dense、sparse 或 multi，以及自己的维度和距离。单向量集合只是只含默认空名空间的特例；`CollectionConfig::new` / `with_sparse` / `with_multi` 是它的便捷构造器。点用同一个 `vectors` map 承载所有空间，查询可指定一个或多个目标；多目标检索按 RRF 融合。`VectorPoint::vector()` / `SearchQuery::primary_vector()` 是 dense 单空间路径的只读快捷方式。
 
-稀疏空间不设词表上界，索引允许乱序输入并在写入时排序；检索直接按 posting 权重累加打分。多向量以 `flat + dim` 扁平存储，比较器目前为 MaxSim。具名集合的 dense 空间仍走精确扫描，ANN / 量化只在单 dense 空间集合上启用；配置层会拒绝不受支持组合。
+稀疏空间不设词表上界，索引允许乱序唯一输入并在写入与查询侧归一；检索直接按 posting 权重累加打分，支持过滤下推与 TopK 截断。多向量以 `flat + dim` 扁平存储，比较器目前为 MaxSim。具名集合的 dense 空间仍走精确扫描，ANN / 量化只在单 dense 空间集合上启用；配置层会拒绝不受支持组合。具名检索要求回传时返回完整向量映射，全量写入要求带齐所有空间，增量覆盖经 `update_named_vectors`（含 C ABI）按空间 patch，种类与具名压实为手动 `compact_collection`。
 
 ### 存储布局
 

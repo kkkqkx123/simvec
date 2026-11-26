@@ -28,6 +28,7 @@ mod write;
 
 pub(crate) use self::score::score_pair;
 pub(crate) use self::score::sparse_scores;
+pub(crate) use crate::kind_store::truncate_topk;
 pub use self::write::named_upsert_record;
 
 /// One live point of a named collection: a full vector per declared space.

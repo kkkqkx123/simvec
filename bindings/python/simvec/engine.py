@@ -175,6 +175,30 @@ class Engine:
             self._handle,
         )
 
+    def update_named_vectors(self, collection, point_id, vectors):
+        _check(
+            _lib.simvec_update_named_vectors(
+                self._handle,
+                _encode_str(collection),
+                _encode_str(str(point_id)),
+                _encode_json(vectors),
+            ),
+            self._handle,
+        )
+
+    def search_named(self, collection, space, data, limit, **kwargs):
+        query = {"vectors": [{"space": space, "data": data}], "limit": limit}
+        query.update(kwargs)
+        return self.search(collection, query)
+
+    def search_sparse(self, collection, indices, values, limit, **kwargs):
+        query = {
+            "vectors": [{"space": "", "data": {"Sparse": {"indices": indices, "values": values}}}],
+            "limit": limit,
+        }
+        query.update(kwargs)
+        return self.search(collection, query)
+
     def delete(self, collection, point_id):
         _check(
             _lib.simvec_delete(self._handle, _encode_str(collection), _encode_str(str(point_id))),

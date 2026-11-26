@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
@@ -8,7 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
 
-use super::{score_pair, sparse_candidate_scores, KindStore};
+use super::{score_pair, sparse_candidate_scores, truncate_topk, KindStore};
 
 impl KindStore {
     /// Collection kind served by this store.
@@ -98,7 +98,8 @@ impl KindStore {
             ));
         }
         reject_exact_query_controls(query)?;
-        self.validate_data(data)?;
+        let owned = data.clone().normalized();
+        self.validate_data(&owned)?;
 
         let inner = self.inner.lock();
         let limit = query.effective_limit();
@@ -106,16 +107,31 @@ impl KindStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let allowed: Option<HashSet<u32>> = match &query.filter {
+            Some(filter) => {
+                let mut set = HashSet::new();
+                for (slot, point) in inner.points.iter().enumerate() {
+                    if let Some(point) = point {
+                        if filter::matches(filter, &point.id, point.payload.as_ref())? {
+                            set.insert(slot as u32);
+                        }
+                    }
+                }
+                Some(set)
+            }
+            None => None,
+        };
 
         // Sparse scores accumulate directly from postings; multi scans every
         // live slot because there is no coarse structure to consult.
-        let candidates: Vec<(u32, f32)> = match data {
+        let candidates: Vec<(u32, f32)> = match &owned {
             VectorData::Sparse { indices, values } => sparse_candidate_scores(
                 &inner.inverted,
                 &inner.norms,
                 indices,
                 values,
                 self.distance,
+                allowed.as_ref(),
             ),
             _ => (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
@@ -125,17 +141,22 @@ impl KindStore {
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
+            if allowed.is_some() && !allowed.as_ref().is_some_and(|set| set.contains(&slot)) {
+                continue;
+            }
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
-            if let Some(filter) = &query.filter {
-                if !filter::matches(filter, &point.id, point.payload.as_ref())? {
-                    continue;
+            if allowed.is_none() {
+                if let Some(filter) = &query.filter {
+                    if !filter::matches(filter, &point.id, point.payload.as_ref())? {
+                        continue;
+                    }
                 }
             }
-            let score = match data {
+            let score = match &owned {
                 VectorData::Sparse { .. } => sparse_score,
-                _ => score_pair(data, &point.data, self.distance),
+                _ => score_pair(&owned, &point.data, self.distance),
             };
             if query
                 .score_threshold()
@@ -146,7 +167,7 @@ impl KindStore {
             scored.push((slot, score));
         }
 
-        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        truncate_topk(&mut scored, offset, limit);
 
         let with_payload = query
             .with_payload

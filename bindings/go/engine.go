@@ -413,6 +413,44 @@ func (e *Engine) UpsertBatch(collection string, points any) error {
 	return e.fail(C.simvec_upsert_batch(e.handle, cCollection, cPoints))
 }
 
+// UpdateNamedVectors replaces selected named spaces of one point.
+func (e *Engine) UpdateNamedVectors(collection, id string, vectors any) error {
+	raw, err := jsonBytes(vectors)
+	if err != nil {
+		return err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return newError(CodeMisuse, "engine is closed")
+	}
+	cCollection := cString(collection)
+	defer C.free(unsafe.Pointer(cCollection))
+	cID := cString(id)
+	defer C.free(unsafe.Pointer(cID))
+	cVectors := cString(string(raw))
+	defer C.free(unsafe.Pointer(cVectors))
+	return e.fail(C.simvec_update_named_vectors(e.handle, cCollection, cID, cVectors))
+}
+
+// SearchNamed runs a single-space named query document.
+func (e *Engine) SearchNamed(collection, space string, data any, limit uint64, options map[string]any) ([]map[string]any, error) {
+	query := map[string]any{"vectors": []any{map[string]any{"space": space, "data": data}}, "limit": limit}
+	for k, v := range options {
+		query[k] = v
+	}
+	return e.Search(collection, query)
+}
+
+// SearchSparse runs a default-space sparse query document.
+func (e *Engine) SearchSparse(collection string, indices []uint32, values []float32, limit uint64, options map[string]any) ([]map[string]any, error) {
+	query := map[string]any{"vectors": []any{map[string]any{"space": "", "data": map[string]any{"Sparse": map[string]any{"indices": indices, "values": values}}}}, "limit": limit}
+	for k, v := range options {
+		query[k] = v
+	}
+	return e.Search(collection, query)
+}
+
 // Delete removes one point by id.
 func (e *Engine) Delete(collection, id string) error {
 	e.mu.RLock()

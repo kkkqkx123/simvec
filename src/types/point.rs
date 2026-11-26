@@ -102,8 +102,9 @@ impl VectorData {
                         "sparse vector must not be empty".to_string(),
                     ));
                 }
-                for pair in indices.windows(2) {
-                    if pair[0] == pair[1] {
+                let mut seen = std::collections::HashSet::with_capacity(indices.len());
+                for index in indices.iter() {
+                    if !seen.insert(*index) {
                         return Err(VectorSearchError::InvalidConfig(
                             "sparse indices must be unique".to_string(),
                         ));

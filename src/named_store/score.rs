@@ -22,6 +22,7 @@ pub(crate) fn sparse_scores(
     indices: &[u32],
     values: &[f32],
     metric: DistanceMetric,
+    allowed: Option<&std::collections::HashSet<u32>>,
 ) -> Vec<(u32, f32)> {
-    sparse_candidate_scores(space_index, norms, indices, values, metric)
+    sparse_candidate_scores(space_index, norms, indices, values, metric, allowed)
 }

@@ -96,7 +96,11 @@ const DEFINITIONS = {
   simvec_count_by_filter: {
     arguments: ["pointer", "string", "string", "pointer"],
     return: "int32",
-  }
+  },
+  simvec_update_named_vectors: {
+    arguments: ["pointer", "string", "string", "string"],
+    return: "int32",
+  },
   simvec_scroll: {
     arguments: ["pointer", "string", "uint64", "string", "int32", "int32", "pointer"],
     return: "int32",

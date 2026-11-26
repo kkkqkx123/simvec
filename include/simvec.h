@@ -194,6 +194,11 @@ int simvec_set_payload_field(struct simvec_engine_t *engine,
                               const char *key,
                               const char *value_json);
 
+int simvec_update_named_vectors(struct simvec_engine_t *engine,
+                                const char *collection,
+                                const char *id,
+                                const char *vectors_json);
+
 int simvec_apply_txn(struct simvec_engine_t *engine, const char *ops_json);
 
 int simvec_drop_published_index(struct simvec_engine_t *engine, const char *collection);

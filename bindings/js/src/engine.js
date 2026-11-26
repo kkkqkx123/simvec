@@ -191,6 +191,35 @@ export class Engine {
     );
   }
 
+  updateNamedVectors(collection, id, vectors) {
+    const handle = this._requireOpen();
+    check(
+      functions.simvec_update_named_vectors(
+        handle,
+        String(collection),
+        String(id),
+        encodeJson(vectors),
+      ),
+      handle,
+    );
+  }
+
+  searchNamed(collection, space, data, limit, options = {}) {
+    return this.search(collection, {
+      vectors: [{ space, data }],
+      limit,
+      ...options,
+    });
+  }
+
+  searchSparse(collection, indices, values, limit, options = {}) {
+    return this.search(collection, {
+      vectors: [{ space: "", data: { Sparse: { indices, values } } }],
+      limit,
+      ...options,
+    });
+  }
+
   delete(collection, id) {
     const handle = this._requireOpen();
     check(functions.simvec_delete(handle, String(collection), String(id)), handle);

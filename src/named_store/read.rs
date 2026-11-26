@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
@@ -8,7 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorPoint, VectorSpaceConfig,
 };
 
-use super::{score_pair, sparse_scores, NamedStore};
+use super::{score_pair, sparse_scores, truncate_topk, NamedStore};
 
 impl NamedStore {
     /// Declared named-vector spaces.
@@ -105,7 +105,8 @@ impl NamedStore {
         let max_vectors = space
             .multi_config
             .map_or(1, |multi| multi.max_vectors_per_point);
-        data.validate(space.vector_size, max_vectors)?;
+        let owned = data.clone().normalized();
+        owned.validate(space.vector_size, max_vectors)?;
 
         let inner = self.inner.lock();
         let limit = query.effective_limit();
@@ -113,16 +114,30 @@ impl NamedStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let allowed: Option<HashSet<u32>> = match &query.filter {
+            Some(filter) => {
+                let mut set = HashSet::new();
+                for (slot, point) in inner.points.iter().enumerate() {
+                    if let Some(point) = point {
+                        if filter::matches(filter, &point.id, point.payload.as_ref())? {
+                            set.insert(slot as u32);
+                        }
+                    }
+                }
+                Some(set)
+            }
+            None => None,
+        };
 
         // Sparse scores accumulate from postings; other spaces scan all slots.
         let metric = space.distance;
-        let candidates: Vec<(u32, f32)> = match data {
+        let candidates: Vec<(u32, f32)> = match &owned {
             VectorData::Sparse { indices, values } => {
                 let space_index = inner.inverted.get(target);
                 let norms = inner.norms.get(target);
                 match (space_index, norms) {
                     (Some(space_index), Some(norms)) => {
-                        sparse_scores(space_index, norms, indices, values, metric)
+                        sparse_scores(space_index, norms, indices, values, metric, allowed.as_ref())
                     }
                     _ => Vec::new(),
                 }
@@ -135,21 +150,26 @@ impl NamedStore {
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
+            if allowed.is_some() && !allowed.as_ref().is_some_and(|set| set.contains(&slot)) {
+                continue;
+            }
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
-            if let Some(filter) = &query.filter {
-                if !filter::matches(filter, &point.id, point.payload.as_ref())? {
-                    continue;
+            if allowed.is_none() {
+                if let Some(filter) = &query.filter {
+                    if !filter::matches(filter, &point.id, point.payload.as_ref())? {
+                        continue;
+                    }
                 }
             }
             let stored = point
                 .vectors
                 .get(target)
                 .expect("validated point carries every space");
-            let score = match data {
+            let score = match &owned {
                 VectorData::Sparse { .. } => sparse_score,
-                _ => score_pair(data, stored, metric),
+                _ => score_pair(&owned, stored, metric),
             };
             if query
                 .score_threshold()
@@ -160,7 +180,7 @@ impl NamedStore {
             scored.push((slot, score));
         }
 
-        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        truncate_topk(&mut scored, offset, limit);
 
         let with_payload = query
             .with_payload
@@ -183,11 +203,9 @@ impl NamedStore {
                     }
                 }
                 if with_vector {
-                    let stored = point
-                        .vectors
-                        .get(target)
-                        .expect("validated point carries every space");
-                    result = result.with_named_vector(target, stored.clone());
+                    for (space, data) in &point.vectors {
+                        result = result.with_named_vector(space, data.clone());
+                    }
                 }
                 Some(result)
             })
