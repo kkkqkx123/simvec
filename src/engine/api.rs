@@ -40,6 +40,12 @@ pub trait VectorEngine: Send + Sync + std::fmt::Debug {
         vec![crate::types::VectorKind::Dense]
     }
 
+    /// Whether the engine can create named-layout collections. Named layout
+    /// is independent of the supported retrieval kinds.
+    fn supports_named_spaces(&self) -> bool {
+        false
+    }
+
     /// Engine version string.
     fn version(&self) -> &str;
 
@@ -279,6 +285,10 @@ impl VectorEngine for LocalVectorEngine {
         ]
     }
 
+    fn supports_named_spaces(&self) -> bool {
+        true
+    }
+
     fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
     }
@@ -310,6 +320,8 @@ impl VectorEngine for LocalVectorEngine {
 
     fn collection_exists(&self, name: &str) -> bool {
         self.collections.read().contains_key(name)
+            || self.kind_collections.read().contains_key(name)
+            || self.named_collections.read().contains_key(name)
     }
 
     fn get_index_metadata(&self, name: &str) -> Option<IndexMetadata> {

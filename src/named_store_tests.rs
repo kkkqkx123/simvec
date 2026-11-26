@@ -80,10 +80,7 @@ fn named_collection_roundtrip_search_and_replay() {
     let results = engine
         .search(
             "named",
-            &named_query(
-                "keywords",
-                VectorData::sparse(vec![1, 2], vec![1.0, 1.0]),
-            ),
+            &named_query("keywords", VectorData::sparse(vec![1, 2], vec![1.0, 1.0])),
         )
         .expect("search");
     assert_eq!(results.len(), 2);
@@ -99,11 +96,8 @@ fn named_collection_roundtrip_search_and_replay() {
     let results = engine
         .search(
             "named",
-            &named_query(
-                "text",
-                VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]),
-            )
-            .with_score_threshold(0.5),
+            &named_query("text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]))
+                .with_score_threshold(0.5),
         )
         .expect("search");
     assert!(results.iter().all(|r| r.id != PointId::from("p1")));
@@ -115,10 +109,7 @@ fn named_collection_roundtrip_search_and_replay() {
     let results = engine
         .search(
             "named",
-            &named_query(
-                "keywords",
-                VectorData::sparse(vec![1], vec![1.0]),
-            ),
+            &named_query("keywords", VectorData::sparse(vec![1], vec![1.0])),
         )
         .expect("search");
     assert!(results.is_empty());
@@ -137,7 +128,8 @@ fn named_collection_rejects_shape_mismatches() {
         .upsert("named", VectorPoint::new("p1", vec![1.0, 0.0, 0.0, 0.0]))
         .is_err());
     // Missing space on the point.
-    let partial = VectorPoint::with_named("p1", "text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]));
+    let partial =
+        VectorPoint::with_named("p1", "text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]));
     assert!(engine.upsert("named", partial).is_err());
     // Dense query without a target.
     let mut query = SearchQuery::new(vec![1.0, 0.0, 0.0, 0.0], 10);
@@ -145,11 +137,17 @@ fn named_collection_rejects_shape_mismatches() {
     assert!(engine.search("named", &query).is_err());
     // Unknown target space.
     assert!(engine
-        .search("named", &named_query("nope", VectorData::dense(vec![0.0; 4])))
+        .search(
+            "named",
+            &named_query("nope", VectorData::dense(vec![0.0; 4]))
+        )
         .is_err());
     // Dim mismatch inside the space.
     assert!(engine
-        .search("named", &named_query("text", VectorData::dense(vec![0.0; 3])))
+        .search(
+            "named",
+            &named_query("text", VectorData::dense(vec![0.0; 3]))
+        )
         .is_err());
 
     // Named payload routed to a single-space collection.
@@ -157,7 +155,10 @@ fn named_collection_rejects_shape_mismatches() {
         .create_collection("dense", &CollectionConfig::new(4, DistanceMetric::Cosine))
         .expect("create");
     assert!(engine
-        .upsert("dense", point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]))
+        .upsert(
+            "dense",
+            point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)])
+        )
         .is_err());
 }
 
@@ -171,10 +172,8 @@ fn named_collection_get_delete_payload_and_scroll() {
     engine
         .upsert(
             "named",
-            point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]).with_payload_kv(
-                "color",
-                serde_json::json!("red"),
-            ),
+            point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)])
+                .with_payload_kv("color", serde_json::json!("red")),
         )
         .expect("upsert");
 
@@ -197,13 +196,7 @@ fn named_collection_get_delete_payload_and_scroll() {
         )
         .expect("upsert");
     let (page, cursor) = engine
-        .scroll(
-            "named",
-            10,
-            None,
-            Some(true),
-            Some(true),
-        )
+        .scroll("named", 10, None, Some(true), Some(true))
         .expect("scroll");
     assert_eq!(page.len(), 1);
     assert!(cursor.is_some());
@@ -220,10 +213,7 @@ fn named_collection_persists_across_reopen_with_deletes() {
     for i in 0..5 {
         let text = vec![i as f32, 0.0, 0.0, 0.0];
         engine
-            .upsert(
-                "named",
-                point(&format!("p{i}"), text, vec![(i, 1.0)]),
-            )
+            .upsert("named", point(&format!("p{i}"), text, vec![(i, 1.0)]))
             .expect("upsert");
     }
     engine
@@ -251,8 +241,8 @@ fn named_store_upsert_record_requires_named_payload() {
 #[test]
 fn named_store_full_replacement_drops_postings() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = NamedStore::create(dir.path(), "c", &spaces(), &Default::default())
-        .expect("create");
+    let store =
+        NamedStore::create(dir.path(), "c", &spaces(), &Default::default()).expect("create");
     store
         .upsert_batch(&[point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(5, 2.0)])])
         .expect("upsert");
@@ -274,4 +264,46 @@ fn named_store_full_replacement_drops_postings() {
         .expect("search");
     assert_eq!(results.len(), 1);
     let _ = VectorsConfig::Single;
+}
+
+#[test]
+fn named_collection_create_validates_layout_before_opening_storage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = LocalVectorEngine::open(dir.path()).expect("open");
+
+    let empty = CollectionConfig::with_named(BTreeMap::new());
+    assert!(engine.create_collection("empty", &empty).is_err());
+
+    let mut multi = named_config();
+    if let crate::types::VectorsConfig::Named(spaces) = &mut multi.vectors {
+        spaces.insert(
+            "multi".to_string(),
+            crate::types::VectorSpaceConfig {
+                kind: crate::types::VectorKind::Multi,
+                vector_size: 4,
+                distance: DistanceMetric::Cosine,
+            },
+        );
+    }
+    assert!(engine.create_collection("multi", &multi).is_err());
+
+    let mut ann = named_config();
+    ann.index = crate::types::IndexConfig::Hnsw(Default::default());
+    assert!(engine.create_collection("ann", &ann).is_err());
+
+    let mut quantized = named_config();
+    quantized.quantization_config = Some(crate::types::QuantizationConfig::binary());
+    assert!(engine.create_collection("quantized", &quantized).is_err());
+}
+
+#[test]
+fn named_collection_rejects_dense_recall_modes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = LocalVectorEngine::open(dir.path()).expect("open");
+    engine
+        .create_collection("named", &named_config())
+        .expect("create");
+    let query = named_query("text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]))
+        .with_search_mode(crate::types::SearchMode::TopK(5));
+    assert!(engine.search("named", &query).is_err());
 }

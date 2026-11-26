@@ -22,8 +22,8 @@ use crate::filter;
 use crate::kind_store::sparse_score;
 use crate::storage::{Wal, WalRecord, WalTxn};
 use crate::types::{
-    Payload, PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
-    VectorSpaceConfig,
+    CollectionConfig, Payload, PointId, SearchQuery, SearchResult, VectorData, VectorFilter,
+    VectorKind, VectorPoint, VectorSpaceConfig,
 };
 
 /// One live point of a named collection: a full vector per declared space.
@@ -115,6 +115,7 @@ impl NamedStore {
         spaces: &BTreeMap<String, VectorSpaceConfig>,
         storage: &crate::types::StorageConfig,
     ) -> Result<Arc<Self>> {
+        CollectionConfig::with_named(spaces.clone()).validate_kind()?;
         std::fs::create_dir_all(dir)?;
         let meta = NamedMeta {
             collection: name.to_string(),
@@ -166,7 +167,11 @@ impl NamedStore {
         let mut inner = self.inner.lock();
         for record in &txn.ops {
             match record {
-                WalRecord::UpsertNamed { id, vectors, payload } => {
+                WalRecord::UpsertNamed {
+                    id,
+                    vectors,
+                    payload,
+                } => {
                     self.apply_upsert(&mut inner, id.clone(), vectors.clone(), payload.clone())?;
                 }
                 WalRecord::Delete { point_id } => {
@@ -206,7 +211,9 @@ impl NamedStore {
                     }
                 }
                 WalRecord::Compact => {}
-                WalRecord::Upsert { .. } | WalRecord::UpsertKind { .. } | WalRecord::Quantize
+                WalRecord::Upsert { .. }
+                | WalRecord::UpsertKind { .. }
+                | WalRecord::Quantize
                 | WalRecord::DropCollection => {
                     return Err(VectorSearchError::CorruptData(format!(
                         "unexpected WAL record in named collection {}",
@@ -327,9 +334,12 @@ impl NamedStore {
     pub fn count_by_filter(&self, filter: &VectorFilter) -> Result<u64> {
         let inner = self.inner.lock();
         let mut count = 0u64;
-        for (slot, point) in inner.points.iter().enumerate().filter_map(|(i, p)| {
-            p.is_some().then_some((i, p.as_ref().expect("live point")))
-        }) {
+        for (slot, point) in inner
+            .points
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.is_some().then_some((i, p.as_ref().expect("live point"))))
+        {
             let _ = slot;
             if filter::matches(filter, &point.id, point.payload.as_ref())? {
                 count += 1;
@@ -397,7 +407,11 @@ impl NamedStore {
         let mut inner = self.inner.lock();
         for record in records {
             match record {
-                WalRecord::UpsertNamed { id, vectors, payload } => {
+                WalRecord::UpsertNamed {
+                    id,
+                    vectors,
+                    payload,
+                } => {
                     self.apply_upsert(&mut inner, id.clone(), vectors.clone(), payload.clone())?;
                 }
                 WalRecord::Delete { point_id } => {
@@ -427,7 +441,11 @@ impl NamedStore {
         })?;
         for record in records {
             match record {
-                WalRecord::UpsertNamed { id, vectors, payload } => {
+                WalRecord::UpsertNamed {
+                    id,
+                    vectors,
+                    payload,
+                } => {
                     self.apply_upsert(&mut inner, id, vectors, payload)?;
                 }
                 WalRecord::Delete { point_id } => {
@@ -466,8 +484,11 @@ impl NamedStore {
                         payload.insert(key, value);
                     }
                 }
-                WalRecord::Upsert { .. } | WalRecord::UpsertKind { .. } | WalRecord::Compact
-                | WalRecord::Quantize | WalRecord::DropCollection => {
+                WalRecord::Upsert { .. }
+                | WalRecord::UpsertKind { .. }
+                | WalRecord::Compact
+                | WalRecord::Quantize
+                | WalRecord::DropCollection => {
                     return Err(VectorSearchError::Internal(
                         "named store commit received an unsupported record".to_string(),
                     ));
@@ -496,10 +517,12 @@ impl NamedStore {
                 "named collection queries must not carry single-space payloads".to_string(),
             ));
         }
-        if query.quantization.is_some() || query.nprobe.is_some() {
-            return Err(VectorSearchError::InvalidConfig(
-                "quantization and nprobe controls only apply to dense collections".to_string(),
-            ));
+        if query.search_mode.is_some() || query.nprobe.is_some() || query.quantization.is_some() {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "named-vector queries reject search_mode, nprobe and quantization controls; \
+                 target space: {}",
+                target
+            )));
         }
         let space = self.spaces.get(target).ok_or_else(|| {
             VectorSearchError::InvalidConfig(format!("unknown named-vector space {target}"))
@@ -523,15 +546,11 @@ impl NamedStore {
         // Candidate set: inverted postings for sparse spaces, every live
         // slot for dense spaces.
         let candidates: Vec<u32> = match data {
-            VectorData::Sparse { indices, .. } => {
-                inner
-                    .inverted
-                    .get(target)
-                    .and_then(|space_index| {
-                        sparse_postings(space_index, indices, inner.points.len())
-                    })
-                    .unwrap_or_default()
-            }
+            VectorData::Sparse { indices, .. } => inner
+                .inverted
+                .get(target)
+                .and_then(|space_index| sparse_postings(space_index, indices, inner.points.len()))
+                .unwrap_or_default(),
             _ => (0..inner.points.len() as u32)
                 .filter(|slot| inner.points[*slot as usize].is_some())
                 .collect(),
@@ -593,13 +612,15 @@ impl NamedStore {
         let Some(&slot) = inner.reverse.get(&point_id.to_string()) else {
             return Ok(None);
         };
-        Ok(inner.points[slot as usize].as_ref().map(|point| VectorPoint {
-            id: point.id.clone(),
-            vector: Vec::new(),
-            data: None,
-            named: point.vectors.clone(),
-            payload: point.payload.clone(),
-        }))
+        Ok(inner.points[slot as usize]
+            .as_ref()
+            .map(|point| VectorPoint {
+                id: point.id.clone(),
+                vector: Vec::new(),
+                data: None,
+                named: point.vectors.clone(),
+                payload: point.payload.clone(),
+            }))
     }
 
     /// Replace the payload for a single point.
@@ -713,9 +734,7 @@ impl NamedStore {
             .reverse
             .get(&point_id.to_string())
             .copied()
-            .ok_or_else(|| {
-                VectorSearchError::Internal(format!("point {point_id} not found"))
-            })
+            .ok_or_else(|| VectorSearchError::InvalidConfig(format!("point {point_id} not found")))
     }
 }
 
@@ -742,7 +761,11 @@ fn sparse_postings(
 ///
 /// Scores follow the crate-wide higher-is-better contract: raw dot products
 /// for Cosine/Dot and `1/(1 + distance)` for Euclid/Manhattan.
-fn score_pair(query: &VectorData, stored: &VectorData, metric: crate::types::DistanceMetric) -> f32 {
+fn score_pair(
+    query: &VectorData,
+    stored: &VectorData,
+    metric: crate::types::DistanceMetric,
+) -> f32 {
     match (query, stored) {
         (
             VectorData::Sparse {

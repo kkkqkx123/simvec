@@ -129,7 +129,8 @@ impl LocalVectorEngine {
     /// (`.suspect-*`) handles are tracked separately and never appear here,
     /// so metrics and maintenance sweeps only see serving data.
     pub fn collection_names(&self) -> Vec<String> {
-        let mut names: std::collections::HashSet<String> = self.collections.read().keys().cloned().collect();
+        let mut names: std::collections::HashSet<String> =
+            self.collections.read().keys().cloned().collect();
         names.extend(self.kind_collections.read().keys().cloned());
         let mut names: Vec<String> = names
             .into_iter()
@@ -146,6 +147,22 @@ impl LocalVectorEngine {
     /// Create a collection. Fails with
     /// [`VectorSearchError::CollectionAlreadyExists`] if it already exists.
     pub fn create_collection(&self, name: &str, config: &CollectionConfig) -> Result<()> {
+        // Named layouts are exact-scan only. Validate before applying engine
+        // defaults so a requested ANN tier or quantization is never silently
+        // replaced by a default.
+        if matches!(&config.vectors, crate::types::VectorsConfig::Named(_)) {
+            config.validate_kind()?;
+            let spaces = match &config.vectors {
+                crate::types::VectorsConfig::Named(spaces) => spaces.clone(),
+                _ => unreachable!("checked above"),
+            };
+            let dir = self.root_dir.join(name);
+            let store = crate::named_store::NamedStore::create(&dir, name, &spaces, &self.storage)?;
+            self.named_collections
+                .write()
+                .insert(name.to_string(), store);
+            return Ok(());
+        }
         let mut effective = config.clone();
         match &mut effective.index {
             IndexConfig::Hnsw(cfg) => {
@@ -172,23 +189,6 @@ impl LocalVectorEngine {
             }
         }
         let dir = self.root_dir.join(name);
-        if matches!(effective.vectors, crate::types::VectorsConfig::Named(_)) {
-            // Named collections never use ANN tiers or quantization; coerce
-            // the default dense knobs and keep the single-space fields at
-            // their defaults, which are not interpreted for named layouts.
-            effective.index = IndexConfig::Flat;
-            effective.quantization_config = None;
-            let spaces = match &effective.vectors {
-                crate::types::VectorsConfig::Named(spaces) => spaces.clone(),
-                _ => unreachable!("checked above"),
-            };
-            let store =
-                crate::named_store::NamedStore::create(&dir, name, &spaces, &self.storage)?;
-            self.named_collections
-                .write()
-                .insert(name.to_string(), store);
-            return Ok(());
-        }
         if effective.kind != crate::types::VectorKind::Dense {
             // Kind collections never use ANN tiers or quantization; coerce
             // the default dense knobs instead of rejecting configs built
@@ -319,6 +319,8 @@ impl LocalVectorEngine {
     /// replication fields are still excluded.
     pub fn collection_config(&self, name: &str) -> Result<Option<CollectionConfig>> {
         if let Some(store) = self.named_store(name)? {
+            // Named layouts keep the single-space fields at their defaults;
+            // callers must read every parameter from `vectors` instead.
             let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
             config.vectors = crate::types::VectorsConfig::Named(store.spaces());
             config.index = IndexConfig::Flat;
@@ -360,6 +362,8 @@ impl LocalVectorEngine {
     pub fn collection_info(&self, name: &str) -> Result<CollectionInfo> {
         if let Some(store) = self.named_store(name)? {
             let live = store.count();
+            // Single-space fields carry no meaning for named layouts; the
+            // authoritative layout is the per-space map.
             let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
             config.vectors = crate::types::VectorsConfig::Named(store.spaces());
             config.index = IndexConfig::Flat;
