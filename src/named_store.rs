@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use parking_lot::Mutex;
 
+use crate::metrics::Metrics;
 use crate::storage::Wal;
 use crate::types::{Payload, PointId, StorageConfig, VectorData, VectorKind};
 
@@ -66,6 +67,20 @@ struct NamedSpaceMeta {
     distance: crate::types::DistanceMetric,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct NamedSnapshotPoint {
+    slot: u32,
+    id: String,
+    vectors: BTreeMap<String, VectorData>,
+    payload: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct NamedSnapshot {
+    lsn: u64,
+    points: Vec<NamedSnapshotPoint>,
+}
+
 /// A single opened named-vectors collection.
 pub struct NamedStore {
     dir: PathBuf,
@@ -74,6 +89,10 @@ pub struct NamedStore {
     wal: Wal,
     /// Engine-level storage tuning this collection was opened with.
     storage: StorageConfig,
+    /// Operational counters for the exact-scan path.
+    metrics: Metrics,
+    /// Snapshot path; the WAL is replayed on top of this derived state.
+    snapshot: PathBuf,
 }
 
 impl std::fmt::Debug for NamedStore {

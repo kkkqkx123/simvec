@@ -5,13 +5,13 @@ use std::sync::Arc;
 use super::*;
 use crate::error::VectorSearchError;
 use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SearchQuery, SparseConfig,
-    VectorKind, VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SearchQuery, VectorKind,
+    VectorPoint,
 };
 use crate::{LocalVectorEngine, VectorEngine};
 
 fn sparse_config() -> CollectionConfig {
-    CollectionConfig::with_sparse(100, DistanceMetric::Dot, SparseConfig { vocab_size: 100 })
+    CollectionConfig::with_sparse(100, DistanceMetric::Dot)
 }
 
 fn multi_config() -> CollectionConfig {
@@ -36,8 +36,12 @@ fn multi_point(id: &str, vectors: Vec<Vec<f32>>) -> VectorPoint {
 #[test]
 fn kind_configs_validate() {
     let mut config = sparse_config();
-    config.sparse_config = None;
+    config.distance = DistanceMetric::Euclid;
     assert!(config.validate_kind().is_err());
+
+    assert!(CollectionConfig::with_sparse(100, DistanceMetric::Cosine)
+        .validate_kind()
+        .is_ok());
 
     let mut config = multi_config();
     config.index = IndexConfig::Hnsw(crate::types::HnswConfig::default());
@@ -50,8 +54,16 @@ fn kind_configs_validate() {
 #[test]
 fn dense_config_rejects_kind_params() {
     let mut config = CollectionConfig::new(3, DistanceMetric::Cosine);
-    config.sparse_config = Some(SparseConfig { vocab_size: 10 });
+    config.multi_config = Some(MultiConfig {
+        max_vectors_per_point: 2,
+    });
     assert!(config.validate_kind().is_err());
+}
+
+#[test]
+fn sparse_weights_must_be_non_negative() {
+    let data = VectorData::sparse(vec![1, 2], vec![1.0, -0.5]);
+    assert!(data.validate(100, 1).is_err());
 }
 
 #[test]

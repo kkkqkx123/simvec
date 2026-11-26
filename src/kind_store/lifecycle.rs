@@ -4,10 +4,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
+use crate::metrics::Metrics;
 use crate::storage::{Wal, WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData};
 
-use super::{Inner, KindMeta, KindPoint, KindStore};
+use super::{Inner, KindMeta, KindPoint, KindSnapshot, KindSnapshotPoint, KindStore};
 
 impl KindStore {
     /// Create a new kind collection directory (`kind.bin` marker + WAL).
@@ -38,6 +39,8 @@ impl KindStore {
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            metrics: Metrics::default(),
+            snapshot: dir.join("kind_snapshot.bin"),
         }))
     }
 
@@ -47,6 +50,8 @@ impl KindStore {
         let bytes = std::fs::read(dir.join("kind.bin"))?;
         let meta: KindMeta = postcard::from_bytes(&bytes)?;
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let snapshot_path = dir.join("kind_snapshot.bin");
+        let snapshot = crate::storage::snapshot::read::<KindSnapshot>(&snapshot_path)?;
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
             kind: meta.kind,
@@ -56,10 +61,79 @@ impl KindStore {
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            metrics: Metrics::default(),
+            snapshot: snapshot_path,
         });
-        let next_lsn = store.wal.replay(|txn| store.replay_txn(txn))?;
-        store.inner.lock().next_lsn = next_lsn.saturating_add(1);
+        let after = snapshot.as_ref().map(|snapshot| snapshot.lsn);
+        if let Some(snapshot) = snapshot {
+            store.restore_snapshot(snapshot)?;
+        }
+        let next_lsn = store.wal.replay_after(after, |txn| store.replay_txn(txn))?;
+        if next_lsn > after.unwrap_or(0) {
+            store.inner.lock().next_lsn = next_lsn.saturating_add(1);
+        }
         Ok(store)
+    }
+
+    fn restore_snapshot(&self, snapshot: KindSnapshot) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let capacity = snapshot.points.iter().map(|p| p.slot).max().unwrap_or(0) + 1;
+        inner.points.resize(capacity as usize, None);
+        for point in snapshot.points {
+            let payload: Option<Payload> = point
+                .payload
+                .as_ref()
+                .map(|p| serde_json::from_str(p))
+                .transpose()?;
+            self.validate_data(&point.data)?;
+            if let VectorData::Sparse { indices, values } = &point.data {
+                for (index, value) in indices.iter().zip(values.iter()) {
+                    inner
+                        .inverted
+                        .entry(*index)
+                        .or_default()
+                        .push((point.slot, *value));
+                }
+            }
+            inner.reverse.insert(point.id.clone(), point.slot);
+            inner.points[point.slot as usize] = Some(KindPoint {
+                id: PointId::from(point.id),
+                data: point.data,
+                payload,
+            });
+            inner.live_count += 1;
+        }
+        inner.next_lsn = snapshot.lsn.saturating_add(1);
+        Ok(())
+    }
+
+    /// Publish a snapshot of the live state and truncate the covered WAL.
+    pub fn checkpoint(&self) -> Result<()> {
+        let snapshot = {
+            let inner = self.inner.lock();
+            KindSnapshot {
+                lsn: inner.next_lsn.saturating_sub(1),
+                points: inner
+                    .points
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, point)| {
+                        point.as_ref().map(|point| KindSnapshotPoint {
+                            slot: slot as u32,
+                            id: point.id.to_string(),
+                            data: point.data.clone(),
+                            payload: point
+                                .payload
+                                .as_ref()
+                                .and_then(|p| serde_json::to_string(p).ok()),
+                        })
+                    })
+                    .collect(),
+            }
+        };
+        crate::storage::snapshot::write(&self.snapshot, &snapshot)?;
+        self.wal.truncate()?;
+        Ok(())
     }
 
     fn replay_txn(&self, txn: &WalTxn) -> Result<()> {

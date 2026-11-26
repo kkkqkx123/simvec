@@ -38,6 +38,7 @@ mod payloads;
 pub(crate) mod quant;
 mod queue;
 mod search;
+pub(crate) mod snapshot;
 mod tombstones;
 pub(crate) mod vectors;
 mod wal;

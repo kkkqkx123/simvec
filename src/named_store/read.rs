@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
 use crate::filter;
+use crate::types::query::reject_exact_query_controls;
 use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorPoint, VectorSpaceConfig,
 };
@@ -42,6 +43,22 @@ impl NamedStore {
         self.inner.lock().live_count
     }
 
+    /// Operational counters for this collection.
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
+    /// Approximate in-memory payload size of the live points.
+    pub fn memory_bytes(&self) -> u64 {
+        let inner = self.inner.lock();
+        inner
+            .points
+            .iter()
+            .flatten()
+            .map(|point| point.vectors.values().map(vector_data_bytes).sum::<usize>() as u64)
+            .sum()
+    }
+
     /// Number of live points matching `filter`. Pure read.
     pub fn count_by_filter(&self, filter: &VectorFilter) -> Result<u64> {
         let inner = self.inner.lock();
@@ -62,6 +79,7 @@ impl NamedStore {
 
     /// Exact-scan top-k search over one named space.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        let started = std::time::Instant::now();
         let target = query.target.as_deref().ok_or_else(|| {
             VectorSearchError::InvalidConfig(
                 "named collection queries must declare a target space".to_string(),
@@ -77,13 +95,7 @@ impl NamedStore {
                 "named collection queries must not carry single-space payloads".to_string(),
             ));
         }
-        if query.search_mode.is_some() || query.nprobe.is_some() || query.quantization.is_some() {
-            return Err(VectorSearchError::InvalidConfig(format!(
-                "named-vector queries reject search_mode, nprobe and quantization controls; \
-                 target space: {}",
-                target
-            )));
-        }
+        reject_exact_query_controls(query)?;
         let space = self.spaces.get(target).ok_or_else(|| {
             VectorSearchError::InvalidConfig(format!("unknown named-vector space {target}"))
         })?;
@@ -118,7 +130,6 @@ impl NamedStore {
 
         let metric = space.distance;
         let mut scored: Vec<(u32, f32)> = Vec::new();
-        let mut skipped = 0usize;
         for slot in candidates {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
@@ -133,37 +144,53 @@ impl NamedStore {
                 .get(target)
                 .expect("validated point carries every space");
             let score = score_pair(data, stored, metric);
-            if let Some(threshold) = query.score_threshold {
-                if score < threshold {
-                    continue;
-                }
-            }
-            if skipped < offset {
-                skipped += 1;
+            if query
+                .score_threshold()
+                .is_some_and(|threshold| score < threshold)
+            {
                 continue;
             }
             scored.push((slot, score));
         }
 
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        scored.truncate(limit);
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
-        Ok(scored
+        let with_payload = query
+            .with_payload
+            .unwrap_or(crate::types::DEFAULT_WITH_PAYLOAD);
+        let with_vector = query.with_vector.unwrap_or(false);
+        let results: Vec<SearchResult> = scored
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .filter_map(|(slot, score)| {
                 let point = inner.points[slot as usize].as_ref()?;
-                Some(SearchResult::new(point.id.clone(), score).with_payload(
-                    match (&point.payload, query.with_payload.unwrap_or(true)) {
-                        (Some(payload), true) => payload.clone(),
-                        _ => Default::default(),
-                    },
-                ))
+                let mut result = SearchResult::new(point.id.clone(), score);
+                if with_payload {
+                    if let Some(payload) = &point.payload {
+                        let payload = match &query.payload_selector {
+                            Some(selector) => selector.apply(payload),
+                            None => payload.clone(),
+                        };
+                        result = result.with_payload(payload);
+                    }
+                }
+                if with_vector {
+                    let stored = point
+                        .vectors
+                        .get(target)
+                        .expect("validated point carries every space");
+                    result = result.with_data(stored.clone());
+                }
+                Some(result)
             })
-            .collect())
+            .collect();
+        self.metrics.record_search(
+            crate::metrics::SearchPath::Exact,
+            query.filter.is_some(),
+            started.elapsed(),
+        );
+        Ok(results)
     }
 
     /// Fetch a point by id.
@@ -254,5 +281,17 @@ impl NamedStore {
             }
         }
         Ok((points, cursor))
+    }
+}
+
+fn vector_data_bytes(data: &VectorData) -> usize {
+    match data {
+        VectorData::Dense(values) => values.len() * std::mem::size_of::<f32>(),
+        VectorData::Sparse { indices, values } => {
+            indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
+        }
+        VectorData::Multi(vectors) => {
+            vectors.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
+        }
     }
 }

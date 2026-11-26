@@ -19,10 +19,7 @@ pub enum VectorData {
     /// A single dense embedding vector.
     Dense(Vec<f32>),
     /// Sparse vector: strictly increasing indices paired with finite weights.
-    Sparse {
-        indices: Vec<u32>,
-        values: Vec<f32>,
-    },
+    Sparse { indices: Vec<u32>, values: Vec<f32> },
     /// Multiple dense vectors of identical dimension scored with MaxSim.
     Multi(Vec<Vec<f32>>),
 }
@@ -97,6 +94,11 @@ impl VectorData {
                     }
                 }
                 validate_finite(values)?;
+                if values.iter().any(|value| *value < 0.0) {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "sparse weights must be non-negative".to_string(),
+                    ));
+                }
             }
             VectorData::Multi(vectors) => {
                 if vectors.is_empty() {

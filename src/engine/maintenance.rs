@@ -69,6 +69,12 @@ impl LocalVectorEngine {
 
     /// Operational metrics snapshot for a collection.
     pub fn collection_metrics(&self, collection: &str) -> Result<MetricsSnapshot> {
+        if let Some(named) = self.named_store(collection)? {
+            return Ok(named.metrics().snapshot());
+        }
+        if let Some(kind) = self.kind_store(collection)? {
+            return Ok(kind.metrics().snapshot());
+        }
         Ok(self.store(collection)?.metrics().snapshot())
     }
 

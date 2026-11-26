@@ -10,14 +10,14 @@ pub mod error;
 pub mod filter;
 pub mod filter_cond;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod kind_store;
-#[cfg(not(target_arch = "wasm32"))]
 mod index;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod named_store;
+pub mod kind_store;
 #[cfg(feature = "wasm")]
 pub mod memory_engine;
 pub mod metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod named_store;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod storage;
 pub mod types;

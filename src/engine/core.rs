@@ -132,6 +132,7 @@ impl LocalVectorEngine {
         let mut names: std::collections::HashSet<String> =
             self.collections.read().keys().cloned().collect();
         names.extend(self.kind_collections.read().keys().cloned());
+        names.extend(self.named_collections.read().keys().cloned());
         let mut names: Vec<String> = names
             .into_iter()
             .filter(|name| {
@@ -147,6 +148,9 @@ impl LocalVectorEngine {
     /// Create a collection. Fails with
     /// [`VectorSearchError::CollectionAlreadyExists`] if it already exists.
     pub fn create_collection(&self, name: &str, config: &CollectionConfig) -> Result<()> {
+        if self.collection_exists(name) {
+            return Err(VectorSearchError::CollectionAlreadyExists(name.to_string()));
+        }
         // Named layouts are exact-scan only. Validate before applying engine
         // defaults so a requested ANN tier or quantization is never silently
         // replaced by a default.
@@ -273,10 +277,16 @@ impl LocalVectorEngine {
     pub fn list_collections(&self) -> Vec<String> {
         let mut names: std::collections::HashSet<String> =
             self.collections.read().keys().cloned().collect();
+        names.extend(self.kind_collections.read().keys().cloned());
+        names.extend(self.named_collections.read().keys().cloned());
         if let Ok(entries) = std::fs::read_dir(&self.root_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() || !path.join("meta.bin").exists() {
+                if !path.is_dir()
+                    || !(path.join("meta.bin").exists()
+                        || path.join("kind.bin").exists()
+                        || path.join("named.bin").exists())
+                {
                     continue;
                 }
                 names.insert(entry.file_name().to_string_lossy().into_owned());
@@ -330,11 +340,7 @@ impl LocalVectorEngine {
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());
             config.kind = store.kind();
             match store.kind() {
-                crate::types::VectorKind::Sparse => {
-                    config.sparse_config = Some(crate::types::SparseConfig {
-                        vocab_size: store.vector_size(),
-                    });
-                }
+                crate::types::VectorKind::Sparse => {}
                 crate::types::VectorKind::Multi => {
                     config.multi_config = Some(crate::types::MultiConfig {
                         max_vectors_per_point: store.max_vectors_per_point(),
@@ -376,13 +382,18 @@ impl LocalVectorEngine {
                 config,
                 status: CollectionStatus::Green,
                 index: None,
-                memory_bytes: 0,
+                memory_bytes: store.memory_bytes(),
             });
         }
         if let Some(store) = self.kind_store(name)? {
             let live = store.count();
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());
             config.kind = store.kind();
+            if store.kind() == crate::types::VectorKind::Multi {
+                config.multi_config = Some(crate::types::MultiConfig {
+                    max_vectors_per_point: store.max_vectors_per_point(),
+                });
+            }
             config.index = IndexConfig::Flat;
             return Ok(CollectionInfo {
                 name: name.to_string(),
@@ -393,7 +404,7 @@ impl LocalVectorEngine {
                 config,
                 status: CollectionStatus::Green,
                 index: None,
-                memory_bytes: 0,
+                memory_bytes: store.memory_bytes(),
             });
         }
         let collections = self.collections.read();

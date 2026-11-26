@@ -5,10 +5,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
+use crate::metrics::Metrics;
 use crate::storage::{Wal, WalRecord, WalTxn};
 use crate::types::{CollectionConfig, Payload, PointId, VectorData, VectorKind, VectorSpaceConfig};
 
-use super::{Inner, NamedMeta, NamedPoint, NamedSpaceMeta, NamedStore};
+use super::{
+    Inner, NamedMeta, NamedPoint, NamedSnapshot, NamedSnapshotPoint, NamedSpaceMeta, NamedStore,
+};
 
 impl NamedStore {
     /// Create a new named collection directory (`named.bin` marker + WAL).
@@ -45,6 +48,8 @@ impl NamedStore {
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            metrics: Metrics::default(),
+            snapshot: dir.join("named_snapshot.bin"),
         }))
     }
 
@@ -54,16 +59,99 @@ impl NamedStore {
         let bytes = std::fs::read(dir.join("named.bin"))?;
         let meta: NamedMeta = postcard::from_bytes(&bytes)?;
         let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let snapshot_path = dir.join("named_snapshot.bin");
+        let snapshot = crate::storage::snapshot::read::<NamedSnapshot>(&snapshot_path)?;
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
             spaces: meta.spaces,
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
+            metrics: Metrics::default(),
+            snapshot: snapshot_path,
         });
-        let next_lsn = store.wal.replay(|txn| store.replay_txn(txn))?;
-        store.inner.lock().next_lsn = next_lsn.saturating_add(1);
+        let after = snapshot.as_ref().map(|snapshot| snapshot.lsn);
+        if let Some(snapshot) = snapshot {
+            store.restore_snapshot(snapshot)?;
+        }
+        let next_lsn = store.wal.replay_after(after, |txn| store.replay_txn(txn))?;
+        if next_lsn > after.unwrap_or(0) {
+            store.inner.lock().next_lsn = next_lsn.saturating_add(1);
+        }
         Ok(store)
+    }
+
+    fn restore_snapshot(&self, snapshot: NamedSnapshot) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let capacity = snapshot.points.iter().map(|p| p.slot).max().unwrap_or(0) + 1;
+        inner.points.resize(capacity as usize, None);
+        for point in snapshot.points {
+            let payload: Option<Payload> = point
+                .payload
+                .as_ref()
+                .map(|p| serde_json::from_str(p))
+                .transpose()?;
+            for (space, data) in &point.vectors {
+                let Some(config) = self.spaces.get(space) else {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "snapshot references unknown space {space}"
+                    )));
+                };
+                if data.kind() != config.kind {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "snapshot space {space} kind mismatch"
+                    )));
+                }
+                data.validate(config.vector_size, 1)?;
+                if let VectorData::Sparse { indices, values } = data {
+                    let space_index = inner.inverted.entry(space.clone()).or_default();
+                    for (index, value) in indices.iter().zip(values.iter()) {
+                        space_index
+                            .entry(*index)
+                            .or_default()
+                            .push((point.slot, *value));
+                    }
+                }
+            }
+            inner.reverse.insert(point.id.clone(), point.slot);
+            inner.points[point.slot as usize] = Some(NamedPoint {
+                id: PointId::from(point.id),
+                vectors: point.vectors,
+                payload,
+            });
+            inner.live_count += 1;
+        }
+        inner.next_lsn = snapshot.lsn.saturating_add(1);
+        Ok(())
+    }
+
+    /// Publish a snapshot of the live state and truncate the covered WAL.
+    pub fn checkpoint(&self) -> Result<()> {
+        let snapshot = {
+            let inner = self.inner.lock();
+            NamedSnapshot {
+                lsn: inner.next_lsn.saturating_sub(1),
+                points: inner
+                    .points
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, point)| {
+                        point.as_ref().map(|point| NamedSnapshotPoint {
+                            slot: slot as u32,
+                            id: point.id.to_string(),
+                            vectors: point.vectors.clone(),
+                            payload: point
+                                .payload
+                                .as_ref()
+                                .and_then(|p| serde_json::to_string(p).ok()),
+                        })
+                    })
+                    .collect(),
+            }
+        };
+        crate::storage::snapshot::write(&self.snapshot, &snapshot)?;
+        self.wal.truncate()?;
+        Ok(())
     }
 
     fn replay_txn(&self, txn: &WalTxn) -> Result<()> {

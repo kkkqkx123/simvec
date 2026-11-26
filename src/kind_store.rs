@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 use parking_lot::Mutex;
 
+use crate::metrics::Metrics;
 use crate::storage::Wal;
 use crate::types::{Payload, PointId, StorageConfig, VectorData, VectorKind};
 
@@ -74,6 +75,10 @@ pub struct KindStore {
     wal: Wal,
     /// Engine-level storage tuning this collection was opened with.
     storage: StorageConfig,
+    /// Operational counters for the exact-scan path.
+    metrics: Metrics,
+    /// Snapshot path; the WAL is replayed on top of this derived state.
+    snapshot: PathBuf,
 }
 
 impl std::fmt::Debug for KindStore {
@@ -84,6 +89,22 @@ impl std::fmt::Debug for KindStore {
             .field("vector_size", &self.dim)
             .finish()
     }
+}
+
+/// Checkpointed live point. Slot ids stay stable across snapshots so the
+/// slot-addressed payload records in the WAL remain valid.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KindSnapshotPoint {
+    slot: u32,
+    id: String,
+    data: VectorData,
+    payload: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct KindSnapshot {
+    lsn: u64,
+    points: Vec<KindSnapshotPoint>,
 }
 
 /// Persisted per-collection metadata (`kind.bin`).

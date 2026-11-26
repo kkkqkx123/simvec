@@ -29,10 +29,6 @@ pub struct CollectionConfig {
     /// per-space parameters and ignores those fields.
     #[serde(default)]
     pub vectors: VectorsConfig,
-    /// Parameters for `VectorKind::Sparse` collections; must be set when
-    /// (and only when) `kind` is `Sparse`.
-    #[serde(default)]
-    pub sparse_config: Option<SparseConfig>,
     /// Parameters for `VectorKind::Multi` collections; must be set when
     /// (and only when) `kind` is `Multi`.
     #[serde(default)]
@@ -68,7 +64,6 @@ impl CollectionConfig {
             distance,
             kind: VectorKind::Dense,
             vectors: VectorsConfig::Single,
-            sparse_config: None,
             multi_config: None,
             index: IndexConfig::default(),
             quantization_config: None,
@@ -82,11 +77,11 @@ impl CollectionConfig {
         }
     }
 
-    /// Declare a `VectorKind::Sparse` collection.
-    pub fn with_sparse(vector_size: usize, distance: DistanceMetric, config: SparseConfig) -> Self {
+    /// Declare a `VectorKind::Sparse` collection. `vector_size` is the
+    /// vocabulary bound: every sparse index must be smaller than it.
+    pub fn with_sparse(vector_size: usize, distance: DistanceMetric) -> Self {
         Self {
             kind: VectorKind::Sparse,
-            sparse_config: Some(config),
             index: IndexConfig::Flat,
             ..Self::new(vector_size, distance)
         }
@@ -103,24 +98,19 @@ impl CollectionConfig {
     }
 
     /// Validate the kind-specific parameter combinations. Dense collections
-    /// must not carry kind parameters; Sparse/Multi collections must carry
-    /// exactly their own parameters and may not select an ANN tier or
-    /// quantization (both operate on fixed-length dense vectors only).
+    /// must not carry kind parameters; Sparse/Multi collections may not
+    /// select an ANN tier or quantization (both operate on fixed-length
+    /// dense vectors only).
     pub fn validate_kind(&self) -> Result<()> {
         match self.kind {
             VectorKind::Dense => {
-                if self.sparse_config.is_some() || self.multi_config.is_some() {
+                if self.multi_config.is_some() {
                     return Err(VectorSearchError::InvalidConfig(
-                        "dense collections must not declare sparse/multi parameters".to_string(),
+                        "dense collections must not declare multi parameters".to_string(),
                     ));
                 }
             }
             VectorKind::Sparse => {
-                if self.sparse_config.is_none() {
-                    return Err(VectorSearchError::InvalidConfig(
-                        "sparse collections must declare sparse parameters".to_string(),
-                    ));
-                }
                 if self.multi_config.is_some() {
                     return Err(VectorSearchError::InvalidConfig(
                         "sparse collections must not declare multi parameters".to_string(),
@@ -128,19 +118,15 @@ impl CollectionConfig {
                 }
                 if self.vector_size == 0 {
                     return Err(VectorSearchError::InvalidConfig(
-                        "sparse vocab_size must be >= 1".to_string(),
+                        "sparse vector_size must be >= 1".to_string(),
                     ));
                 }
+                validate_sparse_distance(self.distance)?;
             }
             VectorKind::Multi => {
                 if self.multi_config.is_none() {
                     return Err(VectorSearchError::InvalidConfig(
                         "multi collections must declare multi parameters".to_string(),
-                    ));
-                }
-                if self.sparse_config.is_some() {
-                    return Err(VectorSearchError::InvalidConfig(
-                        "multi collections must not declare sparse parameters".to_string(),
                     ));
                 }
                 if self.vector_size == 0 {
@@ -173,10 +159,7 @@ impl CollectionConfig {
             }
         }
         if matches!(self.vectors, VectorsConfig::Named(_)) {
-            if self.kind != VectorKind::Dense
-                || self.sparse_config.is_some()
-                || self.multi_config.is_some()
-            {
+            if self.kind != VectorKind::Dense || self.multi_config.is_some() {
                 return Err(VectorSearchError::InvalidConfig(
                     "named-vectors collections must keep the default single-space kind fields"
                         .to_string(),
@@ -214,6 +197,13 @@ impl CollectionConfig {
                         return Err(VectorSearchError::InvalidConfig(format!(
                             "named-vector space {name} vector_size must be >= 1"
                         )));
+                    }
+                    if space.kind == VectorKind::Sparse {
+                        validate_sparse_distance(space.distance).map_err(|e| {
+                            VectorSearchError::InvalidConfig(format!(
+                                "named-vector space {name}: {e}"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -275,6 +265,20 @@ impl CollectionConfig {
     pub fn with_storage_hints(mut self, storage_hints: StorageHints) -> Self {
         self.storage_hints = Some(storage_hints);
         self
+    }
+}
+
+/// Sparse scoring supports raw dot and normalized cosine only. Distance
+/// metrics would require a different upper-bound scheme in the inverted
+/// index and are rejected at configuration time.
+pub fn validate_sparse_distance(distance: DistanceMetric) -> Result<()> {
+    match distance {
+        DistanceMetric::Dot | DistanceMetric::Cosine => Ok(()),
+        DistanceMetric::Euclid | DistanceMetric::Manhattan => {
+            Err(VectorSearchError::InvalidConfig(format!(
+                "sparse collections do not support {distance:?} distance"
+            )))
+        }
     }
 }
 

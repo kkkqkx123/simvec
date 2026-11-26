@@ -269,7 +269,18 @@ impl Wal {
     /// mid-append) or a checksum mismatch on the final record stops the replay
     /// silently — nothing after a torn record can be trusted; anything else
     /// that is malformed is reported as `CorruptData`.
-    pub fn replay(&self, mut f: impl FnMut(&WalTxn) -> Result<()>) -> Result<u64> {
+    pub fn replay(&self, f: impl FnMut(&WalTxn) -> Result<()>) -> Result<u64> {
+        self.replay_after(None, f)
+    }
+
+    /// Replay transactions with `txn_id > after`. Used when a snapshot has
+    /// already covered every earlier transaction; skipped records still
+    /// advance the returned high-water mark.
+    pub fn replay_after(
+        &self,
+        after: Option<u64>,
+        mut f: impl FnMut(&WalTxn) -> Result<()>,
+    ) -> Result<u64> {
         let mut file = self.file.lock();
         file.rewind()?;
         let mut last_txn = 0u64;
@@ -305,7 +316,9 @@ impl Wal {
                 break;
             }
             let txn: WalTxn = postcard::from_bytes(&bytes)?;
-            f(&txn)?;
+            if after.is_none_or(|lsn| txn.txn_id > lsn) {
+                f(&txn)?;
+            }
             last_txn = txn.txn_id.max(last_txn);
         }
         Ok(last_txn)

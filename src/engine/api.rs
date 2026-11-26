@@ -325,6 +325,35 @@ impl VectorEngine for LocalVectorEngine {
     }
 
     fn get_index_metadata(&self, name: &str) -> Option<IndexMetadata> {
+        if let Some(named) = self.named_store(name).ok().flatten() {
+            let mut config = CollectionConfig::new(0, crate::types::DistanceMetric::Cosine);
+            config.vectors = crate::types::VectorsConfig::Named(named.spaces());
+            config.index = crate::types::IndexConfig::Flat;
+            return Some(IndexMetadata {
+                name: name.to_string(),
+                config,
+                created_at: chrono::Utc::now(),
+                vector_count: named.count(),
+                index_name: None,
+            });
+        }
+        if let Some(kind) = self.kind_store(name).ok().flatten() {
+            let mut config = CollectionConfig::new(kind.vector_size(), kind.distance());
+            config.kind = kind.kind();
+            if kind.kind() == crate::types::VectorKind::Multi {
+                config.multi_config = Some(crate::types::MultiConfig {
+                    max_vectors_per_point: kind.max_vectors_per_point(),
+                });
+            }
+            config.index = crate::types::IndexConfig::Flat;
+            return Some(IndexMetadata {
+                name: name.to_string(),
+                config,
+                created_at: chrono::Utc::now(),
+                vector_count: kind.count(),
+                index_name: None,
+            });
+        }
         let collections = self.collections.read();
         let store = collections.get(name)?;
         let meta = store.meta();

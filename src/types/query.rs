@@ -238,7 +238,7 @@ impl SearchQuery {
     pub fn score_threshold(&self) -> Option<f32> {
         match &self.search_mode {
             Some(SearchMode::Range { radius, .. }) => Some(*radius),
-            _ => None,
+            _ => self.score_threshold,
         }
     }
 
@@ -272,6 +272,9 @@ pub struct SearchResult {
     pub score: f32,
     pub payload: Option<Payload>,
     pub vector: Option<Vec<f32>>,
+    /// Non-dense payload echoed back when `with_vector` is requested.
+    #[serde(default)]
+    pub data: Option<VectorData>,
 }
 
 impl SearchResult {
@@ -281,6 +284,7 @@ impl SearchResult {
             score,
             payload: None,
             vector: None,
+            data: None,
         }
     }
 
@@ -293,6 +297,24 @@ impl SearchResult {
         self.vector = Some(vector);
         self
     }
+
+    /// Attach a non-dense payload (Sparse/Multi) to the result.
+    pub fn with_data(mut self, data: VectorData) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+/// Reject dense-only search controls on exact-scan collections.
+pub(crate) fn reject_exact_query_controls(query: &SearchQuery) -> crate::error::Result<()> {
+    use crate::error::VectorSearchError;
+    if query.search_mode.is_some() || query.nprobe.is_some() || query.quantization.is_some() {
+        return Err(VectorSearchError::InvalidConfig(
+            "search_mode, nprobe and quantization controls only apply to dense collections"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

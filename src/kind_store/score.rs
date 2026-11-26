@@ -2,8 +2,8 @@ use crate::types::VectorData;
 
 /// Score a (query, stored) payload pair under the collection metric.
 ///
-/// Scores follow the crate-wide higher-is-better contract: raw dot products
-/// for Cosine/Dot and `1/(1 + distance)` for Euclid/Manhattan.
+/// Scores follow the crate-wide higher-is-better contract: dot product for
+/// `Dot` and its norm-normalized form for `Cosine`.
 pub(crate) fn score_pair(
     query: &VectorData,
     stored: &VectorData,
@@ -27,9 +27,9 @@ pub(crate) fn score_pair(
 
 /// Sparse similarity: merge two strictly-increasing index lists.
 ///
-/// Cosine/Dot accumulate the weighted dot product over shared terms;
-/// Euclid/Manhattan accumulate squared/absolute gaps over the union and
-/// normalize to the higher-is-better contract.
+/// `Dot` returns the raw weighted overlap; `Cosine` divides it by both
+/// vector norms. Other metrics are rejected by collection validation and
+/// never reach this function.
 pub(crate) fn sparse_score(
     q_idx: &[u32],
     q_val: &[f32],
@@ -37,62 +37,36 @@ pub(crate) fn sparse_score(
     d_val: &[f32],
     metric: crate::types::DistanceMetric,
 ) -> f32 {
-    use crate::types::DistanceMetric::{Cosine, Dot, Euclid, Manhattan};
+    use crate::types::DistanceMetric::{Cosine, Dot};
     let mut qi = 0usize;
     let mut di = 0usize;
-    let mut acc = 0f32;
+    let mut dot = 0f32;
     while qi < q_idx.len() && di < d_idx.len() {
         match q_idx[qi].cmp(&d_idx[di]) {
-            std::cmp::Ordering::Less => {
-                if matches!(metric, Euclid | Manhattan) {
-                    acc += match metric {
-                        Euclid => q_val[qi] * q_val[qi],
-                        _ => q_val[qi].abs(),
-                    };
-                }
-                qi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                if matches!(metric, Euclid | Manhattan) {
-                    acc += match metric {
-                        Euclid => d_val[di] * d_val[di],
-                        _ => d_val[di].abs(),
-                    };
-                }
-                di += 1;
-            }
+            std::cmp::Ordering::Less => qi += 1,
+            std::cmp::Ordering::Greater => di += 1,
             std::cmp::Ordering::Equal => {
-                let gap = q_val[qi] - d_val[di];
-                acc += match metric {
-                    Cosine | Dot => q_val[qi] * d_val[di],
-                    Euclid => gap * gap,
-                    Manhattan => gap.abs(),
-                };
+                dot += q_val[qi] * d_val[di];
                 qi += 1;
                 di += 1;
             }
-        }
-    }
-    for (i, value) in q_val.iter().enumerate().skip(qi) {
-        if matches!(metric, Euclid | Manhattan) {
-            acc += match metric {
-                Euclid => value * value,
-                _ => value.abs(),
-            };
-        }
-        let _ = i;
-    }
-    for value in d_val.iter().skip(di) {
-        if matches!(metric, Euclid | Manhattan) {
-            acc += match metric {
-                Euclid => value * value,
-                _ => value.abs(),
-            };
         }
     }
     match metric {
-        Euclid | Manhattan => 1.0 / (1.0 + acc),
-        Cosine | Dot => acc,
+        Dot => dot,
+        Cosine => {
+            let q_norm = q_val.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let d_norm = d_val.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let denom = q_norm * d_norm;
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot / denom
+            }
+        }
+        crate::types::DistanceMetric::Euclid | crate::types::DistanceMetric::Manhattan => {
+            unreachable!("sparse distance metric was validated at collection creation")
+        }
     }
 }
 

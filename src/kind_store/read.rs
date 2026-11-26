@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
 use crate::filter;
+use crate::types::query::reject_exact_query_controls;
 use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
@@ -46,6 +47,22 @@ impl KindStore {
         self.inner.lock().live_count
     }
 
+    /// Operational counters for this collection.
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
+    /// Approximate in-memory payload size of the live points.
+    pub fn memory_bytes(&self) -> u64 {
+        let inner = self.inner.lock();
+        inner
+            .points
+            .iter()
+            .flatten()
+            .map(|point| vector_data_bytes(&point.data) as u64)
+            .sum()
+    }
+
     /// Number of live points matching `filter`. Pure read.
     pub fn count_by_filter(&self, filter: &VectorFilter) -> Result<u64> {
         let inner = self.inner.lock();
@@ -68,6 +85,7 @@ impl KindStore {
 impl KindStore {
     /// Exact-scan top-k search over the collection.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        let started = std::time::Instant::now();
         let data = query.data.as_ref().ok_or_else(|| {
             VectorSearchError::InvalidConfig(
                 "kind collection queries must carry a non-dense payload".to_string(),
@@ -78,11 +96,12 @@ impl KindStore {
                 "kind collection queries must not also carry a dense vector".to_string(),
             ));
         }
-        if query.quantization.is_some() || query.nprobe.is_some() {
+        if query.target.is_some() || query.named_vector.is_some() {
             return Err(VectorSearchError::InvalidConfig(
-                "quantization and nprobe controls only apply to dense collections".to_string(),
+                "kind collection queries must not target a named space".to_string(),
             ));
         }
+        reject_exact_query_controls(query)?;
         self.validate_data(data)?;
 
         let inner = self.inner.lock();
@@ -102,7 +121,6 @@ impl KindStore {
         };
 
         let mut scored: Vec<(u32, f32)> = Vec::new();
-        let mut skipped = 0usize;
         for slot in candidates {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
@@ -113,48 +131,49 @@ impl KindStore {
                 }
             }
             let score = score_pair(data, &point.data, self.distance);
-            if let Some(threshold) = query.score_threshold {
-                if score < threshold {
-                    continue;
-                }
-            }
-            if skipped < offset {
-                skipped += 1;
+            if query
+                .score_threshold()
+                .is_some_and(|threshold| score < threshold)
+            {
                 continue;
             }
             scored.push((slot, score));
         }
 
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        scored.truncate(limit);
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
+        let with_payload = query
+            .with_payload
+            .unwrap_or(crate::types::DEFAULT_WITH_PAYLOAD);
         let with_vector = query.with_vector.unwrap_or(false);
-        Ok(scored
+        let results: Vec<SearchResult> = scored
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .filter_map(|(slot, score)| {
                 let point = inner.points[slot as usize].as_ref()?;
-                Some(SearchResult::new(point.id.clone(), score).with_payload(
-                    match (&point.payload, query.with_payload.unwrap_or(true)) {
-                        (Some(payload), true) => payload.clone(),
-                        _ => Default::default(),
-                    },
-                ))
-            })
-            .map(|result| {
-                if with_vector {
-                    // The stored data payload is returned through the point's
-                    // `data` field; SearchResult carries dense vectors only,
-                    // so non-dense results stay in the store.
-                    result
-                } else {
-                    result
+                let mut result = SearchResult::new(point.id.clone(), score);
+                if with_payload {
+                    if let Some(payload) = &point.payload {
+                        let payload = match &query.payload_selector {
+                            Some(selector) => selector.apply(payload),
+                            None => payload.clone(),
+                        };
+                        result = result.with_payload(payload);
+                    }
                 }
+                if with_vector {
+                    result = result.with_data(point.data.clone());
+                }
+                Some(result)
             })
-            .collect())
+            .collect();
+        self.metrics.record_search(
+            crate::metrics::SearchPath::Exact,
+            query.filter.is_some(),
+            started.elapsed(),
+        );
+        Ok(results)
     }
 
     /// Fetch a point by id.
@@ -261,5 +280,17 @@ impl KindStore {
             }
         }
         Ok((points, cursor))
+    }
+}
+
+fn vector_data_bytes(data: &VectorData) -> usize {
+    match data {
+        VectorData::Dense(values) => values.len() * std::mem::size_of::<f32>(),
+        VectorData::Sparse { indices, values } => {
+            indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
+        }
+        VectorData::Multi(vectors) => {
+            vectors.iter().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
+        }
     }
 }

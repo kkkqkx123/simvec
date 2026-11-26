@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{LocalVectorEngine, TxnOp};
-use crate::error::Result;
+use crate::error::{Result, VectorSearchError};
 use crate::storage::{WalPoint, WalRecord};
 use crate::types::{
     Payload, PayloadSchemaType, PointId, SearchQuery, SearchResult, VectorFilter, VectorPoint,
@@ -11,10 +11,14 @@ impl LocalVectorEngine {
     /// Upsert a point (WAL-backed).
     pub fn upsert(&self, collection: &str, point: VectorPoint) -> Result<()> {
         if let Some(named) = self.named_store(collection)? {
-            return named.upsert_batch(std::slice::from_ref(&point));
+            return named
+                .upsert_batch(std::slice::from_ref(&point))
+                .inspect_err(|_| named.metrics().record_upsert_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.upsert_batch(std::slice::from_ref(&point));
+            return kind
+                .upsert_batch(std::slice::from_ref(&point))
+                .inspect_err(|_| kind.metrics().record_upsert_error());
         }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::Upsert {
@@ -31,10 +35,14 @@ impl LocalVectorEngine {
     /// Upsert a batch of points (WAL-backed, single transaction).
     pub fn upsert_batch(&self, collection: &str, points: &[VectorPoint]) -> Result<()> {
         if let Some(named) = self.named_store(collection)? {
-            return named.upsert_batch(points);
+            return named
+                .upsert_batch(points)
+                .inspect_err(|_| named.metrics().record_upsert_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.upsert_batch(points);
+            return kind
+                .upsert_batch(points)
+                .inspect_err(|_| kind.metrics().record_upsert_error());
         }
         let store = self.store(collection)?;
         let ops: Result<Vec<_>> = points
@@ -64,10 +72,14 @@ impl LocalVectorEngine {
     /// Delete a point by id (WAL-backed). Deleting a missing id is a no-op.
     pub fn delete(&self, collection: &str, point_id: &PointId) -> Result<()> {
         if let Some(named) = self.named_store(collection)? {
-            return named.delete(point_id);
+            return named
+                .delete(point_id)
+                .inspect_err(|_| named.metrics().record_delete_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.delete(point_id);
+            return kind
+                .delete(point_id)
+                .inspect_err(|_| kind.metrics().record_delete_error());
         }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::Delete {
@@ -84,10 +96,14 @@ impl LocalVectorEngine {
     /// Delete a batch of points (WAL-backed, single transaction).
     pub fn delete_batch(&self, collection: &str, point_ids: &[PointId]) -> Result<()> {
         if let Some(named) = self.named_store(collection)? {
-            return named.delete_batch(point_ids);
+            return named
+                .delete_batch(point_ids)
+                .inspect_err(|_| named.metrics().record_delete_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.delete_batch(point_ids);
+            return kind
+                .delete_batch(point_ids)
+                .inspect_err(|_| kind.metrics().record_delete_error());
         }
         let store = self.store(collection)?;
         let result = store.apply_ops(&[WalRecord::DeleteBatch {
@@ -104,10 +120,14 @@ impl LocalVectorEngine {
     /// Delete every point matching `filter`. Returns the number deleted.
     pub fn delete_by_filter(&self, collection: &str, filter: &VectorFilter) -> Result<u64> {
         if let Some(named) = self.named_store(collection)? {
-            return named.delete_by_filter(filter);
+            return named
+                .delete_by_filter(filter)
+                .inspect_err(|_| named.metrics().record_delete_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.delete_by_filter(filter);
+            return kind
+                .delete_by_filter(filter)
+                .inspect_err(|_| kind.metrics().record_delete_error());
         }
         let store = self.store(collection)?;
         let deleted = match store.delete_by_filter(filter) {
@@ -129,10 +149,14 @@ impl LocalVectorEngine {
     /// same contract at the client boundary.
     pub fn search(&self, collection: &str, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         if let Some(named) = self.named_store(collection)? {
-            return named.search(query);
+            return named
+                .search(query)
+                .inspect_err(|_| named.metrics().record_search_error());
         }
         if let Some(kind) = self.kind_store(collection)? {
-            return kind.search(query);
+            return kind
+                .search(query)
+                .inspect_err(|_| kind.metrics().record_search_error());
         }
         let store = self.store(collection)?;
         let results = store.search(query);
@@ -252,11 +276,21 @@ impl LocalVectorEngine {
         field: &str,
         schema: PayloadSchemaType,
     ) -> Result<()> {
+        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
+            return Err(VectorSearchError::InvalidConfig(
+                "exact-scan collections do not support payload field indexes".to_string(),
+            ));
+        }
         self.store(collection)?.create_payload_index(field, schema)
     }
 
     /// Drop the payload field index on `field`. Returns whether it existed.
     pub fn delete_payload_index(&self, collection: &str, field: &str) -> Result<bool> {
+        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
+            return Err(VectorSearchError::InvalidConfig(
+                "exact-scan collections do not support payload field indexes".to_string(),
+            ));
+        }
         self.store(collection)?.delete_payload_index(field)
     }
 
@@ -265,6 +299,9 @@ impl LocalVectorEngine {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, PayloadSchemaType)>> {
+        if self.kind_store(collection)?.is_some() || self.named_store(collection)?.is_some() {
+            return Ok(Vec::new());
+        }
         Ok(self.store(collection)?.list_payload_indexes())
     }
 

@@ -4,15 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use super::{CollectionConfig, DistanceMetric, IndexConfig};
 
-/// Collection-level vector kind. `Dense` is the historical default; `Sparse`
-/// and `Multi` collections are served by the exact-scan kind store
-/// (`crate::kind_store`) instead of the dense HNSW/IVF pipeline.
+/// Collection-level vector kind. `Dense` is the default; `Sparse` and `Multi`
+/// collections are served by the exact-scan kind store (`crate::kind_store`)
+/// instead of the dense HNSW/IVF pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VectorKind {
     /// Single dense embedding per point (default).
     #[default]
     Dense,
-    /// Sparse (index, weight) pairs scored with a weighted dot product.
+    /// Sparse (index, weight) pairs scored with dot or normalized cosine.
     Sparse,
     /// A bounded sequence of dense vectors per point scored with MaxSim.
     Multi,
@@ -27,13 +27,6 @@ impl VectorKind {
             VectorKind::Multi => "multi",
         }
     }
-}
-
-/// Parameters for `VectorKind::Sparse` collections.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct SparseConfig {
-    /// Vocabulary size bound: a sparse index must satisfy `index < vocab_size`.
-    pub vocab_size: usize,
 }
 
 /// Parameters for `VectorKind::Multi` collections.

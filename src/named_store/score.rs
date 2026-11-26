@@ -24,8 +24,8 @@ pub(crate) fn sparse_postings(
 
 /// Score a (query, stored) payload pair within one named space.
 ///
-/// Scores follow the crate-wide higher-is-better contract: raw dot products
-/// for Cosine/Dot and `1/(1 + distance)` for Euclid/Manhattan.
+/// Scores follow the crate-wide higher-is-better contract: dot product for
+/// `Dot` and its norm-normalized form for `Cosine` in sparse spaces.
 pub(crate) fn score_pair(
     query: &VectorData,
     stored: &VectorData,

@@ -90,6 +90,20 @@ impl NamedStore {
 
     /// Commit `records` to the WAL and apply them in order.
     fn commit(&self, records: Vec<WalRecord>) -> Result<()> {
+        let started = std::time::Instant::now();
+        let upserts = records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::UpsertNamed { .. }))
+            .count() as u64;
+        let deletes = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    WalRecord::Delete { .. } | WalRecord::DeleteBatch { .. }
+                )
+            })
+            .count() as u64;
         let mut inner = self.inner.lock();
         let txn_id = inner.next_lsn;
         inner.next_lsn += 1;
@@ -151,6 +165,15 @@ impl NamedStore {
                         "named store commit received an unsupported record".to_string(),
                     ));
                 }
+            }
+        }
+        self.metrics()
+            .record_apply_txn(upserts, deletes, started.elapsed());
+        let checkpoint = self.wal.appended_bytes() >= self.storage.wal_checkpoint_bytes;
+        drop(inner);
+        if checkpoint {
+            if let Err(error) = self.checkpoint() {
+                tracing::warn!(error = %error, "named store checkpoint failed");
             }
         }
         Ok(())
