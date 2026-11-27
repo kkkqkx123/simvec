@@ -30,12 +30,16 @@
 //! `set_len(0)` on a file that then keeps growing: [`Wal::truncate_through`]
 //! removes every segment whose whole lsn range is at or below a durable water
 //! mark (the checkpoint's `last_applied_txn`), and [`Wal::truncate`] wipes the
-//! directory for the paths that rewrite every derived file anyway.
+//! directory for the paths that rewrite every derived file anyway. Both paths
+//! publish the water mark in `wal/acked-lsn` *before* unlinking, so replay can
+//! skip a segment that survives a crash and cannot overwrite newer data with
+//! an old transaction.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +53,15 @@ const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
 /// lexical sort of the directory is lsn order.
 const SEGMENT_EXT: &str = "bin";
 const SEGMENT_NAME_DIGITS: usize = 20;
+
+/// Durable watermark: every transaction at or below this lsn is already
+/// reflected in the collection's data files. It is written before covered
+/// segments are unlinked, so a segment that reappears after a crash cannot
+/// replay stale operations over newer data.
+const ACK_FILE: &str = "acked-lsn";
+const ACK_MAGIC: [u8; 4] = *b"SVAK";
+const ACK_VERSION: u32 = 1;
+const ACK_HEADER_LEN: usize = 20;
 
 /// Segments kept as one transaction log; the bytes after which a new segment
 /// is started. Default mirrors `StorageConfig::wal_segment_bytes`.
@@ -202,6 +215,9 @@ pub struct Wal {
     /// crosses a tombstone ratio, so without it the log would grow without
     /// bound.
     appended_bytes: std::sync::atomic::AtomicU64,
+    /// Highest lsn whose effects are durable in the data files. Only
+    /// advanced by checkpoint/truncation paths, never by ordinary appends.
+    acked_lsn: AtomicU64,
     /// Test-only: fail the next batch append, to exercise the failure paths.
     #[cfg(test)]
     fail_next_append: std::sync::atomic::AtomicBool,
@@ -234,6 +250,7 @@ impl Wal {
                 active,
             }),
             appended_bytes: std::sync::atomic::AtomicU64::new(total),
+            acked_lsn: AtomicU64::new(read_ack(dir)),
             #[cfg(test)]
             fail_next_append: std::sync::atomic::AtomicBool::new(false),
         })
@@ -250,6 +267,37 @@ impl Wal {
     /// Segment size threshold (bytes) at which the log rolls over.
     pub fn segment_bytes(&self) -> u64 {
         self.segment_bytes
+    }
+
+    /// Highest lsn already covered by the collection's data files.
+    pub fn acked_lsn(&self) -> u64 {
+        self.acked_lsn.load(AtomicOrdering::Acquire)
+    }
+
+    /// Read every transaction newer than the durable watermark.
+    ///
+    /// Callers must only use this when the data files really do contain every
+    /// operation up to `acked_lsn`; dense collections satisfy that after a
+    /// checkpoint. Exact-scan stores that keep their own snapshot watermark
+    /// use [`Self::replay_after`] with that snapshot's lsn instead.
+    pub fn read_all_acked(&self) -> Result<(Vec<WalTxn>, u64)> {
+        self.read_all_from(self.acked_lsn())
+    }
+
+    /// Replay everything newer than an explicit floor.
+    ///
+    /// Exact-scan stores pass their published generation's lsn instead of the
+    /// WAL watermark: only a generation can say which operations are already
+    /// reflected in its snapshot.
+    pub fn read_all_from(&self, floor: u64) -> Result<(Vec<WalTxn>, u64)> {
+        let mut txns = Vec::new();
+        // An lsn of zero means "nothing checkpointed": transaction zero is
+        // valid for the exact-scan stores, so replay the whole log.
+        let last_txn = self.replay_after((floor > 0).then_some(floor), |txn| {
+            txns.push(txn.clone());
+            Ok(())
+        })?;
+        Ok((txns, last_txn.max(floor)))
     }
 
     /// Append a single transaction (one write + one fsync).
@@ -388,14 +436,26 @@ impl Wal {
     /// (compaction), where no logged transaction remains authoritative.
     pub fn truncate(&self) -> Result<()> {
         let mut state = self.state.lock();
+        // Every segment is being dropped because the data files already
+        // contain the whole log. Publish that fact before unlinking so a
+        // crash cannot leave a reused segment replayable.
+        let covered = if state.active_last_lsn == u64::MAX {
+            state.segments.last().map_or(0, |name| name.saturating_sub(1))
+        } else {
+            state.active_last_lsn
+        };
+        let new_ack = self.acked_lsn().max(covered);
+        write_ack(&self.dir, new_ack)?;
         for name in state.segments.drain(..) {
             remove_segment(&self.dir, name)?;
         }
+        sync_dir(&self.dir)?;
         state.active = None;
         state.active_last_lsn = 0;
         drop(state);
-        self.appended_bytes
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.acked_lsn
+            .store(new_ack, AtomicOrdering::Release);
+        self.appended_bytes.store(0, AtomicOrdering::Relaxed);
         Ok(())
     }
 
@@ -414,6 +474,13 @@ impl Wal {
     /// exist only to be re-read.
     pub fn truncate_through(&self, watermark: u64) -> Result<()> {
         let mut state = self.state.lock();
+        // The caller has just made everything up to `watermark` durable in
+        // the data files. Publish that watermark before unlinking anything:
+        // if a covered segment survives a crash, replay skips it instead of
+        // overwriting newer state with old operations.
+        write_ack(&self.dir, self.acked_lsn().max(watermark))?;
+        self.acked_lsn
+            .store(self.acked_lsn().max(watermark), AtomicOrdering::Release);
         let segments = std::mem::take(&mut state.segments);
         let mut kept: Vec<u64> = Vec::with_capacity(segments.len());
         let mut removed_bytes = 0u64;
@@ -438,6 +505,7 @@ impl Wal {
             }
         }
         state.segments = kept;
+        sync_dir(&self.dir)?;
         drop(state);
         if removed_bytes > 0 {
             self.appended_bytes.fetch_sub(
@@ -562,6 +630,51 @@ fn read_segment(
         last_txn = txn.txn_id.max(last_txn);
     }
     Ok(last_txn)
+}
+
+/// Persist the replay watermark with a checksum and a directory fsync.
+/// A torn or corrupt file reads as zero, which is always safe: replay then
+/// starts from the first segment.
+fn write_ack(dir: &Path, lsn: u64) -> Result<()> {
+    let target = dir.join(ACK_FILE);
+    let tmp = dir.join("acked-lsn.tmp");
+    let mut bytes = Vec::with_capacity(ACK_HEADER_LEN);
+    bytes.extend_from_slice(&ACK_MAGIC);
+    bytes.extend_from_slice(&ACK_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&lsn.to_le_bytes());
+    bytes.extend_from_slice(&crc32fast::hash(&lsn.to_le_bytes()).to_le_bytes());
+
+    let mut file = File::create(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &target)?;
+    sync_dir(dir)
+}
+
+fn read_ack(dir: &Path) -> u64 {
+    let Ok(bytes) = std::fs::read(dir.join(ACK_FILE)) else {
+        return 0;
+    };
+    if bytes.len() != ACK_HEADER_LEN || bytes[0..4] != ACK_MAGIC {
+        return 0;
+    }
+    if u32::from_le_bytes(bytes[4..8].try_into().expect("ack version slice")) != ACK_VERSION {
+        return 0;
+    }
+    let lsn_bytes: [u8; 8] = bytes[8..16].try_into().expect("ack lsn slice");
+    let expected = u32::from_le_bytes(bytes[16..20].try_into().expect("ack crc slice"));
+    if crc32fast::hash(&lsn_bytes) != expected {
+        return 0;
+    }
+    u64::from_le_bytes(lsn_bytes)
+}
+
+/// Make WAL segment removals and new segment names durable as a directory
+/// change, not just as file writes.
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn segment_file_name(name: u64) -> String {
@@ -872,6 +985,30 @@ mod tests {
         .unwrap();
         assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(*seen.last().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_acked_replay_skips_checkpointed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        wal.append(&txn(1, 10)).unwrap();
+        wal.append(&txn(2, 20)).unwrap();
+
+        wal.truncate_through(2).unwrap();
+        assert_eq!(wal.acked_lsn(), 2);
+        wal.append(&txn(3, 30)).unwrap();
+
+        let (txns, last) = wal.read_all_acked().unwrap();
+        assert_eq!(last, 3);
+        assert_eq!(txns.iter().map(|t| t.txn_id).collect::<Vec<_>>(), vec![3]);
+
+        // The watermark survives reopen, so a resurrected old segment is
+        // skipped on the next recovery too.
+        drop(wal);
+        let reopened = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        assert_eq!(reopened.acked_lsn(), 2);
+        assert_eq!(reopened.read_all_acked().unwrap().0.len(), 1);
     }
 
     #[test]

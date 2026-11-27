@@ -9,6 +9,10 @@ use crate::types::{
     VectorSpaceConfig,
 };
 
+fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
+    crate::storage::Generation::open(root).unwrap().path()
+}
+
 fn spaces() -> BTreeMap<String, VectorSpaceConfig> {
     BTreeMap::from([
         (
@@ -488,7 +492,7 @@ fn named_restart_loads_the_posting_dictionaries() {
         (blob_bytes, posting_bytes) = store.storage_bytes();
         assert!(blob_bytes > 0);
         assert!(posting_bytes > 0, "sparse spaces must persist their postings");
-        let snapshot = std::fs::metadata(dir.join("named_snapshot.bin"))
+        let snapshot = std::fs::metadata(data_dir(&dir).join("named_snapshot.bin"))
             .unwrap()
             .len();
         assert!(
@@ -609,7 +613,7 @@ fn named_payloads_are_blobbed_outside_the_snapshot() {
         store.checkpoint().unwrap();
 
         assert!(store.payload_bytes() >= (marker.len() * 48) as u64);
-        let snapshot = std::fs::read(dir.join("named_snapshot.bin")).unwrap();
+        let snapshot = std::fs::read(data_dir(&dir).join("named_snapshot.bin")).unwrap();
         assert!(
             !snapshot
                 .windows(marker.len())

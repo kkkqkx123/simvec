@@ -51,10 +51,7 @@ impl LocalVectorEngine {
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("meta.bin").exists()
-                && !path.join("kind.bin").exists()
-                && !path.join("named.bin").exists()
-            {
+            if !path.join("generation.bin").exists() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -276,11 +273,7 @@ impl LocalVectorEngine {
         if let Ok(entries) = std::fs::read_dir(&self.root_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir()
-                    || !(path.join("meta.bin").exists()
-                        || path.join("kind.bin").exists()
-                        || path.join("named.bin").exists())
-                {
+                if !path.is_dir() || !path.join("generation.bin").exists() {
                     continue;
                 }
                 names.insert(entry.file_name().to_string_lossy().into_owned());

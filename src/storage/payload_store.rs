@@ -156,6 +156,15 @@ impl PayloadStore {
         let tracker = Tracker::open(path, &config)?;
         let bitmask = MmapBitmask::open(path, &config)?;
         let pages = Pages::open(path)?;
+        // Unlike the in-memory tracker, on-disk pointers have no WAL attached
+        // at this point: if a checkpoint already truncated the log, a pointer
+        // into a missing page can never be repaired. Fail the open instead of
+        // serving a payload that silently reads as empty.
+        for (slot, pointer) in tracker.entries() {
+            pages
+                .validate_pointer(&pointer, &config)
+                .map_err(|e| VectorSearchError::CorruptData(format!("slot {slot}: {e}")))?;
+        }
 
         Ok(Self {
             base_path: path.to_path_buf(),

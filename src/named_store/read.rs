@@ -38,6 +38,11 @@ impl NamedStore {
         &self.dir
     }
 
+    /// Directory holding the published generation's data files.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.generation.read().path()
+    }
+
     /// Engine-level storage tuning.
     pub fn storage_config(&self) -> &crate::types::StorageConfig {
         &self.storage
@@ -62,20 +67,20 @@ impl NamedStore {
     /// means at least one was rebuilt from the snapshot, which is what a crash
     /// between the manifest write and the snapshot leaves behind.
     pub fn postings_restored(&self) -> bool {
-        self.postings.values().all(|space| space.was_restored())
+        self.postings.load().values().all(|space| space.was_restored())
     }
 
     /// (bytes of the vector blob file, bytes of all posting buckets).
     pub fn storage_bytes(&self) -> (u64, u64) {
         (
-            self.blobs.len(),
-            self.postings.values().map(|space| space.disk_bytes()).sum(),
+            self.blobs.load().len(),
+            self.postings.load().values().map(|space| space.disk_bytes()).sum(),
         )
     }
 
     /// Committed JSON bytes held in `payloads.bin`, outside the snapshot.
     pub fn payload_bytes(&self) -> u64 {
-        self.payloads.len()
+        self.payloads.load().len()
     }
 
     /// Approximate resident size: the point directory, the norm caches, the
@@ -92,10 +97,11 @@ impl NamedStore {
             .sum();
         let postings: u64 = self
             .postings
+            .load()
             .values()
             .map(|space| space.memory_bytes())
             .sum();
-        directory + norms + postings + self.blobs.mapped_bytes()
+        directory + norms + postings + self.blobs.load().mapped_bytes()
     }
 
     /// Number of live points matching `filter`. Pure read.
@@ -173,11 +179,11 @@ impl NamedStore {
             let space_index = self.postings_of(target);
             let norms = inner.norms.get(target);
             if let (Some(space_index), Some(norms)) = (space_index, norms) {
-                let hits = crate::kind_store::posting_hits(space_index, indices);
+                let hits = crate::kind_store::posting_hits(&space_index, indices);
                 full_scan = hits > inner.live_count.saturating_mul(2) as usize;
                 if !full_scan {
                     candidates = sparse_scores(
-                        space_index,
+                        &space_index,
                         norms,
                         indices,
                         values,
@@ -197,7 +203,8 @@ impl NamedStore {
         }
 
         // One borrow of the blob mapping for the whole scoring pass.
-        let reader = self.blobs.reader();
+        let blobs_guard = self.blobs.load();
+        let reader = blobs_guard.reader();
         let space_index = self.order_of(target);
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
@@ -310,7 +317,8 @@ impl NamedStore {
         let Some(point) = inner.points[slot as usize].as_ref() else {
             return Ok(None);
         };
-        let reader = self.blobs.reader();
+        let blobs_guard = self.blobs.load();
+        let reader = blobs_guard.reader();
         let Some(bytes) = reader.bytes(point.blob) else {
             return Ok(None);
         };
@@ -386,7 +394,8 @@ impl NamedStore {
                 }
             }
             let vectors = if with_vector {
-                let reader = self.blobs.reader();
+                let blobs_guard = self.blobs.load();
+        let reader = blobs_guard.reader();
                 let mut vectors = BTreeMap::new();
                 if let Some(bytes) = reader.bytes(point.blob) {
                     for (index, entry) in named_entries(bytes).unwrap_or_default() {

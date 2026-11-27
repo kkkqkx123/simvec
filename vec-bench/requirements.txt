@@ -1,0 +1,6 @@
+pyarrow>=14
+numpy>=1.24
+oss2>=2.18
+qdrant-client>=1.10
+psycopg[binary]>=3.1
+pgvector>=0.3

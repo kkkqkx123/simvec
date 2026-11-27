@@ -179,27 +179,6 @@ impl PointBlobs {
         true
     }
 
-    /// Atomically replace the backing file with `tmp_path` (compaction) and
-    /// remap. `len` is the staged logical length: the staging file is
-    /// pre-allocated in whole chunks, so the tail past `len` is bloat the
-    /// replacement has to drop. Readers keep their old mapping until the swap.
-    pub fn replace_from(&self, tmp_path: &Path, len: u64) -> Result<()> {
-        std::fs::rename(tmp_path, &self.path)?;
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        if file.metadata()?.len() > len {
-            file.set_len(len)?;
-        }
-        file.sync_all()?;
-        open_dir(&self.path)?.sync_all()?;
-        let map = map_all(&file, len)?;
-        let mut state = self.state.write();
-        state.file = file;
-        state.map = map;
-        state.len = len;
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Bytes currently mapped. Used by the resident-memory estimate.
     pub fn mapped_bytes(&self) -> u64 {
         self.state.read().len

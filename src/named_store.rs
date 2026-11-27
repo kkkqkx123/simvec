@@ -17,13 +17,15 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use parking_lot::Mutex;
+use arc_swap::ArcSwap;
+use parking_lot::{Mutex, RwLock};
 
 use crate::metrics::Metrics;
 use crate::storage::point_blobs::{BlobRef, PointBlobs};
 use crate::storage::postings::Postings;
-use crate::storage::{IdMap, Wal};
+use crate::storage::{Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
 mod lifecycle;
@@ -135,15 +137,15 @@ pub struct NamedStore {
     gate: Mutex<()>,
     /// Operational counters for the exact-scan path.
     metrics: Metrics,
-    /// Snapshot path; the WAL is replayed on top of this derived state.
-    snapshot: PathBuf,
+    /// Published data generation. Its lsn bounds WAL replay.
+    generation: RwLock<Generation>,
     /// Append-only vector bytes (`points.bin`).
-    blobs: PointBlobs,
+    blobs: ArcSwap<PointBlobs>,
     /// Append-only JSON payload bytes (`payloads.bin`).
-    payloads: PointBlobs,
+    payloads: ArcSwap<PointBlobs>,
     /// Sparse postings per space, keyed by space name. Dense and multi spaces
     /// have no entry.
-    postings: HashMap<String, Postings>,
+    postings: ArcSwap<HashMap<String, Arc<Postings>>>,
 }
 
 impl std::fmt::Debug for NamedStore {
@@ -176,7 +178,7 @@ impl NamedStore {
     }
 
     /// Postings of one space, if it is sparse.
-    fn postings_of(&self, space: &str) -> Option<&Postings> {
-        self.postings.get(space)
+    fn postings_of(&self, space: &str) -> Option<Arc<Postings>> {
+        self.postings.load_full().get(space).cloned()
     }
 }

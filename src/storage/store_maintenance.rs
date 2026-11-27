@@ -84,7 +84,11 @@ impl CollectionStore {
 
         // Phase 2: durable water marks.
         let inner = self.inner.write();
-        inner.meta.save(&self.dir)?;
+        let data_dir = self.data_dir();
+        inner.meta.save(&data_dir)?;
+        // Publish the generation's lsn before the WAL watermark: recovery
+        // never replays past what this generation's files contain.
+        self.generation.write().set_lsn(inner.meta.last_applied_txn)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
         // Marker first (this append itself fsyncs the log), then truncate
         // through the water mark: every segment covered by `meta.bin` is
@@ -112,18 +116,19 @@ impl CollectionStore {
     /// but takes no store lock, so readers are unaffected. `slot_capacity` is
     /// captured under the gate, where no growth can race it.
     fn flush_data_files(&self, slot_capacity: u64) -> Result<()> {
+        let data = self.data_arc();
         // Payload store: dirty pages, block bitmask, slot→pointer table.
-        let ps_guard = self.payload_store.load();
+        let ps_guard = data.payload_store.load();
         if let Some(ps) = ps_guard.as_ref().as_ref() {
             ps.checkpoint()?;
         }
         drop(ps_guard);
         // Directory and vector files touched since the last checkpoint.
-        self.keys.sync();
-        self.vectors.sync();
+        data.keys.sync();
+        data.vectors.sync();
         // Tombstones before meta and before the truncate: they are the only
         // surviving record of the deletes once the log is cleared.
-        self.tombstones.load().save(&self.dir, slot_capacity)?;
+        data.tombstones.load().save(data.dir(), slot_capacity)?;
         Ok(())
     }
 
@@ -177,12 +182,13 @@ impl CollectionStore {
         // Quantized codes: derived file plus in-memory codebook for Product.
         if let Some(qc) = meta.quantization_config.as_ref() {
             total += meta.slot_capacity * qc.quant_bytes_per_vector(meta.vector_size) as u64;
-            if let Some(q) = self.quant.read().as_ref() {
+            let data = self.data_arc();
+            if let Some(q) = data.quant.read().as_ref() {
                 let snap = q.meta_snapshot();
                 if let Some(cb) = snap.codebook.as_ref() {
                     total += cb.len() as u64 * 4;
                 }
-            }
+            };
         }
         total += self.wal.appended_bytes();
         total
@@ -199,7 +205,8 @@ impl CollectionStore {
     /// Returns the number of nodes whose adjacency lists were modified,
     /// or 0 if no index is published or no repair was needed.
     pub fn repair_hnsw(&self) -> Result<usize> {
-        let index = self.index.load();
+        let data = self.data_arc();
+        let index = data.index.load();
         let Some(published) = index.as_ref() else {
             return Ok(0);
         };
@@ -207,8 +214,8 @@ impl CollectionStore {
             return Ok(0);
         };
 
-        let tombstones = self.tombstones.load();
-        let vsnap = self.vectors.snapshot();
+        let tombstones = data.tombstones.load();
+        let vsnap = data.vectors.snapshot();
         let segment_slots = self.inner.read().meta.segment_slots;
 
         Ok(hnsw.repair(&tombstones, &vsnap, segment_slots))
@@ -234,18 +241,19 @@ impl CollectionStore {
                 });
             }
         }
-        self.vectors.grow_to(needed_slots)?;
-        let new_capacity = self.vectors.slot_capacity();
-        self.keys.grow_to(new_capacity)?;
-        if let Some(q) = self.quant.read().as_ref() {
+        let data = self.data_arc();
+        data.vectors.grow_to(needed_slots)?;
+        let new_capacity = data.vectors.slot_capacity();
+        data.keys.grow_to(new_capacity)?;
+        if let Some(q) = data.quant.read().as_ref() {
             // Quant file growth mirrors vectors capacity; zero-fill new range.
             if let Err(e) = q.grow_to(new_capacity) {
                 tracing::warn!(error = %e, "quant grow_to failed; rebuild will recreate the file");
             }
         }
 
-        let next = self.tombstones.load().resized(new_capacity as usize);
-        self.tombstones.store(Arc::new(next));
+        let next = data.tombstones.load().resized(new_capacity as usize);
+        data.tombstones.store(Arc::new(next));
 
         meta.slot_capacity = new_capacity;
         inner.filter_bitmap.resize(new_capacity as usize);
@@ -253,7 +261,7 @@ impl CollectionStore {
         // Capacity change is a rare, natural checkpoint for the payload store's
         // derived files: it costs O(new slots) once per segment growth instead
         // of once per point. Failures are non-fatal (the WAL covers replay).
-        let ps_guard = self.payload_store.load();
+        let ps_guard = data.payload_store.load();
         if let Some(ps) = ps_guard.as_ref().as_ref() {
             let _ = ps.checkpoint();
         }
@@ -288,13 +296,14 @@ impl CollectionStore {
                 inner.meta.next_slot,
             )
         };
+        let data = self.data_arc();
         // If store has no quant yet, create one now.
         {
-            let mut qguard = self.quant.write();
+            let mut qguard = data.quant.write();
             if qguard.is_none() {
                 let capacity = self.inner.read().meta.slot_capacity;
                 *qguard = Some(QuantStore::create(
-                    &self.dir,
+                    data.dir(),
                     dim,
                     distance,
                     &qc,
@@ -304,7 +313,7 @@ impl CollectionStore {
             }
         }
         let live: Vec<u32> = {
-            let tomb = self.tombstones.load();
+            let tomb = data.tombstones.load();
             (0..next_slot as u32)
                 .filter(|&s| !tomb.bit(s as usize))
                 .collect()
@@ -312,8 +321,8 @@ impl CollectionStore {
         if live.is_empty() {
             return Ok(false);
         }
-        let vsnap = self.vectors.snapshot();
-        let quant = self
+        let vsnap = data.vectors.snapshot();
+        let quant = data
             .quant
             .read()
             .as_ref()
@@ -323,7 +332,7 @@ impl CollectionStore {
         // Delegate training to QuantStore. No external cancellation source is
         // wired yet; rebuild checks the flag cooperatively.
         let stopped = std::sync::atomic::AtomicBool::new(false);
-        let quant_store = self.quant.read();
+        let quant_store = data.quant.read();
         let qs = quant_store.as_ref().expect("quant store exists");
         qs.rebuild(&vsnap, segment_slots, &live, dim, &stopped)?;
         Ok(true)
@@ -331,7 +340,11 @@ impl CollectionStore {
 
     /// Whether quantization is active and ready for search.
     pub fn has_quantization(&self) -> bool {
-        self.quant.read().as_ref().is_some_and(|q| q.is_ready())
+        self.data_arc()
+            .quant
+            .read()
+            .as_ref()
+            .is_some_and(|q| q.is_ready())
     }
 
     /// Quantization config in effect, if any.
@@ -361,10 +374,11 @@ impl CollectionStore {
                     inner.meta.slot_capacity,
                 )
             };
-            let mut qguard = self.quant.write();
+            let data = self.data_arc();
+            let mut qguard = data.quant.write();
             if qguard.is_none() {
                 *qguard = Some(QuantStore::create(
-                    &self.dir,
+                    data.dir(),
                     dim,
                     distance,
                     &config,
@@ -374,10 +388,10 @@ impl CollectionStore {
             } else if qguard.as_ref().is_some_and(|q| q.config() != &config) {
                 // Config type changed: recreate files.
                 *qguard = None;
-                let _ = std::fs::remove_file(self.dir.join("quant.bin"));
-                let _ = std::fs::remove_file(self.dir.join("quant_meta.bin"));
+                let _ = std::fs::remove_file(data.dir().join("quant.bin"));
+                let _ = std::fs::remove_file(data.dir().join("quant_meta.bin"));
                 *qguard = Some(QuantStore::create(
-                    &self.dir,
+                    data.dir(),
                     dim,
                     distance,
                     &config,
@@ -392,7 +406,7 @@ impl CollectionStore {
         };
         let mut inner = self.inner.write();
         inner.meta.quantization_config = new_quant;
-        inner.meta.save(&self.dir)?;
+        inner.meta.save(&self.data_dir())?;
         // Append a WAL checkpoint so replay knows to re-validate quant files.
         // No in-memory mutation is needed; replay for `Quantize` is a no-op
         // because quant files are derived and rebuildable.

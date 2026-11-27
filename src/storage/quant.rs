@@ -76,8 +76,6 @@ impl QuantMeta {
 
 /// Segmented mmap for quantized codes.
 pub struct QuantStore {
-    dir: PathBuf,
-    path: PathBuf,
     meta_path: PathBuf,
     dim: usize,
     config: QuantizationConfig,
@@ -138,8 +136,6 @@ impl QuantStore {
         save_meta(&meta_path, &meta)?;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
-            path,
             meta_path,
             dim,
             config: config.clone(),
@@ -209,8 +205,6 @@ impl QuantStore {
 
         let config = meta.config.clone();
         Ok(Some(Self {
-            dir: dir.to_path_buf(),
-            path,
             meta_path,
             dim,
             config,
@@ -232,6 +226,30 @@ impl QuantStore {
 
     pub fn is_ready(&self) -> bool {
         self.meta.read().ready
+    }
+
+    /// Mark the derived codes unusable after a failed incremental write.
+    ///
+    /// Search must not keep filtering candidates through stale codes: with
+    /// rescore enabled the ordering of survivors is fixed, but a true nearest
+    /// neighbour can be missing from the candidate set entirely. Persisting
+    /// the flag also keeps a reopen on the exact path until rebuild.
+    pub fn mark_stale(&self) -> Result<()> {
+        let mut meta = self.meta.write();
+        if meta.ready {
+            meta.ready = false;
+            save_meta(&self.meta_path, &meta)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the derived metadata for a compacted code file. The slot
+    /// capacity must match the compacted vectors or reopen would grow the
+    /// code file back to the old capacity.
+    pub fn write_compacted_meta(&self, dir: &Path, new_capacity: u64) -> Result<()> {
+        let mut meta = self.meta.read().clone();
+        meta.slot_capacity = new_capacity;
+        save_meta(&dir.join(QUANT_META_FILE), &meta)
     }
 
     pub fn snapshot(&self) -> arc_swap::Guard<Arc<Vec<Arc<Mmap>>>> {
@@ -310,10 +328,6 @@ impl QuantStore {
 
 fn segment_bytes(bytes_per_vector: usize, segment_slots: u32) -> u64 {
     bytes_per_vector as u64 * segment_slots as u64
-}
-
-fn open_dir(dir: &Path) -> Result<File> {
-    Ok(File::open(dir)?)
 }
 
 fn map_all_segments(file: &File, segment_bytes: u64, total: u64) -> Result<Vec<Arc<Mmap>>> {

@@ -59,8 +59,9 @@ impl CollectionStore {
         filter: &crate::types::VectorFilter,
     ) -> Result<Vec<PointId>> {
         let inner = self.inner.read();
-        let tombstones = self.tombstones.load();
-        let keysnap = self.keys.snapshot();
+        let data = self.data_arc();
+        let tombstones = data.tombstones.load();
+        let keysnap = data.keys.snapshot();
         let mut point_ids = Vec::new();
         for slot in 0..inner.meta.next_slot as usize {
             if tombstones.bit(slot) {
@@ -100,15 +101,16 @@ impl CollectionStore {
     /// Fetch a point by id.
     pub fn get(&self, id: &PointId) -> Result<Option<VectorPoint>> {
         let inner = self.inner.read();
+        let data = self.data_arc();
         let slot = match inner.reverse.get(id) {
             Some(slot) => slot as u64,
             None => return Ok(None),
         };
-        if self.tombstones.load().bit(slot as usize) {
+        if data.tombstones.load().bit(slot as usize) {
             return Ok(None);
         }
         let dim = inner.meta.vector_size;
-        let vsnap = self.vectors.snapshot();
+        let vsnap = data.vectors.snapshot();
         let vector = Vectors::read_slot(&vsnap, slot, inner.meta.segment_slots, dim)
             .ok_or_else(|| {
                 VectorSearchError::CorruptData(format!("slot {slot} out of vectors.bin range"))
@@ -132,7 +134,8 @@ impl CollectionStore {
     /// the commit queue exists to preserve.
     pub fn slot_of(&self, id: &PointId) -> Option<u32> {
         let slot = self.inner.read().reverse.get(id)?;
-        (!self.tombstones.load().bit(slot as usize)).then_some(slot)
+        let data = self.data_arc();
+        (!data.tombstones.load().bit(slot as usize)).then_some(slot)
     }
 
     /// Number of live points.
@@ -156,9 +159,10 @@ impl CollectionStore {
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let inner = self.inner.read();
-        let tombstones = self.tombstones.load();
-        let keysnap = self.keys.snapshot();
-        let vsnap = self.vectors.snapshot();
+        let data = self.data_arc();
+        let tombstones = data.tombstones.load();
+        let keysnap = data.keys.snapshot();
+        let vsnap = data.vectors.snapshot();
         let dim = inner.meta.vector_size;
         let include_payload = with_payload.unwrap_or(true);
         let include_vector = with_vector.unwrap_or(false);
@@ -230,9 +234,10 @@ impl CollectionStore {
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let inner = self.inner.read();
-        let tombstones = self.tombstones.load();
-        let keysnap = self.keys.snapshot();
-        let vsnap = self.vectors.snapshot();
+        let data = self.data_arc();
+        let tombstones = data.tombstones.load();
+        let keysnap = data.keys.snapshot();
+        let vsnap = data.vectors.snapshot();
         let dim = inner.meta.vector_size;
         let include_payload = with_payload.unwrap_or(true);
         let include_vector = with_vector.unwrap_or(false);

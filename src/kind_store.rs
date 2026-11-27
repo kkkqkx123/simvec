@@ -33,12 +33,13 @@ mod tests;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use parking_lot::Mutex;
+use arc_swap::ArcSwap;
+use parking_lot::{Mutex, RwLock};
 
 use crate::metrics::Metrics;
 use crate::storage::point_blobs::{BlobRef, PointBlobs};
 use crate::storage::postings::Postings;
-use crate::storage::{IdMap, Wal};
+use crate::storage::{Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
 mod lifecycle;
@@ -111,14 +112,14 @@ pub struct KindStore {
     gate: Mutex<()>,
     /// Operational counters for the exact-scan path.
     metrics: Metrics,
-    /// Snapshot path; the WAL is replayed on top of this derived state.
-    snapshot: PathBuf,
+    /// Published data generation. Its lsn bounds WAL replay.
+    generation: RwLock<Generation>,
     /// Append-only vector bytes (`points.bin`).
-    blobs: PointBlobs,
+    blobs: ArcSwap<PointBlobs>,
     /// Append-only JSON payload bytes (`payloads.bin`).
-    payloads: PointBlobs,
+    payloads: ArcSwap<PointBlobs>,
     /// Persisted sparse postings (`postings/`).
-    postings: Postings,
+    postings: ArcSwap<Postings>,
 }
 
 impl std::fmt::Debug for KindStore {

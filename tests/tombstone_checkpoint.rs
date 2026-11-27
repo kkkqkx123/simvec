@@ -38,6 +38,7 @@ fn new_store(dir: &std::path::Path) -> std::sync::Arc<CollectionStore> {
 fn deleted_point_stays_deleted_after_checkpoint_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let collection_dir = dir.path().join("probe");
+    let data_dir;
     {
         let store = new_store(dir.path());
         for id in 1..=3 {
@@ -46,11 +47,13 @@ fn deleted_point_stays_deleted_after_checkpoint_and_reopen() {
         delete(&store, 2);
         assert_eq!(store.count(), 2, "live count right after delete");
         store.checkpoint().expect("checkpoint");
-        assert!(collection_dir.join("tombstones.bin").exists());
+        data_dir = store.data_dir();
+        assert!(data_dir.join("tombstones.bin").exists());
         drop(store);
     }
 
     let store = CollectionStore::open(&collection_dir).expect("reopen");
+    assert_eq!(store.data_dir(), data_dir);
     assert!(
         store.get(&PointId::Num(2)).expect("get").is_none(),
         "deleted point came back after checkpoint + reopen"

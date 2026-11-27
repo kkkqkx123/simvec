@@ -4,10 +4,12 @@
 //! Protected by `parking_lot::RwLock` for safe concurrent access.
 //!
 //! Allocation state lives in memory during normal operation and is persisted
-//! only at a payload-store checkpoint. A crash leaves the on-disk bitmap
-//! stale, but WAL replay re-applies every allocation and converges the
-//! in-memory state; stale free bits can only leak a block, never alias two
-//! live payloads.
+//! only at a payload-store checkpoint. Checkpoints publish the bitmap by
+//! writing `bitmask.bin.tmp`, fsyncing it and renaming it over the live file,
+//! so a crash cannot leave a half-written allocator state that fails to open.
+//! A stale but complete bitmap is still safe: WAL replay re-applies every
+//! allocation and converges in-memory state, and stale free bits can only
+//! leak a block, never alias two live payloads.
 //!
 //! # On-disk format
 //!
@@ -22,7 +24,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VectorSearchError};
 
@@ -120,7 +122,7 @@ impl BitmaskInner {
 
 /// Bitmask tracking block allocation across all data pages.
 pub struct MmapBitmask {
-    file: parking_lot::Mutex<File>,
+    path: PathBuf,
     inner: parking_lot::RwLock<BitmaskInner>,
 }
 
@@ -137,8 +139,9 @@ impl MmapBitmask {
             next_fit: 0,
         };
         Self::write_file(&mut file, &inner)?;
+        file.sync_all()?;
         Ok(Self {
-            file: parking_lot::Mutex::new(file),
+            path: file_path,
             inner: parking_lot::RwLock::new(inner),
         })
     }
@@ -162,7 +165,7 @@ impl MmapBitmask {
             )));
         }
         Ok(Self {
-            file: parking_lot::Mutex::new(file),
+            path: file_path,
             inner: parking_lot::RwLock::new(inner),
         })
     }
@@ -241,9 +244,15 @@ impl MmapBitmask {
     /// once per checkpoint instead of once per payload write.
     pub fn persist(&self) -> Result<()> {
         let inner = self.inner.read();
-        let mut file = self.file.lock();
+        let tmp = self.path.with_extension("bin.tmp");
+        let mut file = File::create(&tmp)?;
         Self::write_file(&mut file, &inner)?;
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 

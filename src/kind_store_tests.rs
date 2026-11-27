@@ -10,6 +10,10 @@ use crate::types::{
 };
 use crate::{LocalVectorEngine, VectorEngine};
 
+fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
+    crate::storage::Generation::open(root).unwrap().path()
+}
+
 fn sparse_config() -> CollectionConfig {
     CollectionConfig::with_sparse(DistanceMetric::Dot)
 }
@@ -412,7 +416,7 @@ fn kind_restart_loads_the_posting_dictionary() {
         assert!(posting_bytes > 0, "postings must land in postings/");
         // The snapshot is a directory: it references blobs instead of copying
         // the 200-byte vectors they hold.
-        let snapshot = std::fs::metadata(dir.join("kind_snapshot.bin"))
+        let snapshot = std::fs::metadata(data_dir(&dir).join("kind_snapshot.bin"))
             .unwrap()
             .len();
         assert!(
@@ -448,7 +452,7 @@ fn kind_stale_posting_manifest_is_rebuilt() {
     }
     // Simulate the crash window: the manifest is gone, so it can no longer
     // vouch for the buckets.
-    std::fs::remove_file(dir.join("postings").join("manifest.bin")).unwrap();
+    std::fs::remove_file(data_dir(&dir).join("postings").join("manifest.bin")).unwrap();
 
     let reopened = KindStore::open(&dir, &storage).unwrap();
     assert!(!reopened.postings_restored());
@@ -567,7 +571,7 @@ fn kind_payloads_are_blobbed_and_reblobbed_on_edit() {
 
         let bytes = store.payload_bytes();
         assert!(bytes >= (marker.len() * 64) as u64);
-        let snapshot = std::fs::read(dir.join("kind_snapshot.bin")).unwrap();
+        let snapshot = std::fs::read(data_dir(&dir).join("kind_snapshot.bin")).unwrap();
         assert!(
             !snapshot
                 .windows(marker.len())
@@ -596,4 +600,33 @@ fn kind_payloads_are_blobbed_and_reblobbed_on_edit() {
         point.payload.as_ref().unwrap()["note"],
         serde_json::json!(big)
     );
+}
+
+/// Compaction publishes a complete generation: the old directory is removed
+/// and a reopen serves the new slot numbering without replaying stale blobs.
+#[test]
+fn kind_compaction_publishes_a_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb_gen");
+    let storage = crate::types::StorageConfig::default();
+    let store = KindStore::create(&dir, "kb_gen", &sparse_config(), &storage).unwrap();
+    let points: Vec<VectorPoint> = (0..12u32)
+        .map(|i| sparse_point(&format!("p{i}"), &[(1, 1.0 + i as f32)]))
+        .collect();
+    store.upsert_batch(&points).unwrap();
+    store.checkpoint().unwrap();
+    let before = store.data_dir();
+    for i in 0..6 {
+        store.delete(&PointId::from(format!("p{i}"))).unwrap();
+    }
+    assert_eq!(store.compact().unwrap(), 6);
+    let after = store.data_dir();
+    assert_ne!(before, after);
+    assert!(!before.exists(), "superseded generation must be retired");
+    drop(store);
+
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.data_dir(), after);
+    assert_eq!(reopened.count(), 6);
+    assert!(reopened.postings_restored());
 }

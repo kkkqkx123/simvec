@@ -55,13 +55,14 @@ impl CollectionStore {
     /// and to any published index, so a rehydrated index immediately honors
     /// the runtime config.
     pub fn set_ivf_config(&self, config: IvfConfig) -> Result<()> {
+        let files = self.data_arc();
         config.validate()?;
         let mut inner = self.inner.write();
         match &mut inner.meta.index {
             IndexConfig::Ivf(slot) => {
                 *slot = Some(config.clone());
                 inner.ivf_config = Some(config.clone());
-                inner.meta.save(&self.dir)?;
+                inner.meta.save(&self.data_dir())?;
             }
             _ => {
                 return Err(crate::error::VectorSearchError::InvalidConfig(
@@ -70,7 +71,7 @@ impl CollectionStore {
             }
         }
         drop(inner);
-        if let Some(PublishedIndex::Ivf(index)) = self.index.load().as_ref() {
+        if let Some(PublishedIndex::Ivf(index)) = files.index.load().as_ref() {
             index.set_config(config);
         }
         Ok(())
@@ -86,7 +87,7 @@ impl CollectionStore {
         match &mut inner.meta.index {
             IndexConfig::Hnsw(slot) => {
                 *slot = config;
-                inner.meta.save(&self.dir)
+                inner.meta.save(&self.data_dir())
             }
             _ => Err(crate::error::VectorSearchError::InvalidConfig(
                 "hnsw config requires the HNSW tier".to_string(),
@@ -107,9 +108,10 @@ impl CollectionStore {
     }
 
     fn load_ivf(&self) -> Result<()> {
-        let index_path = self.dir.join("index.bin");
+        let files = self.data_arc();
+        let index_path = self.data_dir().join("index.bin");
         let existed = index_path.exists();
-        let Some(data) = persist::load(&self.dir)? else {
+        let Some(data) = persist::load(&self.data_dir())? else {
             if existed {
                 tracing::info!("vector index.bin corrupt; falling back to exact scan");
                 self.metrics.record_index_load_fallback();
@@ -136,7 +138,7 @@ impl CollectionStore {
         index.set_metrics(self.metrics_arc());
         let index = Arc::new(index);
         {
-            let tombstones = self.tombstones.load();
+            let tombstones = files.tombstones.load();
             let mut p = self.pending.lock();
             for slot in covered..next_slot as usize {
                 if slot < capacity && !tombstones.bit(slot) {
@@ -144,14 +146,15 @@ impl CollectionStore {
                 }
             }
         }
-        self.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
+        files.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
         Ok(())
     }
 
     fn load_hnsw(&self) -> Result<()> {
-        let hnsw_path = self.dir.join("hnsw.bin");
+        let files = self.data_arc();
+        let hnsw_path = self.data_dir().join("hnsw.bin");
         let existed = hnsw_path.exists();
-        let Some(data) = persist::load_hnsw(&self.dir)? else {
+        let Some(data) = persist::load_hnsw(&self.data_dir())? else {
             if existed {
                 tracing::info!("vector hnsw.bin corrupt; falling back to exact scan");
                 self.metrics.record_index_load_fallback();
@@ -192,7 +195,7 @@ impl CollectionStore {
             }
         };
         {
-            let tombstones = self.tombstones.load();
+            let tombstones = files.tombstones.load();
             let mut p = self.pending.lock();
             for slot in covered..next_slot as usize {
                 if slot < capacity && !tombstones.bit(slot) {
@@ -206,7 +209,7 @@ impl CollectionStore {
                 self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
             }
         }
-        self.index
+        files.index
             .store(Arc::new(Some(PublishedIndex::Hnsw(index))));
         Ok(())
     }
@@ -223,7 +226,8 @@ impl CollectionStore {
     /// scored by brute force in `search_hnsw` for correct visibility, and
     /// drained into the graph by the maintenance worker on each tick.
     pub(super) fn register_slot(&self, slot: u32, vector: &[f32], _segment_slots: u32) {
-        let published = self.index.load();
+        let files = self.data_arc();
+        let published = files.index.load();
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => {
                 index.assign_slot(slot, vector);
@@ -247,8 +251,8 @@ impl CollectionStore {
 
     /// Discard every persisted index artifact (both tiers).
     pub(super) fn discard_index_files(&self) {
-        persist::discard(&self.dir.join("index.bin"));
-        persist::discard(&self.dir.join("hnsw.bin"));
+        persist::discard(&self.data_dir().join("index.bin"));
+        persist::discard(&self.data_dir().join("hnsw.bin"));
     }
 
     /// Build and publish the configured ANN tier from the current live set.
@@ -303,6 +307,7 @@ impl CollectionStore {
     /// the store write lock before publication, so approximate search never
     /// misses a point.
     fn build_hnsw_index(&self, config: HnswConfig) -> Result<bool> {
+        let files = self.data_arc();
         let _compact_guard = self.compact_mutex.lock();
         let _guard = self.build_mutex.lock();
 
@@ -317,7 +322,7 @@ impl CollectionStore {
             )
         };
         let live: Vec<u32> = {
-            let tombstones = self.tombstones.load();
+            let tombstones = files.tombstones.load();
             (0..snapshot_next_slot as u32)
                 .filter(|&s| !tombstones.bit(s as usize))
                 .collect()
@@ -337,7 +342,7 @@ impl CollectionStore {
         );
         let build_started = Instant::now();
         let built = {
-            let vsnap = self.vectors.snapshot();
+            let vsnap = files.vectors.snapshot();
             HnswIndex::build(
                 &IndexBuildParams::new(&name, dim, metric, &live, &vsnap, segment_slots)
                     .with_progress(&self.build_inserted),
@@ -371,8 +376,8 @@ impl CollectionStore {
         {
             let inner = self.inner.write();
             let mut p = self.pending.lock();
-            let tombstones = self.tombstones.load();
-            let vsnap = self.vectors.snapshot();
+            let tombstones = files.tombstones.load();
+            let vsnap = files.vectors.snapshot();
             let mut adopted: HashSet<u32> = HashSet::new();
             for slot in snapshot_next_slot..inner.meta.next_slot {
                 let slot = slot as u32;
@@ -399,7 +404,7 @@ impl CollectionStore {
         // its slot nowhere and go missing from approximate searches. With
         // this order such an upsert still sees `building == true` and lands
         // in `pending`, which every published-index adoption path drains.
-        self.index
+        files.index
             .store(Arc::new(Some(PublishedIndex::Hnsw(index))));
         self.build_inserted.store(
             self.build_points_total.load(AtomicOrdering::Relaxed),
@@ -408,7 +413,7 @@ impl CollectionStore {
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
 
-        if let Err(e) = persist::save_hnsw(&self.dir, &persisted) {
+        if let Err(e) = persist::save_hnsw(&self.data_dir(), &persisted) {
             tracing::warn!(collection = %name, error = %e, "hnsw.bin save failed");
         }
         self.metrics
@@ -430,6 +435,7 @@ impl CollectionStore {
     /// drained, and only afterwards does the index become visible, so probe
     /// search never misses a point.
     fn build_ivf_index(&self, config: IvfConfig) -> Result<bool> {
+        let files = self.data_arc();
         let _compact_guard = self.compact_mutex.lock();
         let _guard = self.build_mutex.lock();
 
@@ -444,7 +450,7 @@ impl CollectionStore {
             )
         };
         let live: Vec<u32> = {
-            let tombstones = self.tombstones.load();
+            let tombstones = files.tombstones.load();
             (0..snapshot_next_slot as u32)
                 .filter(|&s| !tombstones.bit(s as usize))
                 .collect()
@@ -465,7 +471,7 @@ impl CollectionStore {
 
         let build_started = Instant::now();
         let built = {
-            let vsnap = self.vectors.snapshot();
+            let vsnap = files.vectors.snapshot();
             IvfIndex::build(
                 &IndexBuildParams::new(&name, dim, metric, &live, &vsnap, segment_slots)
                     .with_progress(&self.build_inserted),
@@ -493,8 +499,8 @@ impl CollectionStore {
         let persisted = {
             let inner = self.inner.write();
             let mut p = self.pending.lock();
-            let tombstones = self.tombstones.load();
-            let vsnap = self.vectors.snapshot();
+            let tombstones = files.tombstones.load();
+            let vsnap = files.vectors.snapshot();
             index.adopt_range(
                 snapshot_next_slot as u32,
                 inner.meta.next_slot as u32,
@@ -516,7 +522,7 @@ impl CollectionStore {
         // its slot nowhere and go missing from probe searches. With this
         // order such an upsert still sees `building == true` and lands in
         // `pending`, which every probe search scans unconditionally.
-        self.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
+        files.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
         self.build_inserted.store(
             self.build_points_total.load(AtomicOrdering::Relaxed),
             AtomicOrdering::Relaxed,
@@ -524,7 +530,7 @@ impl CollectionStore {
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
 
-        if let Err(e) = persist::save(&self.dir, &persisted) {
+        if let Err(e) = persist::save(&self.data_dir(), &persisted) {
             tracing::warn!(collection = %name, error = %e, "index.bin save failed");
         }
         self.metrics
@@ -539,8 +545,9 @@ impl CollectionStore {
 
     /// Drop the published index and return to exact scan.
     pub fn drop_index(&self) -> Result<()> {
+        let files = self.data_arc();
         let _guard = self.compact_mutex.lock();
-        self.index.store(Arc::new(None));
+        files.index.store(Arc::new(None));
         self.pending.lock().clear();
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
@@ -556,7 +563,8 @@ impl CollectionStore {
     /// left for the next tick.  If no HNSW index is published or pending
     /// is empty this is a no-op.
     pub(crate) fn drain_pending_hnsw(&self) {
-        let published = self.index.load();
+        let files = self.data_arc();
+        let published = files.index.load();
         let Some(PublishedIndex::Hnsw(index)) = published.as_ref() else {
             return;
         };
@@ -577,8 +585,8 @@ impl CollectionStore {
             let inner = self.inner.read();
             (inner.meta.vector_size, inner.meta.segment_slots)
         };
-        let tombstones = self.tombstones.load();
-        let vsnap = self.vectors.snapshot();
+        let tombstones = files.tombstones.load();
+        let vsnap = files.vectors.snapshot();
         let mut drained = 0u64;
         for slot in pending {
             if tombstones.bit(slot as usize) {
@@ -600,7 +608,8 @@ impl CollectionStore {
 
     /// Whether an index is published.
     pub fn has_index(&self) -> bool {
-        self.index.load().is_some()
+        let files = self.data_arc();
+        files.index.load().is_some()
     }
 
     /// Number of slots waiting in the pending queue (not yet incorporated
@@ -635,6 +644,7 @@ impl CollectionStore {
 
     /// Measure the current drift ratio of the published IVF index.
     pub(crate) fn measure_drift(&self, index: &IvfIndex) -> f64 {
+        let files = self.data_arc();
         let (next_slot, segment_slots) = {
             let inner = self.inner.read();
             (inner.meta.next_slot as u32, inner.meta.segment_slots)
@@ -643,8 +653,8 @@ impl CollectionStore {
         if samples.is_empty() {
             return 0.0;
         }
-        let tombstones = self.tombstones.load();
-        let vsnap = self.vectors.snapshot();
+        let tombstones = files.tombstones.load();
+        let vsnap = files.vectors.snapshot();
         index.drift_ratio(&samples, &tombstones, &vsnap, segment_slots)
     }
 
@@ -652,7 +662,8 @@ impl CollectionStore {
     /// worker's drift checks. HNSW needs no equivalent: it has no global
     /// training state to drift away from.
     pub(crate) fn ivf_state(&self) -> Option<(Arc<IvfIndex>, IvfConfig)> {
-        let published = self.index.load();
+        let files = self.data_arc();
+        let published = files.index.load();
         let Some(PublishedIndex::Ivf(index)) = published.as_ref() else {
             return None;
         };
@@ -666,8 +677,9 @@ impl CollectionStore {
 
     /// Current index state for [`CollectionInfo`](crate::types::CollectionInfo).
     pub fn index_info(&self) -> Option<IndexInfo> {
+        let files = self.data_arc();
         let (building, build_inserted, build_points_total) = self.build_progress();
-        let published = self.index.load();
+        let published = files.index.load();
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => Some(IndexInfo {
                 index_kind: IndexKind::Ivf,

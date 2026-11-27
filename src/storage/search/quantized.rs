@@ -29,7 +29,8 @@ impl CollectionStore {
         // holds only an owned snapshot Arc, never the quant lock, so
         // concurrent rebuilds are never blocked by searches.
         let (bytes_per_vector, q_snap_arc, oversample, rescore, qq) = {
-            let quant_guard = self.quant.read();
+            let data = self.data_arc();
+            let quant_guard = data.quant.read();
             let Some(quant) = quant_guard.as_ref() else {
                 return Err(VectorSearchError::Internal(
                     "quantization not active".to_string(),

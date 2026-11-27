@@ -80,7 +80,8 @@ impl CollectionStore {
         let quant_enabled = self.has_quantization() && !quant_params.ignore && !quant_params.exact;
         if quant_enabled {
             let setup = {
-                let quant_guard = self.quant.read();
+                let data = self.data_arc();
+                let quant_guard = data.quant.read();
                 quant_guard.as_ref().filter(|q| q.is_ready()).and_then(|quant| {
                     let metric = self.inner.read().meta.distance;
                     match quant.encode_query(query.primary_vector(), metric) {

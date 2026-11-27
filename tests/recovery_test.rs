@@ -8,6 +8,15 @@ fn config() -> CollectionConfig {
     CollectionConfig::new(4, DistanceMetric::Cosine)
 }
 
+fn data_dir(collection: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(collection.join("generations"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("published generation")
+}
+
 fn euclid_config() -> CollectionConfig {
     CollectionConfig::new(4, DistanceMetric::Euclid)
 }
@@ -368,7 +377,7 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     }
 
     // Flip an arbitrary payload byte after the 10-byte header (magic+version+crc).
-    let index_path = store_dir.join("index.bin");
+    let index_path = data_dir(&store_dir).join("index.bin");
     let mut bytes = std::fs::read(&index_path).unwrap();
     assert!(bytes.len() > 12, "index.bin must contain payload");
     // Payload starts at byte 10; flipping byte 10 must break CRC.
@@ -418,7 +427,7 @@ fn test_hnsw_bin_payload_bitflip_triggers_crc_fallback() {
         assert!(store.has_index());
     }
 
-    let hnsw_path = store_dir.join("hnsw.bin");
+    let hnsw_path = data_dir(&store_dir).join("hnsw.bin");
     let mut bytes = std::fs::read(&hnsw_path).unwrap();
     assert!(bytes.len() > 12, "hnsw.bin must contain payload");
     // Flip a payload byte (header is 10 bytes).

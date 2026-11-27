@@ -10,6 +10,15 @@ fn config() -> CollectionConfig {
     CollectionConfig::new(3, DistanceMetric::Dot)
 }
 
+fn data_dir(collection: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(collection.join("generations"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("published generation")
+}
+
 #[test]
 fn corrupt_collection_is_quarantined_and_the_rest_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -20,7 +29,7 @@ fn corrupt_collection_is_quarantined_and_the_rest_load() {
     }
 
     // Flip one byte of the payload body: the CRC envelope rejects it.
-    let meta_path = dir.path().join("bad/meta.bin");
+    let meta_path = data_dir(&dir.path().join("bad")).join("meta.bin");
     let mut bytes = std::fs::read(&meta_path).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xFF;

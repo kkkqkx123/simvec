@@ -229,7 +229,13 @@ fn corrupt_index_bin_falls_back_to_exact_scan() {
         assert!(engine.build_index("col").unwrap());
     }
     let col_dir = dir.path().join("vec").join("col");
-    std::fs::write(col_dir.join("index.bin"), b"VIVFgarbage-not-parseable").unwrap();
+    let data_dir = std::fs::read_dir(col_dir.join("generations"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("published generation");
+    std::fs::write(data_dir.join("index.bin"), b"VIVFgarbage-not-parseable").unwrap();
 
     let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
     assert!(
@@ -242,7 +248,7 @@ fn corrupt_index_bin_falls_back_to_exact_scan() {
         .unwrap();
     assert_eq!(results.len(), 3);
     // The corrupt file is cleaned up so a later save starts fresh.
-    assert!(!col_dir.join("index.bin").exists());
+    assert!(!data_dir.join("index.bin").exists());
 }
 
 #[test]

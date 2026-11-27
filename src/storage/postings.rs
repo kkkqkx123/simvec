@@ -371,26 +371,6 @@ impl Postings {
         Ok(())
     }
 
-    /// Discard every posting: used by compaction, which renumbers slots and
-    /// therefore has to rebuild the index on the new slot ids.
-    pub fn reset(&self) -> Result<()> {
-        let mut state = self.state.lock();
-        state.dict.clear();
-        state.pending.clear();
-        state.pending_bytes = 0;
-        state.buckets.clear();
-        state.lens.clear();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.file_name().to_str() == Some(MANIFEST_FILE) {
-                continue;
-            }
-            let _ = std::fs::remove_file(entry.path());
-        }
-        let _ = std::fs::remove_file(self.dir.join(MANIFEST_FILE));
-        Ok(())
-    }
-
     /// Bytes the postings occupy on disk plus the pending window.
     pub fn disk_bytes(&self) -> u64 {
         let state = self.state.lock();
@@ -809,16 +789,4 @@ mod tests {
         assert!(collect(&reopened, 1).is_empty());
     }
 
-    #[test]
-    fn reset_removes_every_bucket() {
-        let dir = tempfile::tempdir().unwrap();
-        let postings = open(dir.path(), None);
-        postings.index(1, &[1, 2, 3], &[1.0, 2.0, 3.0]).unwrap();
-        postings.flush(Some(1)).unwrap();
-        assert!(postings.disk_bytes() > 0);
-        postings.reset().unwrap();
-        assert_eq!(postings.disk_bytes(), 0);
-        assert_eq!(postings.term_count(), 0);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
 }

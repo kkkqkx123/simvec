@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use crate::error::{Result, VectorSearchError};
 use crate::types::{DistanceMetric, QuantizationType};
 
-use super::{map_all_segments, open_dir, save_meta, segment_bytes, write_at, QuantStore};
+use super::{save_meta, write_at, QuantStore};
 
 /// Max training vectors for PQ codebooks (aligned with qdrant's
 /// `KMEANS_SAMPLE_SIZE`).
@@ -245,36 +245,6 @@ impl QuantStore {
                 Ok(())
             }
         }
-    }
-
-    /// Atomically replace quant files after compaction renumbering.
-    pub fn replace_from(&self, tmp_path: &Path, new_capacity: u64, live_map: &[u32]) -> Result<()> {
-        // `tmp_path` is a temp quant.bin with new capacity.
-        std::fs::rename(tmp_path, &self.path)?;
-        open_dir(self.dir.as_path())?.sync_all()?;
-
-        let file = File::options().read(true).write(true).open(&self.path)?;
-        let bytes_per_vector = self.bytes_per_vector;
-        let total = new_capacity as usize * bytes_per_vector;
-        let bytes_per_segment = segment_bytes(bytes_per_vector, self.segment_slots);
-        let segments = if total == 0 {
-            Vec::new()
-        } else {
-            map_all_segments(&file, bytes_per_segment, total as u64)?
-        };
-        *self.file.lock() = file;
-        self.segments.store(Arc::new(segments));
-        {
-            let mut meta = self.meta.write();
-            // Update slot_capacity, but keep scale/codebook ready.
-            meta.slot_capacity = new_capacity;
-            // For product, codebook slots mapping is already handled by rewriting quant.bin
-            // via compaction's vector mapping (code already remapped).
-            save_meta(&self.meta_path, &meta)?;
-        }
-        // live_map not needed beyond caller handling; quant file already rewritten.
-        let _ = live_map;
-        Ok(())
     }
 
     /// Write compaction temp quant file.

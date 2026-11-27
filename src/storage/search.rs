@@ -67,6 +67,9 @@ impl CollectionStore {
         //
         // The payload store is snapshotted atomically via ArcSwap so it
         // cannot be swapped by a concurrent compaction during the search.
+        // One generation guard covers every file view below; compaction
+        // cannot swap half of the file set into this search pass.
+        let data = self.data();
         let (
             dim,
             metric,
@@ -102,15 +105,16 @@ impl CollectionStore {
                 inner.meta.distance,
                 inner.meta.segment_slots,
                 inner.meta.next_slot,
-                self.tombstones.load(),
-                self.vectors.snapshot(),
-                self.keys.snapshot(),
-                self.index.load(),
+                data.tombstones.load(),
+                data.vectors.snapshot(),
+                data.keys.snapshot(),
+                data.index.load(),
                 mask,
                 self.pending.lock().clone(),
             )
         };
-        let ps_guard = self.payload_store.load();
+        // Same generation guard as the vectors/keys/tombstones above.
+        let ps_guard = data.payload_store.load();
         let payload_view: Option<&PayloadStore> = (*ps_guard).as_ref().as_ref();
         let filtered = query.filter.is_some();
         let snap = SearchSnapshot {

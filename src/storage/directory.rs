@@ -298,71 +298,6 @@ impl BlobDirectory {
         Ok(())
     }
 
-    /// Atomically replace the backing file with `tmp_path` (which must be a
-    /// complete, valid directory file) and refresh the in-memory view.
-    ///
-    /// Used by compaction, which builds a compacted file and renames it over
-    /// the live one. Readers keep their old mmap snapshot until the swap.
-    pub fn replace_from(&self, tmp_path: &Path) -> Result<()> {
-        let dir = self.path.parent().ok_or_else(|| {
-            VectorSearchError::Internal(format!("no parent dir for {}", self.path.display()))
-        })?;
-        std::fs::rename(tmp_path, &self.path)?;
-        open_dir(dir)?.sync_all()?;
-
-        let file = File::options().read(true).write(true).open(&self.path)?;
-        let file_len = file.metadata()?.len() as usize;
-        if file_len < HEADER_LEN {
-            return Err(VectorSearchError::CorruptData(format!(
-                "{} too short: {} bytes",
-                self.path.display(),
-                file_len
-            )));
-        }
-        if read_magic(&file)? != self.magic {
-            return Err(VectorSearchError::CorruptData(format!(
-                "{} bad magic",
-                self.path.display()
-            )));
-        }
-        if read_version(&file)? != FILE_VERSION {
-            return Err(VectorSearchError::CorruptData(format!(
-                "{} unsupported version",
-                self.path.display()
-            )));
-        }
-        let rec_size = read_rec_size(&file)?;
-        if rec_size != self.rec_size {
-            return Err(VectorSearchError::CorruptData(format!(
-                "{} record size {rec_size} != {desc}",
-                self.path.display(),
-                desc = self.rec_size
-            )));
-        }
-        let rec_capacity = read_rec_capacity(&file)? as usize;
-        let blob_len = read_blob_len(&file)?;
-        let expected = HEADER_LEN + rec_capacity * rec_size + blob_len as usize;
-        if file_len != expected {
-            return Err(VectorSearchError::CorruptData(format!(
-                "{} length {} != expected {expected}",
-                self.path.display(),
-                file_len
-            )));
-        }
-        let mmap = map_file(&file, file_len)?;
-        *self.file.lock() = file;
-        self.view.store(Arc::new(DirView {
-            mmap: Arc::new(mmap),
-            rec_size,
-            rec_capacity,
-            blob_len,
-            mapped_len: file_len,
-        }));
-        self.dirty
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Grow the record array to at least `target_capacity` records.
     ///
     /// Relocates the blob area, so the file is rebuilt atomically via a
@@ -604,17 +539,4 @@ mod tests {
         assert!(matches!(err, VectorSearchError::CorruptData(_)), "{err}");
     }
 
-    #[test]
-    fn replace_from_rejects_a_different_record_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dir.bin");
-        let other = dir.path().join("other.bin");
-        let dir_file = BlobDirectory::create(&path, *b"VTST", 12, 4).unwrap();
-        {
-            let foreign = BlobDirectory::create(&other, *b"VTST", 16, 4).unwrap();
-            foreign.append_blob(0, b"y", 0).unwrap();
-        }
-        let err = dir_file.replace_from(&other).unwrap_err();
-        assert!(matches!(err, VectorSearchError::CorruptData(_)), "{err}");
-    }
 }

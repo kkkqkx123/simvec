@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
 use super::filter_bitmap::FilterBitmap;
+use super::generation::Generation;
 use super::keys::Keys;
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
@@ -14,7 +15,7 @@ use super::quant::QuantStore;
 use super::queue::CommitQueue;
 use super::tombstones::TombstoneBits;
 use super::vectors::Vectors;
-use super::{CollectionStore, StoreInner};
+use super::{CollectionStore, DataFiles, StoreInner};
 use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
@@ -133,19 +134,23 @@ impl CollectionStore {
         // info and re-created requests stay byte-identical with the original.
         meta.vectors_on_disk = config.vectors_on_disk;
         meta.storage_hints = config.storage_hints.clone();
-        meta.save(dir)?;
+        // The generation manifest is published last, so an interrupted create
+        // leaves no partially described serving generation behind.
+        let generation = Generation::create(dir)?;
+        let data_dir = generation.path();
+        meta.save(&data_dir)?;
 
         let vectors = Vectors::create(
-            &dir.join("vectors.bin"),
+            &data_dir.join("vectors.bin"),
             config.vector_size,
             meta.segment_slots,
         )?;
-        let keys = Keys::create(&dir.join("keys.bin"), meta.slot_capacity)?;
+        let keys = Keys::create(&data_dir.join("keys.bin"), meta.slot_capacity)?;
         // Create quantized storage if requested. Scalar/Binary are ready immediately;
         // Product needs a codebook build before it becomes usable.
         let quant = if let Some(qc) = &config.quantization_config {
             Some(QuantStore::create(
-                dir,
+                &data_dir,
                 config.vector_size,
                 config.distance,
                 qc,
@@ -159,15 +164,25 @@ impl CollectionStore {
         let initial_tombstones = TombstoneBits::new(meta.slot_capacity as usize);
         // A fresh collection owns a valid, all-zero table so `open` never has
         // to guess whether a missing file means "nothing deleted".
-        initial_tombstones.save(dir, meta.slot_capacity)?;
-        let tombstones = ArcSwap::from(Arc::new(initial_tombstones));
+        initial_tombstones.save(&data_dir, meta.slot_capacity)?;
         let slot_capacity = meta.slot_capacity;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         // New collections always use the Gridstore-style PayloadStore.
         let payload_store =
-            PayloadStore::create(&dir.join("payloads_store"), storage.payload_store_config())?;
+            PayloadStore::create(&data_dir.join("payloads_store"), storage.payload_store_config())?;
+        let files = ArcSwap::from(Arc::new(DataFiles {
+            dir: data_dir,
+            vectors,
+            keys,
+            tombstones: ArcSwap::from(Arc::new(initial_tombstones)),
+            payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
+            quant: parking_lot::RwLock::new(quant),
+            index: ArcSwap::from(Arc::new(None)),
+        }));
         Ok(Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            generation: RwLock::new(generation),
+            files,
             storage: storage.clone(),
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
@@ -183,14 +198,8 @@ impl CollectionStore {
                 filter_bitmap: FilterBitmap::with_capacity(slot_capacity as usize),
                 payload_indexes: PayloadIndexManager::new(),
             }),
-            tombstones,
-            vectors,
-            keys,
-            payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
-            quant: parking_lot::RwLock::new(quant),
             wal,
             queue: Arc::new(CommitQueue::new()),
-            index: ArcSwap::from(Arc::new(None)),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
             compact_mutex: Mutex::new(()),
@@ -214,40 +223,24 @@ impl CollectionStore {
     pub fn open_with_storage(dir: impl AsRef<Path>, storage: &StorageConfig) -> Result<Arc<Self>> {
         storage.validate()?;
         let dir = dir.as_ref();
+        let generation = Generation::open(dir)?;
+        let data_dir = generation.path();
         for name in &["meta.bin", "vectors.bin", "keys.bin"] {
-            let path = dir.join(name);
+            let path = data_dir.join(name);
             if !path.exists() {
                 return Err(VectorSearchError::CollectionIncomplete {
-                    dir: dir.to_path_buf(),
+                    dir: data_dir.clone(),
                     file: name.to_string(),
                 });
             }
         }
-        let meta = Meta::load(dir)?;
-
-        let vectors = Vectors::open(
-            &dir.join("vectors.bin"),
-            meta.vector_size,
-            meta.segment_slots,
-            meta.slot_capacity,
-        )?;
-        let keys = Keys::open(&dir.join("keys.bin"))?;
-        // The tombstone table outlives the WAL: once a checkpoint truncates the
-        // log, this file is the only record of the deletes. Load it before any
-        // scan so a deleted slot is never reported live.
-        let tombstone_bits =
-            TombstoneBits::load(dir, meta.slot_capacity as usize, meta.tombstone_count)?
-                .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
-
-        let payload_store_path = dir.join("payloads_store");
-        // Opened once and reused for the rebuild pass below: opening twice
-        // re-read the tracker and bitmask for nothing.
-        let payload_store = PayloadStore::open(&payload_store_path)?;
+        let meta = Meta::load(&data_dir)?;
+        let files = Arc::new(DataFiles::open(&data_dir, &meta, storage)?);
 
         let mut reverse = IdMap::with_capacity(meta.slot_capacity as usize);
         let mut filter_bitmap = FilterBitmap::with_capacity(meta.slot_capacity as usize);
         let mut payload_indexes = PayloadIndexManager::new();
-        for def in PayloadIndexManager::load_defs(dir) {
+        for def in PayloadIndexManager::load_defs(&data_dir) {
             if payload_indexes
                 .declare(&def.field, def.schema, meta.slot_capacity as usize)
                 .is_err()
@@ -256,8 +249,10 @@ impl CollectionStore {
             }
         }
         {
-            let keys_view = keys.snapshot();
-            let tombstone_view = &tombstone_bits;
+            let keys_view = files.keys.snapshot();
+            let tombstone_view = files.tombstones.load();
+            let ps_guard = files.payload_store.load();
+            let payload_store = ps_guard.as_ref().as_ref().expect("payload store is present");
             for slot in 0..meta.next_slot as usize {
                 if let Some(key) = Keys::read_key(&keys_view, slot)? {
                     // Tombstoned slots keep their key in `keys.bin` until
@@ -278,27 +273,12 @@ impl CollectionStore {
             }
         }
 
-        // Load quantized storage if configured. Missing or corrupt quant files are
-        // treated as absent (derived structure) so open still succeeds; the
-        // collection will run exact until `build_quantization` recreates them.
-        let quant = if meta.quantization_config.is_some() {
-            QuantStore::open(
-                dir,
-                meta.vector_size,
-                meta.distance,
-                meta.segment_slots,
-                meta.slot_capacity,
-            )?
-        } else {
-            None
-        };
-
-        let payload_store = Some(payload_store);
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
-        let tombstones = ArcSwap::from(Arc::new(tombstone_bits));
 
         let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            generation: RwLock::new(generation),
+            files: ArcSwap::from(files),
             storage: storage.clone(),
             self_weak: weak.clone(),
             inner: RwLock::new(StoreInner {
@@ -314,14 +294,8 @@ impl CollectionStore {
                 filter_bitmap,
                 payload_indexes,
             }),
-            tombstones,
-            vectors,
-            keys,
-            payload_store: ArcSwap::from(Arc::new(payload_store)),
-            quant: parking_lot::RwLock::new(quant),
             wal,
             queue: Arc::new(CommitQueue::new()),
-            index: ArcSwap::from(Arc::new(None)),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
             compact_mutex: Mutex::new(()),
@@ -344,24 +318,38 @@ impl CollectionStore {
     /// covers the crash window where the WAL was fsync'ed but `meta.bin` was
     /// not yet written.
     pub(super) fn replay_wal(&self) -> Result<()> {
-        let (txns, last) = self.wal.read_all()?;
-        if !txns.is_empty() {
-            let mut inner = self.inner.write();
-            for txn in &txns {
-                self.apply_records_locked(&mut inner, &txn.ops)?;
-            }
-            inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(last);
-            // Hand out lsns above the replayed water mark so a record that
-            // just replayed can never collide with a new one.
-            inner.next_lsn = inner.meta.last_applied_txn + 1;
-            let live = inner.reverse.len() as u64;
-            let tomb = self.tombstones.load().count_ones();
-            let changed = inner.meta.live_count != live || inner.meta.tombstone_count != tomb;
-            inner.meta.live_count = live;
-            inner.meta.tombstone_count = tomb;
-            if changed {
-                inner.meta.save(&self.dir)?;
-            }
+        // The WAL watermark alone is not an authority: only the published
+        // generation says which operations are already in its data files.
+        // Checkpoints write the generation manifest before the WAL watermark,
+        // so a larger watermark means a manifest from another generation.
+        let generation_lsn = self.generation.read().lsn();
+        let ack = self.wal.acked_lsn();
+        if ack > generation_lsn {
+            return Err(VectorSearchError::CorruptData(format!(
+                "WAL ack {ack} is newer than generation lsn {generation_lsn}"
+            )));
+        }
+        let floor = generation_lsn.max(ack);
+        let (txns, last) = self.wal.read_all_from(floor)?;
+        let mut inner = self.inner.write();
+        for txn in &txns {
+            self.apply_records_locked(&mut inner, &txn.ops)?;
+        }
+        // Even an empty WAL carries information: the floor tells us how far
+        // the data files have been checkpointed. Starting new lsns at 1 after
+        // that point would collide with records that were truncated.
+        let water_changed = inner.meta.last_applied_txn != last;
+        inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(last);
+        inner.next_lsn = inner.meta.last_applied_txn + 1;
+        let live = inner.reverse.len() as u64;
+        let tomb = self.data_arc().tombstones.load().count_ones();
+        let changed = water_changed
+            || inner.meta.live_count != live
+            || inner.meta.tombstone_count != tomb;
+        inner.meta.live_count = live;
+        inner.meta.tombstone_count = tomb;
+        if changed {
+            inner.meta.save(&self.data_dir())?;
         }
         Ok(())
     }

@@ -101,33 +101,6 @@ impl Vectors {
         })
     }
 
-    /// Atomically replace the backing file with `tmp_path` and remap all
-    /// segments. Used by compaction; readers keep their old segment snapshot
-    /// until the swap.
-    pub fn replace_from(&self, tmp_path: &Path) -> Result<()> {
-        let dir = self.path.parent().ok_or_else(|| {
-            VectorSearchError::Internal(format!("no parent dir for {}", self.path.display()))
-        })?;
-        std::fs::rename(tmp_path, &self.path)?;
-        open_dir(dir)?.sync_all()?;
-
-        let file = File::options().read(true).write(true).open(&self.path)?;
-        let len = file.metadata()?.len();
-        let segment_bytes = segment_bytes(self.dim, self.segment_slots);
-        let mut segments = Vec::new();
-        let mut offset = 0u64;
-        while offset < len {
-            let n = segment_bytes.min(len - offset);
-            segments.push(Arc::new(map_segment(&file, n, offset)?));
-            offset += n;
-        }
-        *self.file.lock() = file;
-        self.segments.store(Arc::new(segments));
-        self.dirty
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Total number of slots currently mapped.
     pub fn slot_capacity(&self) -> u64 {
         self.segments.load().len() as u64 * self.segment_slots as u64
@@ -221,10 +194,6 @@ impl Vectors {
 
 fn segment_bytes(dim: usize, segment_slots: u32) -> u64 {
     dim as u64 * segment_slots as u64 * 4
-}
-
-fn open_dir(dir: &Path) -> Result<File> {
-    Ok(File::open(dir)?)
 }
 
 fn map_segment(file: &File, len: u64, offset: u64) -> Result<Mmap> {

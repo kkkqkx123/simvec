@@ -438,18 +438,19 @@ fn test_short_vectors_file_is_repaired_on_open() {
     let store = CollectionStore::create(&store_dir, "col_c", &config(4)).unwrap();
     upsert_logged(&store, &point(1, 4));
     let capacity = store.meta().slot_capacity;
+    let data_dir = store.data_dir();
     drop(store);
 
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .open(store_dir.join("vectors.bin"))
+        .open(data_dir.join("vectors.bin"))
         .unwrap();
     file.set_len(16).unwrap();
     drop(file);
 
     let store = CollectionStore::open(&store_dir).expect("open must repair the length");
     assert_eq!(store.meta().slot_capacity, capacity);
-    let len = std::fs::metadata(store_dir.join("vectors.bin"))
+    let len = std::fs::metadata(data_dir.join("vectors.bin"))
         .unwrap()
         .len();
     assert_eq!(len, capacity * 4 * 4);
@@ -467,11 +468,12 @@ fn test_oversized_vectors_file_is_accepted() {
     let store = CollectionStore::create(&store_dir, "col_c2", &config(4)).unwrap();
     upsert_logged(&store, &point(1, 4));
     let capacity = store.meta().slot_capacity;
+    let data_dir = store.data_dir();
     drop(store);
 
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .open(store_dir.join("vectors.bin"))
+        .open(data_dir.join("vectors.bin"))
         .unwrap();
     file.set_len(capacity * 4 * 4 + 4096).unwrap();
     drop(file);
@@ -569,7 +571,7 @@ fn test_stale_meta_bin_recovers_from_wal() {
         }
         // Fewer batches than META_SAVE_INTERVAL and no capacity growth, so
         // meta.bin still carries the pre-write water mark.
-        let on_disk = Meta::load(&store_dir).unwrap();
+        let on_disk = Meta::load(&store.data_dir()).unwrap();
         assert_eq!(on_disk.next_slot, 0, "meta.bin must lag the live set");
     }
     {
@@ -709,7 +711,7 @@ fn test_wide_vectors_get_smaller_segments() {
     // One segment, sized by the target rather than by a fixed slot count.
     let expected = meta.slot_capacity * 768 * 4;
     assert_eq!(
-        std::fs::metadata(store_dir.join("vectors.bin"))
+        std::fs::metadata(store.data_dir().join("vectors.bin"))
             .unwrap()
             .len(),
         expected
@@ -726,4 +728,58 @@ fn test_wide_vectors_get_smaller_segments() {
         narrow.meta().segment_slots,
         super::meta::SEGMENT_SLOTS_DEFAULT
     );
+}
+
+/// The generation manifest is the commit point: a staging directory left by
+/// a crashed compaction is never adopted on open.
+#[test]
+fn test_unpublished_generation_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_gen");
+    {
+        let store = CollectionStore::create(&store_dir, "col_gen", &config(4)).unwrap();
+        upsert_logged(&store, &point(7, 4));
+        store.checkpoint().unwrap();
+    }
+    let published = data_dir(&store_dir);
+    let orphan = store_dir.join("generations/.g000000000000000000002-staging");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("vectors.bin"), b"partial").unwrap();
+
+    let store = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(store.data_dir(), published);
+    assert!(store.get(&PointId::from(7u64)).unwrap().is_some());
+}
+
+fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
+    super::Generation::open(root).unwrap().path()
+}
+
+/// Checkpoint advances the generation lsn with the data files, and compaction
+/// publishes a new generation while keeping the WAL truncated.
+#[test]
+fn test_generation_advances_with_checkpoint_and_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_gen2");
+    let store = CollectionStore::create(&store_dir, "col_gen2", &config(4)).unwrap();
+    for id in 1..=4 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    delete_logged(&store, &PointId::from(2u64));
+    store.checkpoint().unwrap();
+    let generation = super::Generation::open(&store_dir).unwrap();
+    assert_eq!(generation.lsn(), store.meta().last_applied_txn);
+    let before = store.data_dir();
+
+    assert_eq!(store.compact().unwrap(), 3);
+    let after = store.data_dir();
+    assert_ne!(before, after);
+    let generation = super::Generation::open(&store_dir).unwrap();
+    assert_eq!(generation.lsn(), store.meta().last_applied_txn);
+    assert!(store.get(&PointId::from(2u64)).unwrap().is_none());
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.data_dir(), after);
+    assert_eq!(reopened.count(), 3);
 }

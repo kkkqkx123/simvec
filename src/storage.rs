@@ -1,12 +1,15 @@
 //! Per-collection storage assembly.
 //!
-//! A collection directory contains:
+//! A collection root contains `generation.bin`, the shared `wal/`, and a
+//! type marker. The published `generations/g<id>/` directory holds:
 //! - `meta.bin`     postcard `Meta`
 //! - `vectors.bin`  dense row-major f32, segmented mmap
 //! - `keys.bin`     slot -> point id directory
 //! - `tombstones.bin` slot -> deleted flag (survives WAL truncation)
 //! - `payloads_store/` block-based payload storage (tracker + pages)
-//! - `wal/`         segmented append-only transaction log (crash recovery)
+//!
+//! The generation manifest is the commit point; compaction stages a whole
+//! new generation and publishes it by replacing that manifest.
 //!
 //! Readers snapshot the mmap-backed `ArcSwap` views and scan without the
 //! store lock. Mutations go through the commit queue
@@ -29,6 +32,7 @@
 mod compaction;
 mod directory;
 mod filter_bitmap;
+pub(crate) mod generation;
 mod index_lifecycle;
 mod keys;
 mod meta;
@@ -53,13 +57,14 @@ mod store_write;
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
+pub(crate) use generation::Generation;
 pub(crate) use meta::Meta;
 pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
@@ -73,6 +78,7 @@ use self::quant::QuantStore;
 use self::queue::CommitQueue;
 use self::vectors::Vectors;
 
+use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 
@@ -221,23 +227,79 @@ fn assert_not_applying() {
     );
 }
 
+/// Every file-backed handle of one published generation.
+///
+/// A reader loads the outer `ArcSwap` once and keeps that guard for the whole
+/// pass, so a compaction swapping generations cannot pair a new key table with
+/// an old vector mapping. Mutations hold the store write lock, which excludes
+/// the swap, and therefore use `load_full()` safely.
+pub(super) struct DataFiles {
+    /// Published generation directory holding all of the files below.
+    dir: PathBuf,
+    vectors: Vectors,
+    keys: Keys,
+    tombstones: ArcSwap<TombstoneBits>,
+    payload_store: ArcSwap<Option<PayloadStore>>,
+    quant: RwLock<Option<QuantStore>>,
+    index: ArcSwap<Option<PublishedIndex>>,
+}
+
+impl DataFiles {
+    /// Open every serving file of one generation.
+    pub(super) fn open(dir: &Path, meta: &Meta, _storage: &StorageConfig) -> Result<Self> {
+        let dir = dir.to_path_buf();
+        let vectors = Vectors::open(
+            &dir.join("vectors.bin"),
+            meta.vector_size,
+            meta.segment_slots,
+            meta.slot_capacity,
+        )?;
+        let keys = Keys::open(&dir.join("keys.bin"))?;
+        let tombstones = TombstoneBits::load(
+            &dir,
+            meta.slot_capacity as usize,
+            meta.tombstone_count,
+        )?
+        .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
+        let payload_store = PayloadStore::open(&dir.join("payloads_store"))?;
+        let quant = if meta.quantization_config.is_some() {
+            QuantStore::open(
+                &dir,
+                meta.vector_size,
+                meta.distance,
+                meta.segment_slots,
+                meta.slot_capacity,
+            )?
+        } else {
+            None
+        };
+        Ok(Self {
+            dir,
+            vectors,
+            keys,
+            tombstones: ArcSwap::from(Arc::new(tombstones)),
+            payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
+            quant: RwLock::new(quant),
+            index: ArcSwap::from(Arc::new(None)),
+        })
+    }
+
+    pub(super) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
 /// A single opened collection.
 pub struct CollectionStore {
     dir: PathBuf,
+    /// Published generation. Its lsn bounds every WAL replay.
+    generation: RwLock<Generation>,
+    /// File-backed handles of the published generation, swapped as a unit.
+    files: ArcSwap<DataFiles>,
     /// Engine-level storage tuning this collection was opened with. Sourced
     /// from [`StorageConfig`]; never persisted per collection.
     storage: StorageConfig,
     inner: RwLock<StoreInner>,
-    /// Tombstone mirror (slot -> deleted) for lock-free scans.
-    tombstones: ArcSwap<TombstoneBits>,
-    vectors: Vectors,
-    keys: Keys,
-    /// Gridstore-style payload storage for all payload operations.
-    /// Wrapped in `ArcSwap` for lock-free snapshot reads during search.
-    payload_store: ArcSwap<Option<PayloadStore>>,
-    /// Optional quantized storage (Scalar/Binary/Product). `None` when
-    /// quantization is disabled or not yet built.
-    quant: parking_lot::RwLock<Option<QuantStore>>,
     wal: Wal,
     /// Commit queue: group commit for the WAL plus the single applier thread.
     /// Shared with that thread, which observes the store through a weak
@@ -246,8 +308,6 @@ pub struct CollectionStore {
     /// Weak self-reference, so the commit-queue worker can observe the store
     /// without keeping it alive past the last user.
     self_weak: Weak<CollectionStore>,
-    /// Published ANN index; `None` = exact scan. Swapped atomically.
-    index: ArcSwap<Option<PublishedIndex>>,
     /// Slots inserted while no index was published and a build was in
     /// flight; drained into the index on publish so probe search never
     /// misses them. A mutex-guarded queue: `register_slot` runs under the
@@ -280,6 +340,24 @@ pub struct CollectionStore {
 }
 
 impl CollectionStore {
+    /// Load the published file set as one guard. Read passes must keep the
+    /// guard alive until every derived view has been captured.
+    fn data(&self) -> arc_swap::Guard<Arc<DataFiles>> {
+        self.files.load()
+    }
+
+    /// Owned handle for mutations, which run under the store write lock and
+    /// therefore cannot race a generation swap.
+    fn data_arc(&self) -> Arc<DataFiles> {
+        self.files.load_full()
+    }
+
+    /// Directory holding the serving generation's files.
+    /// Directory holding the currently published generation's data files.
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_arc().dir.clone()
+    }
+
     // ── Payload routing helpers ────────────────────────────────────────
 
     // ── Payload field indexes ──────────────────────────────────────────

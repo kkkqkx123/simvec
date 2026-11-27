@@ -89,6 +89,15 @@ impl Tracker {
         self.pointers.get(slot as usize).copied()
     }
 
+    /// All persisted pointers, used by open-time consistency validation.
+    pub(super) fn entries(&self) -> impl Iterator<Item = (u32, ValuePointer)> + '_ {
+        self.pointers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(slot, pointer)| (slot as u32, pointer))
+    }
+
     /// Set the pointer for a slot, growing the array if needed.
     pub fn set(&mut self, slot: u32, pointer: ValuePointer) {
         let idx = slot as usize;
@@ -110,6 +119,7 @@ impl Tracker {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp_path, &file_path)?;
+        File::open(path)?.sync_all()?;
         Ok(())
     }
 

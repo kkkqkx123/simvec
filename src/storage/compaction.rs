@@ -1,17 +1,18 @@
 //! Collection compaction plus the file-rewriting helpers it relies on.
 //!
-//! Compaction rewrites every collection file into temp files, fsyncs them,
-//! then atomically renames each over the live file (the `replace_from`
-//! path), which is invisible to readers holding old mmap snapshots.
+//! Compaction builds a complete new generation in a staging directory,
+//! fsyncs it, then publishes a generation manifest. No serving file is
+//! overwritten in place: a crash before publication leaves an ignored
+//! staging directory and the previous generation untouched.
 //!
-//! The heavy rewrite phase runs under the `compact_mutex` only — the
-//! store write lock is *not* held, so searches and upserts proceed on the
-//! old files. A mutation counter guards the commit: the swap happens under
-//! the write lock only if no transaction raced the rewrite; otherwise the
-//! attempt is retried on a fresh snapshot. Under sustained write pressure
-//! the compaction falls back to rewriting while holding the write lock, so
-//! progress is always guaranteed. In both paths the `compact_mutex`
-//! excludes index builds/drains, keeping slot numbers stable for the index.
+//! The heavy rewrite phase runs under the `compact_mutex` only — the store
+//! write lock is *not* held, so searches and upserts proceed on the old
+//! files. A mutation counter guards publication: the swap happens under the
+//! write lock only if no transaction raced the rewrite; otherwise the attempt
+//! is retried on a fresh snapshot. Under sustained write pressure the
+//! compaction falls back to rewriting while holding the write lock, so
+//! progress is always guaranteed. In both paths `compact_mutex` excludes
+//! index builds/drains, keeping slot numbers stable for the index.
 //!
 //! The commit also truncates the WAL, so it gates the commit queue for its
 //! duration: a transaction that is queued or halfway through the queue
@@ -22,14 +23,17 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use memmap2::Mmap;
 
 use super::directory::KEY_REC_SIZE;
+use super::generation::StagedGeneration;
 use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
 use super::tombstones::TombstoneBits;
-use super::{CollectionStore, Meta, WalRecord, WalTxn};
+use super::{CollectionStore, DataFiles, Meta, WalRecord, WalTxn};
 use crate::error::{Result, VectorSearchError};
 use crate::index::{persist, HnswIndex, IvfIndex};
 use crate::types::{HnswConfig, IndexConfig, PointId};
@@ -43,6 +47,8 @@ const COMMIT_ATTEMPTS: usize = 4;
 
 /// Everything one compaction attempt needs, captured from an immutable view.
 struct CompactionPlan {
+    /// Metadata snapshot the staged generation is built from.
+    meta: Meta,
     dim: usize,
     segment_slots: u32,
     /// Slot high-water mark the plan covers.
@@ -61,6 +67,7 @@ fn build_plan(meta: &Meta, tombstones: &TombstoneBits) -> CompactionPlan {
         plan_slots(|s| !tombstones.bit(s), meta.next_slot, meta.segment_slots);
     let live_count = map.iter().filter(|s| **s != u32::MAX).count() as u64;
     CompactionPlan {
+        meta: meta.clone(),
         dim: meta.vector_size,
         segment_slots: meta.segment_slots,
         next_slot: meta.next_slot,
@@ -280,28 +287,35 @@ impl CollectionStore {
                 if inner.meta.tombstone_count == 0 || inner.meta.next_slot == 0 {
                     return Ok(inner.meta.live_count);
                 }
-                let tombstones = self.tombstones.load();
+                let tombstones = self.data_arc().tombstones.load();
                 build_plan(&inner.meta, &tombstones)
             };
             let version = self.mutations.load(AtomicOrdering::Relaxed);
-            self.write_temp_files(&plan)?;
+            let staged = self.generation.read().stage()?;
+            let remapped = match self.stage_generation(&plan, &staged) {
+                Ok(remapped) => remapped,
+                Err(e) => {
+                    staged.discard();
+                    return Err(e);
+                }
+            };
             {
-                // The commit truncates the WAL, so the queue is gated for its
-                // duration: no transaction may be queued or halfway through
-                // the worker while the log is cut. Writers keep flowing during
-                // the heavy rewrite above; the mutation counter still detects
-                // a write that raced it.
+                // The commit publishes the manifest and truncates the WAL, so
+                // the queue is gated for its duration: no transaction may be
+                // queued or halfway through the worker while the log is cut.
                 let _gate = self.queue.quiesce();
                 let mut inner = self.inner.write();
                 let raced = self.mutations.load(AtomicOrdering::Relaxed) != version
                     || inner.meta.next_slot != plan.next_slot
                     || inner.meta.tombstone_count != plan.tombstone_count;
                 if !raced {
-                    let live = self.commit_compaction(&mut inner, &plan)?;
+                    let live =
+                        self.commit_generation(&mut inner, &plan, staged, remapped)?;
                     self.metrics.record_compaction(started.elapsed());
                     return Ok(live);
                 }
             }
+            staged.discard();
             self.metrics.record_compaction_race_retry();
             tracing::debug!(
                 collection = %self.inner.read().meta.collection,
@@ -318,11 +332,18 @@ impl CollectionStore {
         if inner.meta.tombstone_count == 0 || inner.meta.next_slot == 0 {
             return Ok(inner.meta.live_count);
         }
-        let tombstones = self.tombstones.load();
+        let tombstones = self.data_arc().tombstones.load();
         let plan = build_plan(&inner.meta, &tombstones);
         drop(tombstones);
-        self.write_temp_files(&plan)?;
-        let live = self.commit_compaction(&mut inner, &plan);
+        let staged = self.generation.read().stage()?;
+        let remapped = match self.stage_generation(&plan, &staged) {
+            Ok(remapped) => remapped,
+            Err(e) => {
+                staged.discard();
+                return Err(e);
+            }
+        };
+        let live = self.commit_generation(&mut inner, &plan, staged, remapped);
         self.metrics.record_compaction(started.elapsed());
         live
     }
@@ -334,10 +355,11 @@ impl CollectionStore {
     /// every file that gets rewritten bounds the peak usage of the rewrite
     /// phase, which briefly doubles that space.
     fn compaction_footprint(&self) -> u64 {
-        let mut total = file_len(&self.dir.join("vectors.bin"));
-        total += file_len(&self.dir.join("keys.bin"));
-        total += file_len(&self.dir.join("quant.bin"));
-        total += dir_len(&self.dir.join("payloads_store"));
+        let dir = self.data_dir();
+        let mut total = file_len(&dir.join("vectors.bin"));
+        total += file_len(&dir.join("keys.bin"));
+        total += file_len(&dir.join("quant.bin"));
+        total += dir_len(&dir.join("payloads_store"));
         total
     }
 
@@ -367,37 +389,46 @@ impl CollectionStore {
         Ok(())
     }
 
-    /// Write the three compacted temp files from immutable snapshots.
+    /// Build every file of a new generation from immutable snapshots.
     ///
-    /// Requires no store locks: every input is either an `ArcSwap` snapshot
-    /// or captured in `plan`. Callers must validate via the mutation counter
-    /// that no write raced the reads before committing these files.
-    fn write_temp_files(&self, plan: &CompactionPlan) -> Result<()> {
-        // 1. vectors.bin
-        let tmp_vectors = self.dir.join("vectors_tmp.bin");
-        {
-            let vsnap = self.vectors.snapshot();
-            write_vectors_file(
-                &tmp_vectors,
-                plan.dim,
-                plan.segment_slots,
+    /// Requires no store locks: every input is either an `ArcSwap` snapshot or
+    /// captured in `plan`. Callers validate via the mutation counter that no
+    /// write raced the reads before publishing this generation. The returned
+    /// index is the remapped ANN tier, already persisted into the staging dir.
+    fn stage_generation(
+        &self,
+        plan: &CompactionPlan,
+        staged: &StagedGeneration,
+    ) -> Result<Option<PublishedIndex>> {
+        let dir = staged.path();
+        let files = self.data_arc();
+        let mut meta = plan.meta.clone();
+        meta.slot_capacity = plan.new_capacity;
+        meta.next_slot = plan.live_count;
+        meta.live_count = plan.live_count;
+        meta.tombstone_count = 0;
+
+        write_vectors_file(
+            &dir.join("vectors.bin"),
+            plan.dim,
+            plan.segment_slots,
+            plan.new_capacity,
+            &files.vectors.snapshot(),
+            &plan.map,
+        )?;
+
+        if let Some(q) = files.quant.read().as_ref() {
+            q.write_compacted_file(
+                &dir.join("quant.bin"),
                 plan.new_capacity,
-                &vsnap,
+                &files.vectors.snapshot(),
                 &plan.map,
             )?;
+            q.write_compacted_meta(dir, plan.new_capacity)?;
         }
 
-        // 1b. quant.bin (derived, remapped exactly like vectors)
-        if let Some(q) = self.quant.read().as_ref() {
-            let tmp_quant = self.dir.join("quant_tmp.bin");
-            let vsnap = self.vectors.snapshot();
-            q.write_compacted_file(&tmp_quant, plan.new_capacity, &vsnap, &plan.map)?;
-        }
-
-        // 2. keys.bin
-        let tmp_keys = self.dir.join("keys_tmp.bin");
         {
-            let keys_view = self.keys.snapshot();
+            let keys_view = files.keys.snapshot();
             let mut entries = Vec::with_capacity(plan.live_count as usize);
             for (old_slot, new_slot) in plan.map.iter().enumerate() {
                 if *new_slot == u32::MAX {
@@ -413,7 +444,7 @@ impl CollectionStore {
                 });
             }
             write_dir_file(
-                &tmp_keys,
+                &dir.join("keys.bin"),
                 *b"VKEY",
                 KEY_REC_SIZE,
                 plan.new_capacity,
@@ -421,10 +452,6 @@ impl CollectionStore {
             )?;
         }
 
-        let tmp_payload_store = self.dir.join("payloads_store_tmp");
-        if tmp_payload_store.exists() {
-            std::fs::remove_dir_all(&tmp_payload_store)?;
-        }
         let live_slots: Vec<(u32, u32)> = plan
             .map
             .iter()
@@ -432,73 +459,72 @@ impl CollectionStore {
             .filter(|(_, new_slot)| **new_slot != u32::MAX)
             .map(|(old, &new)| (old as u32, new))
             .collect();
-        let ps_guard = self.payload_store.load();
+        let ps_guard = files.payload_store.load();
         let old_store = ps_guard
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        let new_store = old_store.compact_to(&tmp_payload_store, &live_slots)?;
-        let _ = old_store;
+        old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
         drop(ps_guard);
-        let _ = new_store;
-        Ok(())
+
+        TombstoneBits::new(plan.new_capacity as usize).save(dir, plan.new_capacity)?;
+        let defs = files.dir().join("payload_indexes.json");
+        if defs.exists() {
+            std::fs::copy(defs, dir.join("payload_indexes.json"))?;
+        }
+        meta.save(dir)?;
+
+        Ok(self.remapped_index(plan, dir))
     }
 
-    /// Commit a validated plan: swap the files, rebuild the in-memory state,
-    /// rewrite meta, invalidate the published ANN index and checkpoint the
-    /// WAL. The caller must hold the store write lock and guarantee (mutation
-    /// counter / lock ownership) that the plan still describes reality.
-    fn commit_compaction(
+    /// Publish a validated generation and switch every in-memory file handle
+    /// to it. The caller holds the store write lock and the queue gate, and
+    /// must have verified that no write raced the staging phase.
+    fn commit_generation(
         &self,
         inner: &mut super::StoreInner,
         plan: &CompactionPlan,
+        staged: StagedGeneration,
+        remapped: Option<PublishedIndex>,
     ) -> Result<u64> {
-        // Swap the files over their live names; readers keep viewing old
-        // snapshots until each ArcSwap store below.
-        self.vectors
-            .replace_from(&self.dir.join("vectors_tmp.bin"))?;
-        if let Some(q) = self.quant.read().as_ref() {
-            // quant_tmp.bin only exists when quantization is active; its
-            // remapping mirrors the vectors slot map so the quant slot numbers
-            // stay consistent with the live vectors after compaction.
-            let tmp_quant = self.dir.join("quant_tmp.bin");
-            if tmp_quant.exists() {
-                q.replace_from(&tmp_quant, plan.new_capacity, &plan.map)?;
-            }
-        }
-        self.keys.replace_from(&self.dir.join("keys_tmp.bin"))?;
+        let mut meta = plan.meta.clone();
+        meta.slot_capacity = plan.new_capacity;
+        meta.next_slot = plan.live_count;
+        meta.live_count = plan.live_count;
+        meta.tombstone_count = 0;
+        let watermark = meta.last_applied_txn;
 
-        {
-            let live_store = self.dir.join("payloads_store");
-            let tmp_store = self.dir.join("payloads_store_tmp");
-            if tmp_store.exists() {
-                if live_store.exists() {
-                    std::fs::remove_dir_all(&live_store)?;
-                }
-                std::fs::rename(&tmp_store, &live_store)?;
-                let new_ps = super::PayloadStore::open(&live_store)?;
-                self.payload_store.store(Arc::new(Some(new_ps)));
-            }
+        // Validate the staged files before publication: a failure here leaves
+        // the old generation serving and the staging directory unpublished.
+        let staged_files = DataFiles::open(staged.path(), &meta, &self.storage)?;
+        drop(staged_files);
+        let had_index = self.data_arc().index.load().is_some();
+        let old_generation = self.generation.read().clone();
+        let next_generation = old_generation.clone().publish(staged, watermark)?;
+        // Reopen from the published path so every handle's path stays valid
+        // for later growth and checkpoint writes.
+        let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage)?;
+        if let Some(index) = remapped {
+            new_files.index.store(Arc::new(Some(index)));
         }
+        let has_new_index = new_files.index.load().is_some();
+        let old_files = self.files.swap(Arc::new(new_files));
+        *self.generation.write() = next_generation;
 
-        // In-memory rebuild against the new files.
-        self.tombstones
-            .store(Arc::new(TombstoneBits::new(plan.new_capacity as usize)));
+        // Rebuild the in-memory directory against the new slot numbering.
+        // Tombstones are already all-clear in the staged table.
+        inner.meta = meta;
         inner.reverse.clear();
         {
-            let keys_view = self.keys.snapshot();
+            let files = self.data_arc();
+            let keys_view = files.keys.snapshot();
             for slot in 0..plan.live_count as usize {
                 let key = Keys::read_key(&keys_view, slot)?.ok_or_else(|| {
                     VectorSearchError::CorruptData(format!("live slot {slot} has no key"))
                 })?;
-                let id = PointId::from(key);
-                inner.reverse.insert(&id, slot as u32);
+                inner.reverse.insert(&PointId::from(key), slot as u32);
             }
         }
-        inner.meta.slot_capacity = plan.new_capacity;
-        inner.meta.next_slot = plan.live_count;
-        inner.meta.live_count = plan.live_count;
-        inner.meta.tombstone_count = 0;
         {
             // Pre-read all live payloads once for the filter bitmap and
             // payload index rebuilds (slot numbering changed wholesale).
@@ -520,18 +546,6 @@ impl CollectionStore {
                 );
             }
         }
-        // The compacted table has no tombstones left; persist it before meta
-        // so a crash right after the WAL truncate cannot read the old bits
-        // back and mark live slots as deleted.
-        self.tombstones.load().save(&self.dir, plan.new_capacity)?;
-        inner.meta.save(&self.dir)?;
-
-        // Slot numbering changed wholesale, but the topology did not: remap
-        // the published index instead of dropping it. Dropping costs the
-        // collection its ANN tier until the maintenance worker finishes a
-        // full rebuild, for a compaction that only removed tombstones.
-        let had_index = self.index.load().is_some();
-        let remapped = self.remap_published_index(inner, plan);
         // `pending` holds old slot numbers as well.
         {
             let mut pending = self.pending.lock();
@@ -545,27 +559,27 @@ impl CollectionStore {
             *pending = carried;
         }
         self.building.store(false, AtomicOrdering::Relaxed);
-        if remapped {
-            self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
-        } else {
-            // No usable index to carry over (exact-scan collection, a graph
-            // with holes, or a remap that failed validation): go through the
-            // ordinary rebuild path.
-            self.index.store(Arc::new(None));
-            self.pending.lock().clear();
-            if had_index {
-                self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
-            }
-            self.discard_index_files();
-        }
+        self.needs_rebuild
+            .store(had_index && !has_new_index, AtomicOrdering::Relaxed);
 
-        // WAL checkpoint + truncate.
+        // The manifest is published; recovery replays from its lsn even if the
+        // old WAL segments survive a crash here.
         self.wal.append(&WalTxn {
-            txn_id: inner.meta.last_applied_txn,
+            txn_id: watermark,
             ops: vec![WalRecord::Compact],
         })?;
-        self.wal.truncate()?;
+        self.wal.truncate_through(watermark)?;
 
+        // Old mmaps stay valid for readers that loaded them before the swap.
+        // The directory is removed only after the last guard is gone.
+        thread::spawn(move || {
+            while Arc::strong_count(&old_files) > 1 {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if let Err(e) = old_generation.retire() {
+                tracing::warn!(error = %e, "failed to remove superseded generation");
+            }
+        });
         Ok(plan.live_count)
     }
 
@@ -574,30 +588,29 @@ impl CollectionStore {
     /// Compaction renumbers live slots densely in their existing order, so a
     /// surviving point keeps its neighbours and only its id moves. Remapping
     /// the persisted form and rebuilding the in-memory index from it is
-    /// O(nodes · degree); a rebuild — what used to happen here — is
-    /// O(nodes · ef_construct · log n) plus a full k-means for IVF, and the
-    /// collection runs on exact scan until it finishes.
+    /// O(nodes · degree), far cheaper than a full rebuild and keeps the ANN
+    /// tier available throughout compaction.
     ///
-    /// Returns whether a usable index is still published. `false` leaves the
-    /// caller to drop the index and schedule a rebuild: that is the case for
-    /// exact-scan collections, a graph with holes (a live point that never
-    /// entered the graph — its adjacency cannot be invented, and the reload
-    /// path requires a dense node table), and any remap that fails validation.
-    fn remap_published_index(&self, inner: &super::StoreInner, plan: &CompactionPlan) -> bool {
+    /// `None` means there was no usable graph to carry over; the staged
+    /// generation then contains no index files and the maintenance worker
+    /// schedules a rebuild after the swap.
+    fn remapped_index(
+        &self,
+        plan: &CompactionPlan,
+        target_dir: &Path,
+    ) -> Option<PublishedIndex> {
         enum Next {
             Hnsw(crate::index::persist::PersistedHnsw),
             Ivf(crate::index::persist::PersistedIvf),
         }
 
-        // Snapshot under the published guard, then drop it before storing the
-        // replacement: `ArcSwap` reclaims the old value once its guards are
-        // gone.
         let next = {
-            let published = self.index.load();
+            let files = self.data_arc();
+            let published = files.index.load();
             match published.as_ref() {
                 Some(PublishedIndex::Hnsw(index)) => {
                     if !index.covers_all(plan.map.len()) {
-                        return false;
+                        return None;
                     }
                     index.to_persisted().remap(&plan.map).map(Next::Hnsw)
                 }
@@ -610,35 +623,35 @@ impl CollectionStore {
 
         match next {
             Some(Next::Hnsw(remapped)) => {
-                let config = match &inner.meta.index {
+                let config = match &plan.meta.index {
                     IndexConfig::Hnsw(config) => config.clone(),
                     _ => HnswConfig::default(),
                 };
                 let Ok(mut index) = HnswIndex::from_persisted(remapped.clone(), &config) else {
-                    return false;
+                    return None;
                 };
                 index.set_metrics(self.metrics_arc());
-                self.index
-                    .store(Arc::new(Some(PublishedIndex::Hnsw(Arc::new(index)))));
-                if let Err(e) = persist::save_hnsw(&self.dir, &remapped) {
-                    // The graph in memory is correct; only the open-latency
-                    // optimization is lost, and the next open rebuilds.
+                if let Err(e) = persist::save_hnsw(target_dir, &remapped) {
                     tracing::warn!(error = %e, "remapped hnsw.bin save failed");
+                    return None;
                 }
-                true
+                Some(PublishedIndex::Hnsw(Arc::new(index)))
             }
             Some(Next::Ivf(remapped)) => {
-                let config = inner.ivf_config.clone().unwrap_or_default();
+                let config = match &plan.meta.index {
+                    IndexConfig::Ivf(Some(config)) => config.clone(),
+                    _ => Default::default(),
+                };
                 let mut index = IvfIndex::from_persisted(remapped.clone(), config);
                 index.set_metrics(self.metrics_arc());
-                self.index
-                    .store(Arc::new(Some(PublishedIndex::Ivf(Arc::new(index)))));
-                if let Err(e) = persist::save(&self.dir, &remapped) {
+                if let Err(e) = persist::save(target_dir, &remapped) {
                     tracing::warn!(error = %e, "remapped index.bin save failed");
+                    return None;
                 }
-                true
+                Some(PublishedIndex::Ivf(Arc::new(index)))
             }
-            None => false,
+            None => None,
         }
     }
+
 }

@@ -7,7 +7,8 @@ use crate::types::{Payload, PointId};
 impl CollectionStore {
     /// Read the payload for a slot from PayloadStore.
     pub(super) fn read_payload_at(&self, slot: u32) -> Result<Option<Payload>> {
-        let ps_guard = self.payload_store.load();
+        let data = self.data_arc();
+        let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
@@ -29,7 +30,8 @@ impl CollectionStore {
     }
 
     pub(super) fn validate_payload_len(&self, len: usize) -> Result<()> {
-        let ps_guard = self.payload_store.load();
+        let data = self.data_arc();
+        let ps_guard = data.payload_store.load();
         let Some(ps) = ps_guard.as_ref().as_ref() else {
             return Ok(());
         };
@@ -45,7 +47,8 @@ impl CollectionStore {
 
     /// Write a payload for a slot to PayloadStore.
     pub(super) fn write_payload_at(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
-        let ps_guard = self.payload_store.load();
+        let data = self.data_arc();
+        let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
@@ -55,7 +58,8 @@ impl CollectionStore {
 
     /// Delete specific keys from a slot's payload in PayloadStore.
     pub(super) fn delete_keys_at(&self, slot: u32, keys: &[&str]) -> Result<()> {
-        let ps_guard = self.payload_store.load();
+        let data = self.data_arc();
+        let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
@@ -65,7 +69,8 @@ impl CollectionStore {
 
     /// Merge the given fields into a slot's payload in PayloadStore.
     pub(super) fn merge_payload_at(&self, slot: u32, partial: &Payload) -> Result<()> {
-        let ps_guard = self.payload_store.load();
+        let data = self.data_arc();
+        let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
@@ -138,13 +143,14 @@ impl CollectionStore {
 
     /// Resolve a live point's slot or fail with `InvalidPointId`.
     pub(super) fn live_slot_of(&self, id: &PointId) -> Result<u32> {
+        let data = self.data_arc();
         let slot = self
             .inner
             .read()
             .reverse
             .get(id)
             .ok_or_else(|| VectorSearchError::InvalidPointId(id.to_string()))?;
-        if self.tombstones.load().bit(slot as usize) {
+        if data.tombstones.load().bit(slot as usize) {
             return Err(VectorSearchError::InvalidPointId(format!(
                 "point {} is tombstoned",
                 id
@@ -172,7 +178,8 @@ impl CollectionStore {
         inner.payload_indexes.declare(field, schema, capacity)?;
         // Populate from the current live payloads; registration for slots
         // without an indexable value on `field` is a no-op.
-        let tombstones = self.tombstones.load();
+        let data = self.data_arc();
+        let tombstones = data.tombstones.load();
         for slot in 0..inner.meta.next_slot as u32 {
             if tombstones.bit(slot as usize) {
                 continue;
@@ -180,7 +187,7 @@ impl CollectionStore {
             let payload = self.read_payload_at(slot).ok().flatten();
             inner.payload_indexes.register_slot(slot, payload.as_ref());
         }
-        inner.payload_indexes.save_defs(&self.dir)?;
+        inner.payload_indexes.save_defs(&self.data_dir())?;
         Ok(())
     }
 
@@ -191,7 +198,7 @@ impl CollectionStore {
         if !inner.payload_indexes.delete(field) {
             return Ok(false);
         }
-        inner.payload_indexes.save_defs(&self.dir)?;
+        inner.payload_indexes.save_defs(&self.data_dir())?;
         Ok(true)
     }
 

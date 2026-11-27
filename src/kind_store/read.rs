@@ -43,6 +43,11 @@ impl KindStore {
         &self.dir
     }
 
+    /// Directory holding the published generation's data files.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.generation.read().path()
+    }
+
     /// Engine-level storage tuning (unused today; kept for symmetry with the
     /// dense store's checkpoint schedule).
     pub fn storage_config(&self) -> &crate::types::StorageConfig {
@@ -63,18 +68,18 @@ impl KindStore {
     /// was rebuilt from the snapshot because the manifest did not match it —
     /// the state a crash between the manifest write and the snapshot leaves.
     pub fn postings_restored(&self) -> bool {
-        self.postings.was_restored()
+        self.postings.load().was_restored()
     }
 
     /// (bytes of the vector blob file, bytes of the posting buckets). Both are
     /// on disk and mapped, not resident.
     pub fn storage_bytes(&self) -> (u64, u64) {
-        (self.blobs.len(), self.postings.disk_bytes())
+        (self.blobs.load().len(), self.postings.load().disk_bytes())
     }
 
     /// Committed JSON bytes held in `payloads.bin`, outside the snapshot.
     pub fn payload_bytes(&self) -> u64 {
-        self.payloads.len()
+        self.payloads.load().len()
     }
 
     /// Approximate resident size of the live points: the directory, the term
@@ -85,8 +90,8 @@ impl KindStore {
         let directory = inner.points.capacity() as u64
             * std::mem::size_of::<Option<super::KindPoint>>() as u64;
         let norms = (inner.norms.capacity() as u64) * (std::mem::size_of::<(u32, f32)>() as u64);
-        let postings = self.postings.memory_bytes();
-        directory + norms + postings + self.blobs.mapped_bytes()
+        let postings = self.postings.load().memory_bytes();
+        directory + norms + postings + self.blobs.load().mapped_bytes()
     }
 
     /// Number of live points matching `filter`. Pure read.
@@ -155,11 +160,11 @@ impl KindStore {
         let mut candidates: Vec<(u32, f32)> = Vec::new();
         let mut full_scan = false;
         if let VectorData::Sparse { indices, values } = &owned {
-            let hits = posting_hits(&self.postings, indices);
+            let hits = posting_hits(&self.postings.load(), indices);
             full_scan = hits > inner.live_count.saturating_mul(2) as usize;
             if !full_scan {
                 candidates = sparse_candidate_scores(
-                    &self.postings,
+                    &self.postings.load(),
                     &inner.norms,
                     indices,
                     values,
@@ -176,7 +181,8 @@ impl KindStore {
         }
 
         // One borrow of the blob mapping for the whole scoring pass.
-        let reader = self.blobs.reader();
+        let blobs_guard = self.blobs.load();
+        let reader = blobs_guard.reader();
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
             if !accept(slot)? {
@@ -248,7 +254,8 @@ impl KindStore {
         let Some(point) = inner.points[slot as usize].as_ref() else {
             return Ok(None);
         };
-        let reader = self.blobs.reader();
+        let blobs_guard = self.blobs.load();
+        let reader = blobs_guard.reader();
         let Some(data) = reader.to_data(point.blob) else {
             return Ok(None);
         };
@@ -293,8 +300,9 @@ impl KindStore {
         };
         let with_payload = with_payload.unwrap_or(true);
         let with_vector = with_vector.unwrap_or(false);
+        let blobs_guard = self.blobs.load();
         let reader = if with_vector {
-            Some(self.blobs.reader())
+            Some(blobs_guard.reader())
         } else {
             None
         };

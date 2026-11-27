@@ -403,11 +403,15 @@ fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
         "a checkpoint covering the whole log leaves no segment behind"
     );
     assert_eq!(store.wal().appended_bytes(), 0);
-    assert_eq!(
-        std::fs::read_dir(&wal_dir).unwrap().count(),
-        0,
-        "segments are unlinked, not truncated in place"
-    );
+    assert_eq!(store.wal().acked_lsn(), 24);
+    // Segments are unlinked, not truncated in place. The only survivor is
+    // the durable replay watermark published before the unlink.
+    let remaining: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(remaining.len(), 1, "unexpected files: {remaining:?}");
+    assert_eq!(remaining[0], "acked-lsn");
 
     // Appending after the wipe starts a fresh segment and replays cleanly.
     upsert_logged(&store, &point(100, 4));

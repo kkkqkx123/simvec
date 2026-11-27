@@ -86,6 +86,7 @@ impl CollectionStore {
     /// order, after the transaction's WAL batch is durable.
     pub(crate) fn apply_queued_txn(&self, lsn: u64, ops: &[WalRecord]) -> Result<()> {
         let started = std::time::Instant::now();
+        let data = self.data_arc();
         let prev_capacity = self.inner.read().meta.slot_capacity;
         {
             let mut inner = self.inner.write();
@@ -106,7 +107,7 @@ impl CollectionStore {
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 + 1;
             if capacity_changed || count >= self.storage.meta_save_interval {
-                inner.meta.save(&self.dir)?;
+                inner.meta.save(data.dir())?;
                 self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
             }
         }
@@ -208,6 +209,7 @@ impl CollectionStore {
         point: &VectorPoint,
     ) -> Result<()> {
         validate_point(&inner.meta, point)?;
+        let data = self.data_arc();
         let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
 
         // The old bytes are readable only before the write below; afterwards
@@ -216,22 +218,24 @@ impl CollectionStore {
         // so only the distance leg is recorded here.
         self.note_overwrite_distance(inner, slot as u32, point.vector());
 
-        self.vectors.write_slot(slot, point.vector())?;
+        data.vectors.write_slot(slot, point.vector())?;
         // Mirror the vector into quantized storage when ready.
-        if let Some(q) = self.quant.read().as_ref() {
-            if q.is_ready() {
+        if let Some(q) = data.quant.read().as_ref() {
+            let attempt = q.is_ready()
+                || matches!(
+                    q.config().quant_type,
+                    crate::types::QuantizationType::Scalar { .. }
+                        | crate::types::QuantizationType::Binary { .. }
+                );
+            if attempt {
                 if let Err(e) = q.write_slot(slot, point.vector()) {
-                    tracing::warn!(slot, error = %e, "quant write_slot failed; search falls back to exact until rebuild");
-                }
-            } else if matches!(
-                q.config().quant_type,
-                crate::types::QuantizationType::Scalar { .. }
-                    | crate::types::QuantizationType::Binary { .. }
-            ) {
-                // Scalar/Binary are always ready after create/rebuild; attempt to
-                // quantize even when `ready` flag races the build.
-                if let Err(e) = q.write_slot(slot, point.vector()) {
-                    tracing::warn!(slot, error = %e, "quant write_slot raced rebuild; code rebuilt on next build_quantization");
+                    // A stale code can drop the true nearest neighbour from
+                    // the candidate set even when rescore is on. Disable the
+                    // quantized path persistently instead of only warning.
+                    tracing::warn!(slot, error = %e, "quant write_slot failed; disabling quantized search until rebuild");
+                    if let Err(mark) = q.mark_stale() {
+                        tracing::error!(error = %mark, "failed to persist quant not-ready state");
+                    }
                 }
             }
         }
@@ -252,12 +256,13 @@ impl CollectionStore {
     /// the leg counts. Runs under the store write lock; the graph read lock
     /// is leaf-level, matching the store-then-graph order of every reader.
     fn note_overwrite_distance(&self, inner: &StoreInner, slot: u32, new_vector: &[f32]) {
-        let published = self.index.load();
+        let data = self.data_arc();
+        let published = data.index.load();
         let Some(super::index_lifecycle::PublishedIndex::Hnsw(index)) = published.as_ref()
         else {
             return;
         };
-        let vsnap = self.vectors.snapshot();
+        let vsnap = data.vectors.snapshot();
         let Some(old) = super::vectors::Vectors::read_slot(
             &vsnap,
             slot as u64,
@@ -304,7 +309,7 @@ impl CollectionStore {
         slot: u32,
     ) -> Result<()> {
         self.ensure_capacity(inner, slot as u64 + 1)?;
-        self.keys.append_key(slot as usize, &id.to_string())?;
+        self.data_arc().keys.append_key(slot as usize, &id.to_string())?;
         inner.reverse.insert(id, slot);
         // A reserved slot can sit beyond the applied high-water mark; the mark
         // only ever moves forward.
@@ -330,7 +335,8 @@ impl CollectionStore {
     }
 
     pub(super) fn update_tombstone_bit(&self, slot: usize, value: bool) {
-        let next = self.tombstones.load().with_slot(slot, value);
-        self.tombstones.store(Arc::new(next));
+        let data = self.data_arc();
+        let next = data.tombstones.load().with_slot(slot, value);
+        data.tombstones.store(Arc::new(next));
     }
 }

@@ -41,11 +41,6 @@ impl Keys {
         self.dir.sync()
     }
 
-    /// Atomically replace the backing file with a compacted `tmp_path`.
-    pub fn replace_from(&self, tmp_path: &Path) -> Result<()> {
-        self.dir.replace_from(tmp_path)
-    }
-
     /// Record the key for a new slot.
     pub fn append_key(&self, slot: usize, key: &str) -> Result<()> {
         self.dir.append_blob(slot, key.as_bytes(), 0)

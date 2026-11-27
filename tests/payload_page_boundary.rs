@@ -76,7 +76,7 @@ fn allocation_never_straddles_a_page() {
     // plus page 1 head) used to straddle the boundary.
     upsert(&store, 2, 600);
 
-    let sizes = page_sizes(&collection_dir);
+    let sizes = page_sizes(&store.data_dir());
     assert!(!sizes.is_empty());
     for size in &sizes {
         assert_eq!(
@@ -104,7 +104,7 @@ fn allocation_never_straddles_a_page() {
     assert_eq!(store.count(), 4);
     assert_eq!(payload_len(&store, 2), Some(600));
     assert_eq!(payload_len(&store, 1), Some(300));
-    for size in page_sizes(&collection_dir) {
+    for size in page_sizes(&store.data_dir()) {
         assert_eq!(size, storage.payload_page_size as u64);
     }
 }

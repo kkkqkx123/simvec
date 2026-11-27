@@ -107,6 +107,53 @@ impl Pages {
         count
     }
 
+    /// Validate that a persisted pointer stays inside its page file.
+    ///
+    /// Called when the payload store opens: a pointer into a missing or
+    /// shorter page is real corruption, not something the allocator can
+    /// repair after the WAL has been checkpointed away.
+    pub fn validate_pointer(&self, pointer: &ValuePointer, config: &StoreConfig) -> Result<()> {
+        if pointer.is_empty() {
+            return Ok(());
+        }
+        let pages = self.page_files.read();
+        let entry = pages.get(&pointer.page_id).ok_or_else(|| {
+            VectorSearchError::CorruptData(format!(
+                "tracker references missing payload page {}",
+                pointer.page_id
+            ))
+        })?;
+        let start = pointer.block_offset as usize * config.block_size;
+        let end = start
+            .checked_add(pointer.length as usize)
+            .ok_or_else(|| VectorSearchError::CorruptData("payload pointer overflow".into()))?;
+        if end > config.page_size {
+            return Err(VectorSearchError::CorruptData(format!(
+                "tracker payload pointer exceeds one page: page {} offset {} len {}",
+                pointer.page_id, pointer.block_offset, pointer.length
+            )));
+        }
+        let mapped = entry.mmap.read();
+        match mapped.as_ref() {
+            Some(mmap) if end <= mmap.len() => {}
+            Some(mmap) => {
+                return Err(VectorSearchError::CorruptData(format!(
+                    "payload page {} shorter than tracker reference: {} < {}",
+                    pointer.page_id,
+                    mmap.len(),
+                    end
+                )));
+            }
+            None => {
+                return Err(VectorSearchError::CorruptData(format!(
+                    "payload page {} has no data but tracker references it",
+                    pointer.page_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read a value from the pages, following the pointer.
     pub fn read_value(&self, pointer: &ValuePointer, config: &StoreConfig) -> Result<Vec<u8>> {
         if pointer.is_empty() {
