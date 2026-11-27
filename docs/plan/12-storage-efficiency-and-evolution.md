@@ -238,7 +238,7 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 | 向量"进入 `vectors.bin` 风格的分段 mmap" | 新建 `points.bin`（4 字节对齐、12 字节头、4 MiB 分块预分配），`VectorView<'a>` 零拷贝借用 | `vectors.bin` 是 dense 的定长槽位文件，装不了稀疏/多向量/payload |
 | `reverse` 键改成 `PointId` / `u32` | 复用 P1-6 的 `IdMap`（`HashMap<u64,u32>` + `HashMap<String,u32>`） | 同一手法，不重复造 |
 
-保留的部分：快照只存 `{slot, id, blob, payload, norm}` 目录 + `blobs_len`，**向量**全部搬进 `points.bin`（payload 仍是快照里的 JSON 字符串，理由见 13 的"未做与理由"）；`inverted` 从内存 `HashMap` 变成 mmap 上的桶文件，checkpoint 从"重写全部"变成"flush 脏桶"。
+保留的部分：快照只存 `{slot, id, blob, payload_blob, norm}` 目录 + `blobs_len` / `payloads_len`，**向量**全部搬进 `points.bin`、**JSON payload** 搬进 `payloads.bin`（见 [14](14-payload-externalization-and-wal-vectors.md)）；`inverted` 从内存 `HashMap` 变成 mmap 上的桶文件，checkpoint 从“重写全部”变成“flush 脏桶”。
 
 新增两条契约（12 原文没有）：
 
@@ -274,7 +274,7 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 |---|---|---|
 | 1 分段 | 已实施 | `src/storage/wal.rs`：段目录 `wal/<20 位 lsn>.bin`、批次不跨段、`WalState{segments, active, active_last_lsn}`；段容量走 `StorageConfig::wal_segment_bytes`（默认 `DEFAULT_SEGMENT_BYTES = 64 MiB`） |
 | 2 水位截断 | 已实施 | `truncate_through(watermark)`：只 `unlink` 全部事务都 ≤ 水位的段（非尾段看"下一段名 − 1"，尾段看 `active_last_lsn`），跨界段原样保留；`truncate()` 退化为"全删"（丢集合 / 压实用） |
-| 3 向量外置 | **未做** | 会打破"WAL 是唯一权威"，需要崩溃点注入的等价性测试；`kind`/`named` 落盘的 `points.bin` 因此是**派生数据**——回放时按 `WalRecord` 重新 append，不由 WAL 引用 |
+| 3 向量外置 | **未做** | 会打破“WAL 是唯一权威”，需要崩溃点注入的等价性测试；`kind`/`named` 落盘的 `points.bin` 因此是**派生数据**——回放时按 `WalRecord` 重新 append，不由 WAL 引用。完整协议与验收方案见 [14](14-payload-externalization-and-wal-vectors.md) |
 
 两条在落地时才明确下来的细节（原方案没写）：
 

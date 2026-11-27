@@ -72,6 +72,11 @@ impl KindStore {
         (self.blobs.len(), self.postings.disk_bytes())
     }
 
+    /// Committed JSON bytes held in `payloads.bin`, outside the snapshot.
+    pub fn payload_bytes(&self) -> u64 {
+        self.payloads.len()
+    }
+
     /// Approximate resident size of the live points: the directory, the term
     /// dictionary and the pending posting window. The vectors themselves live
     /// in the mapped blob file.

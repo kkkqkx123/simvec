@@ -73,6 +73,11 @@ impl NamedStore {
         )
     }
 
+    /// Committed JSON bytes held in `payloads.bin`, outside the snapshot.
+    pub fn payload_bytes(&self) -> u64 {
+        self.payloads.len()
+    }
+
     /// Approximate resident size: the point directory, the norm caches, the
     /// posting dictionaries and the pending posting window. The vectors
     /// themselves live in the mapped blob file.

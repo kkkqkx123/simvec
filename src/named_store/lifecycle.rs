@@ -6,7 +6,9 @@ use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::point_blobs::{encode_named, encode_vector, rewrite_named, PointBlobs};
+use crate::storage::point_blobs::{
+    encode_named, encode_vector, rewrite_named, BlobRef, PointBlobs,
+};
 use crate::storage::postings::Postings;
 use crate::storage::{IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{CollectionConfig, Payload, PointId, VectorData, VectorKind, VectorSpaceConfig};
@@ -17,6 +19,8 @@ use super::{
 
 /// File holding the append-only point vectors.
 const BLOBS_FILE: &str = "points.bin";
+/// File holding the append-only JSON payloads.
+const PAYLOADS_FILE: &str = "payloads.bin";
 /// Directory holding the per-space postings.
 const POSTINGS_DIR: &str = "postings";
 
@@ -55,6 +59,7 @@ impl NamedStore {
         std::fs::write(dir.join("named.bin"), &bytes)?;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         let blobs = PointBlobs::create(&dir.join(BLOBS_FILE))?;
+        let payloads = PointBlobs::create(&dir.join(PAYLOADS_FILE))?;
         let space_order = space_order(&meta.spaces);
         let postings = open_postings(dir, &meta.spaces, &space_order, None)?;
         Ok(Arc::new(Self {
@@ -70,6 +75,7 @@ impl NamedStore {
             metrics: Metrics::default(),
             snapshot: dir.join("named_snapshot.bin"),
             blobs,
+            payloads,
             postings,
         }))
     }
@@ -87,6 +93,16 @@ impl NamedStore {
             &dir.join(BLOBS_FILE),
             snapshot.as_ref().map(|snapshot| snapshot.blobs_len),
         )?;
+        // No published snapshot means no reachable payload handle; the file
+        // is entirely an uncommitted tail.
+        let payloads = PointBlobs::open(
+            &dir.join(PAYLOADS_FILE),
+            Some(
+                snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.payloads_len),
+            ),
+        )?;
         let space_order = space_order(&meta.spaces);
         let postings = open_postings(dir, &meta.spaces, &space_order, snapshot_lsn)?;
         let rebuild_postings = postings.values().any(|space| !space.was_restored());
@@ -103,6 +119,7 @@ impl NamedStore {
             metrics: Metrics::default(),
             snapshot: snapshot_path,
             blobs,
+            payloads,
             postings,
         });
         if let Some(snapshot) = snapshot {
@@ -122,11 +139,7 @@ impl NamedStore {
         let capacity = snapshot.points.iter().map(|p| p.slot).max().unwrap_or(0) + 1;
         inner.points.resize(capacity as usize, None);
         for point in snapshot.points {
-            let payload: Option<Payload> = point
-                .payload
-                .as_ref()
-                .map(|p| serde_json::from_str(p))
-                .transpose()?;
+            let payload = self.load_payload(point.payload)?;
             // Structural check per space; contents were validated before the
             // point was logged.
             {
@@ -178,6 +191,7 @@ impl NamedStore {
             inner.points[point.slot as usize] = Some(NamedPoint {
                 id: PointId::from(point.id),
                 blob: point.blob,
+                payload_blob: point.payload,
                 payload,
             });
             inner.live_count += 1;
@@ -192,19 +206,21 @@ impl NamedStore {
     /// manifests, then the snapshot that references them, then the log.
     pub fn checkpoint(&self) -> Result<()> {
         let _gate = self.gate.lock();
-        let inner = self.inner.lock();
-        self.checkpoint_from_locked(&inner)
+        let mut inner = self.inner.lock();
+        self.checkpoint_from_locked(&mut inner)
     }
 
-    pub(super) fn checkpoint_from_locked(&self, inner: &Inner) -> Result<()> {
+    pub(super) fn checkpoint_from_locked(&self, inner: &mut Inner) -> Result<()> {
         let lsn = inner.next_lsn.saturating_sub(1);
         self.blobs.sync();
         for postings in self.postings.values() {
             postings.flush(Some(lsn))?;
         }
+        self.checkpoint_payloads(inner)?;
         let snapshot = NamedSnapshot {
             lsn,
             blobs_len: self.blobs.len(),
+            payloads_len: self.payloads.len(),
             points: inner
                 .points
                 .iter()
@@ -214,10 +230,7 @@ impl NamedStore {
                         slot: slot as u32,
                         id: point.id.to_string(),
                         blob: point.blob,
-                        payload: point
-                            .payload
-                            .as_ref()
-                            .and_then(|p| serde_json::to_string(p).ok()),
+                        payload: point.payload_blob,
                         norms: self
                             .sparse_spaces()
                             .filter_map(|(space, index)| {
@@ -275,6 +288,7 @@ impl NamedStore {
                 points.push(Some(NamedPoint {
                     id: point.id,
                     blob,
+                    payload_blob: point.payload_blob,
                     payload: point.payload,
                 }));
             }
@@ -311,8 +325,33 @@ impl NamedStore {
         inner.points = points;
         inner.reverse = reverse;
         inner.norms = norms;
-        self.checkpoint_from_locked(&inner)?;
+        self.checkpoint_from_locked(&mut inner)?;
         Ok(reclaimed)
+    }
+
+    /// Materialize one payload from its committed blob.
+    fn load_payload(&self, blob: Option<BlobRef>) -> Result<Option<Payload>> {
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        let reader = self.payloads.reader();
+        let bytes = reader.bytes(blob).ok_or_else(|| {
+            VectorSearchError::CorruptData("snapshot references a missing payload blob".to_string())
+        })?;
+        Ok(Some(serde_json::from_slice(bytes)?))
+    }
+
+    /// Append JSON for changed payloads only; unchanged handles are reused so
+    /// a checkpoint that follows a vector-only write does not grow the file.
+    fn checkpoint_payloads(&self, inner: &mut Inner) -> Result<()> {
+        for point in inner.points.iter_mut().flatten() {
+            if point.payload.is_some() && point.payload_blob.is_none() {
+                let bytes = serde_json::to_vec(point.payload.as_ref().expect("checked above"))?;
+                point.payload_blob = Some(self.payloads.append(&bytes)?);
+            }
+        }
+        self.payloads.sync();
+        Ok(())
     }
 
     fn replay_txn(&self, txn: &WalTxn) -> Result<()> {
@@ -343,10 +382,11 @@ impl NamedStore {
                 }
                 WalRecord::SetPayload { slot, payload } => {
                     if let Some(Some(point)) = inner.points.get_mut(*slot as usize) {
-                        point.payload = payload
+                        let payload = payload
                             .as_ref()
                             .map(|p| serde_json::from_str(p))
                             .transpose()?;
+                        point.replace_payload(payload);
                     }
                 }
                 WalRecord::DeletePayloadKeys { slot, keys } => {
@@ -356,6 +396,7 @@ impl NamedStore {
                                 payload.remove(key);
                             }
                         }
+                        point.touch_payload();
                     }
                 }
                 WalRecord::SetPayloadField { slot, key, value } => {
@@ -363,6 +404,7 @@ impl NamedStore {
                         let payload = point.payload.get_or_insert_with(Default::default);
                         let value: serde_json::Value = serde_json::from_str(value)?;
                         payload.insert(key.clone(), value);
+                        point.touch_payload();
                     }
                 }
                 WalRecord::Compact => {}
@@ -413,6 +455,7 @@ impl NamedStore {
             id: PointId::from(id),
             blob,
             payload,
+            payload_blob: None,
         }));
         inner.live_count += 1;
         Ok(())
@@ -482,6 +525,7 @@ impl NamedStore {
         inner.points.push(Some(NamedPoint {
             id: existing.id,
             blob,
+            payload_blob: existing.payload_blob,
             payload: existing.payload,
         }));
         inner.live_count += 1;

@@ -157,10 +157,11 @@ impl KindStore {
                 }
                 WalRecord::SetPayload { slot, payload } => {
                     if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
-                        point.payload = payload
+                        let payload = payload
                             .as_ref()
                             .map(|p| serde_json::from_str(p))
                             .transpose()?;
+                        point.replace_payload(payload);
                     }
                 }
                 WalRecord::DeletePayloadKeys { slot, keys } => {
@@ -170,6 +171,7 @@ impl KindStore {
                                 payload.remove(&key);
                             }
                         }
+                        point.touch_payload();
                     }
                 }
                 WalRecord::SetPayloadField { slot, key, value } => {
@@ -177,6 +179,7 @@ impl KindStore {
                         let payload = point.payload.get_or_insert_with(Default::default);
                         let value: serde_json::Value = serde_json::from_str(&value)?;
                         payload.insert(key, value);
+                        point.touch_payload();
                     }
                 }
                 WalRecord::Upsert { .. }

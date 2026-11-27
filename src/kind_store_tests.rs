@@ -545,3 +545,55 @@ fn kind_payload_edits_survive_a_restart_without_touching_vectors() {
     );
     assert_eq!(point.vectors.len(), 1);
 }
+
+#[test]
+fn kind_payloads_are_blobbed_and_reblobbed_on_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    let marker = "kind-payload-outside-snapshot";
+    let big = marker.repeat(64);
+    let id = PointId::from("p1");
+    {
+        let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        let point = sparse_point("p1", &[(1, 1.0)]).with_payload(
+            [("note".to_string(), serde_json::json!(big))]
+                .into_iter()
+                .collect(),
+        );
+        store.upsert_batch(&[point]).unwrap();
+        store.checkpoint().unwrap();
+
+        let bytes = store.payload_bytes();
+        assert!(bytes >= (marker.len() * 64) as u64);
+        let snapshot = std::fs::read(dir.join("kind_snapshot.bin")).unwrap();
+        assert!(
+            !snapshot
+                .windows(marker.len())
+                .any(|w| w == marker.as_bytes()),
+            "checkpointed payload bytes must not be inlined in the snapshot"
+        );
+        // A checkpoint without a payload edit reuses the committed blob.
+        store.checkpoint().unwrap();
+        assert_eq!(store.payload_bytes(), bytes);
+
+        store
+            .set_payload_fields(
+                &id,
+                [("tag".to_string(), serde_json::json!("v2"))]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+        store.checkpoint().unwrap();
+        assert!(store.payload_bytes() > bytes, "an edit must append a new blob");
+    }
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    let point = reopened.get(&id).unwrap().unwrap();
+    assert_eq!(point.payload.as_ref().unwrap()["tag"], serde_json::json!("v2"));
+    assert_eq!(
+        point.payload.as_ref().unwrap()["note"],
+        serde_json::json!(big)
+    );
+}

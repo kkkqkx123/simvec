@@ -589,3 +589,42 @@ fn named_compaction_reclaims_blob_bytes() {
         5
     );
 }
+
+#[test]
+fn named_payloads_are_blobbed_outside_the_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("named");
+    let storage = crate::types::StorageConfig::default();
+    let marker = "named-payload-outside-snapshot";
+    let big = marker.repeat(48);
+    let id = PointId::from("p1");
+    {
+        let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+        let point = point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]).with_payload(
+            [("note".to_string(), serde_json::json!(big))]
+                .into_iter()
+                .collect(),
+        );
+        store.upsert_batch(&[point]).unwrap();
+        store.checkpoint().unwrap();
+
+        assert!(store.payload_bytes() >= (marker.len() * 48) as u64);
+        let snapshot = std::fs::read(dir.join("named_snapshot.bin")).unwrap();
+        assert!(
+            !snapshot
+                .windows(marker.len())
+                .any(|w| w == marker.as_bytes()),
+            "checkpointed payload bytes must not be inlined in the snapshot"
+        );
+        let bytes = store.payload_bytes();
+        store.checkpoint().unwrap();
+        assert_eq!(store.payload_bytes(), bytes);
+    }
+    let reopened = NamedStore::open(&dir, &storage).unwrap();
+    let point = reopened.get(&id).unwrap().unwrap();
+    assert_eq!(
+        point.payload.as_ref().unwrap()["note"],
+        serde_json::json!(big)
+    );
+    assert_eq!(point.vectors.len(), 2);
+}

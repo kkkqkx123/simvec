@@ -7,9 +7,9 @@
 //! The layout mirrors [`crate::kind_store::KindStore`]: the slot table and the
 //! id directory stay in memory, point vectors live in an append-only mmap blob
 //! (`points.bin`, one entry per declared space) and sparse postings live in
-//! per-space bucket files (`postings/<space index>/`). Durability is the WAL
-//! plus a snapshot that references blobs instead of inlining them. No ANN
-//! indexes, no quantization.
+//! per-space bucket files (`postings/<space index>/`), and JSON payloads in
+//! `payloads.bin`. Durability is the WAL plus a snapshot that references blobs
+//! instead of inlining them. No ANN indexes, no quantization.
 
 #[cfg(test)]
 #[path = "named_store_tests.rs"]
@@ -44,6 +44,20 @@ struct NamedPoint {
     id: PointId,
     blob: BlobRef,
     payload: Option<Payload>,
+    /// Handle to the committed JSON bytes in `payloads.bin`; `None` until the
+    /// current payload has been checkpointed.
+    payload_blob: Option<BlobRef>,
+}
+
+impl NamedPoint {
+    fn replace_payload(&mut self, payload: Option<Payload>) {
+        self.payload = payload;
+        self.payload_blob = None;
+    }
+
+    fn touch_payload(&mut self) {
+        self.payload_blob = None;
+    }
 }
 
 /// In-memory mutable state of a named collection.
@@ -86,7 +100,8 @@ struct NamedSnapshotPoint {
     slot: u32,
     id: String,
     blob: BlobRef,
-    payload: Option<String>,
+    /// Handle into `payloads.bin`, not an inlined JSON string.
+    payload: Option<BlobRef>,
     /// Sparse norms by space index, so scoring needs no blob reads at open.
     #[serde(default)]
     norms: Vec<(u16, f32)>,
@@ -97,6 +112,8 @@ struct NamedSnapshot {
     lsn: u64,
     /// Length of `points.bin` this snapshot describes.
     blobs_len: u64,
+    /// Length of `payloads.bin` this snapshot describes.
+    payloads_len: u64,
     points: Vec<NamedSnapshotPoint>,
 }
 
@@ -122,6 +139,8 @@ pub struct NamedStore {
     snapshot: PathBuf,
     /// Append-only vector bytes (`points.bin`).
     blobs: PointBlobs,
+    /// Append-only JSON payload bytes (`payloads.bin`).
+    payloads: PointBlobs,
     /// Sparse postings per space, keyed by space name. Dense and multi spaces
     /// have no entry.
     postings: HashMap<String, Postings>,

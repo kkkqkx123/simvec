@@ -9,7 +9,7 @@
 | 项 | 12 的原方案 | 本轮细化后的做法 | 原因 |
 |---|---|---|---|
 | 倒排文件组织 | `postings/<dim_bucket>.bin`，按 term 排序追加，查询二分定位 | 同样是桶文件 + 按 term 排序追加，但**定位用常驻字典而不是文件内二分**：`term >> 10` 选桶，桶内字典 `term -> [chain]` | 文件内二分要维护每文件的稀疏索引；字典每 term 一条 12 B 记录，打开时一次读完即可，查询变成两次哈希 |
-| 快照瘦身 | `slot -> id` + 向量指针，向量进 mmap | 一致，落地为 `points.bin`（追加式 blob）+ 快照只存 `BlobRef{off,len}`；**payload 仍在快照里** | payload 是变长 JSON，搬走要连带 `payloads_store` 的 slot 寻址改造；它不参与"向量反序列化"这条成本，本轮不动（见"未做与理由"） |
+| 快照瘦身 | `slot -> id` + 向量指针，向量进 mmap | 一致，落地为 `points.bin`（追加式 blob）+ 快照只存 `BlobRef{off,len}`；payload 随后也外置到 `payloads.bin`（见 [14](14-payload-externalization-and-wal-vectors.md)） | 本轮先解决“向量反序列化 + 倒排重建”；变长 JSON 用同一套追加式 blob 格式外置，不需要 dense 的 slot 寻址 |
 | 倒排键类型 | `PointId` / `u32` | 一致：`reverse` 改成 `IdMap`（`HashMap<u64,u32>` + `HashMap<String,u32>`），term 本来就是 `u32` | — |
 | WAL 段名 | `<first_lsn>.bin` | 一致，`{:020}` 补零，惰性创建（第一次真正要写时才建文件） | 避免"空段"这种既占 inode 又要在截断时特判的状态 |
 | WAL 截断 | 只删除 `last_lsn < 水位` 的整段 | 一致，并把"尾段是否被覆盖"的判定做实（见下） | 尾段没有后继段名可比，需要单独记 `active_last_lsn` |
@@ -240,7 +240,7 @@ checkpoint:
 
 ## 未做与理由
 
-1. **payload 仍未外置**（12 第 2 步只做了一半）：`kind_snapshot.bin` 里 payload 还是 JSON 字符串。搬进 `payloads_store` 需要把它的 slot 寻址语义（dense 的 `set_len`/页几何）移植到变长集合，收益是"打开时少读 payload 字节"，与本轮要解决的"向量反序列化 + 倒排重建"不同源。留作独立一项。
+1. **payload 外置已由 [14](14-payload-externalization-and-wal-vectors.md) 落地**：`kind_snapshot.bin` / `named_snapshot.bin` 只存 `payloads.bin` 里的 `BlobRef` 与本文件长度；14 未采用 dense 的 slot 寻址 `payloads_store`，而是复用追加式 blob 文件，避免把页几何移植到变长集合。
 2. **P2-4 第 3 步（向量外置到 WAL 之外）**：会改变"WAL 是唯一权威"这条核心不变式，必须与"水位截断"的语义一起做，并配崩溃点注入的等价性测试。本轮不做。
 3. **稠密空间的倒排**：`named` 的 dense 空间不建倒排（本来就不需要），因此 `postings/<idx>` 目录只在稀疏空间出现。
 4. **旧的 `wal.bin` / 旧 `kind_snapshot.bin` 不做迁移**：与仓库既有策略一致（无向后兼容）。旧集合会在版本/结构校验处失败，由引擎隔离为 `.suspect-<ts>`；`keys.bin` v2 的同类处理见 12 的 P2-2。

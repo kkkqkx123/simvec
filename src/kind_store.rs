@@ -7,8 +7,9 @@
 //! This module hosts a self-contained exact-scan engine for those kinds:
 //!
 //! - slot table with an id -> slot directory ([`IdMap`], split by id type);
-//! - point vectors in an append-only mmap blob file ([`PointBlobs`]), so a
-//!   reopen maps the data instead of deserializing it;
+//! - point vectors and JSON payloads in append-only mmap blob files
+//!   ([`PointBlobs`]), so a reopen maps the data instead of deserializing a
+//!   full snapshot;
 //! - sparse postings in persisted bucket files ([`Postings`]), so a reopen
 //!   loads a term dictionary instead of rebuilding the inverted index;
 //! - weighted dot / Euclid / Manhattan scoring for Sparse and exact MaxSim
@@ -59,6 +60,20 @@ struct KindPoint {
     /// Handle to the vector bytes in `points.bin`.
     blob: BlobRef,
     payload: Option<Payload>,
+    /// Handle to the committed JSON bytes in `payloads.bin`. `None` means the
+    /// in-memory payload has changed since the last checkpoint.
+    payload_blob: Option<BlobRef>,
+}
+
+impl KindPoint {
+    fn replace_payload(&mut self, payload: Option<Payload>) {
+        self.payload = payload;
+        self.payload_blob = None;
+    }
+
+    fn touch_payload(&mut self) {
+        self.payload_blob = None;
+    }
 }
 
 /// In-memory mutable state of a kind collection.
@@ -100,6 +115,8 @@ pub struct KindStore {
     snapshot: PathBuf,
     /// Append-only vector bytes (`points.bin`).
     blobs: PointBlobs,
+    /// Append-only JSON payload bytes (`payloads.bin`).
+    payloads: PointBlobs,
     /// Persisted sparse postings (`postings/`).
     postings: Postings,
 }
@@ -122,7 +139,8 @@ struct KindSnapshotPoint {
     slot: u32,
     id: String,
     blob: BlobRef,
-    payload: Option<String>,
+    /// Handle into `payloads.bin`, not an inlined JSON string.
+    payload: Option<BlobRef>,
     /// Sparse L2 norm, so a reopen needs no blob reads to score.
     #[serde(default)]
     norm: Option<f32>,
@@ -134,6 +152,8 @@ struct KindSnapshot {
     /// Length of `points.bin` this snapshot describes; `PointBlobs::open`
     /// drops anything beyond it.
     blobs_len: u64,
+    /// Length of `payloads.bin` this snapshot describes.
+    payloads_len: u64,
     points: Vec<KindSnapshotPoint>,
 }
 
