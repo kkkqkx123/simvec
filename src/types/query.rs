@@ -35,11 +35,11 @@ pub struct QuantizationSearchParams {
 }
 
 impl QuantizationSearchParams {
-    pub fn default_rescore(&self, quant_type: &crate::types::QuantizationType) -> bool {
-        self.rescore.unwrap_or(matches!(
-            quant_type,
-            crate::types::QuantizationType::Binary { .. }
-        ))
+    pub fn default_rescore(&self, _quant_type: &crate::types::QuantizationType) -> bool {
+        // Quantized traversal is only a candidate generator; survivors are
+        // rescored with exact vectors unless the caller explicitly opts out,
+        // so returned scores keep the exact-score contract on every method.
+        self.rescore.unwrap_or(true)
     }
 }
 

@@ -210,6 +210,12 @@ impl CollectionStore {
         validate_point(&inner.meta, point)?;
         let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
 
+        // The old bytes are readable only before the write below; afterwards
+        // the snapshot holds the new vector and any later comparison reads
+        // zero. The overwrite count stays with graph insertion at drain time,
+        // so only the distance leg is recorded here.
+        self.note_overwrite_distance(inner, slot as u32, point.vector());
+
         self.vectors.write_slot(slot, point.vector())?;
         // Mirror the vector into quantized storage when ready.
         if let Some(q) = self.quant.read().as_ref() {
@@ -238,6 +244,31 @@ impl CollectionStore {
             .payload_indexes
             .register_slot(slot as u32, point.payload.as_ref());
         Ok(())
+    }
+
+    /// Record the overwrite distance leg for an in-graph slot.
+    /// Fresh slots and collections without a published graph have no graph
+    /// position to go stale, so the graph itself decides via presence whether
+    /// the leg counts. Runs under the store write lock; the graph read lock
+    /// is leaf-level, matching the store-then-graph order of every reader.
+    fn note_overwrite_distance(&self, inner: &StoreInner, slot: u32, new_vector: &[f32]) {
+        let published = self.index.load();
+        let Some(super::index_lifecycle::PublishedIndex::Hnsw(index)) = published.as_ref()
+        else {
+            return;
+        };
+        let vsnap = self.vectors.snapshot();
+        let Some(old) = super::vectors::Vectors::read_slot(
+            &vsnap,
+            slot as u64,
+            inner.meta.segment_slots,
+            inner.meta.vector_size,
+        ) else {
+            return;
+        };
+        let delta =
+            (crate::distance::distance(inner.meta.distance, new_vector, old) * 1e6) as u64;
+        index.note_overwrite_delta(slot, delta);
     }
 
     /// Resolve the slot an upsert writes to.

@@ -9,12 +9,10 @@
 //! therefore path-independent.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bitvec::prelude::*;
-use rayon::prelude::*;
 
 use super::directory::DirView;
 use super::index_lifecycle::PublishedIndex;
@@ -133,6 +131,19 @@ impl CollectionStore {
                 return results;
             }
             Some(PublishedIndex::Hnsw(index)) => {
+                // Highly selective filters match fewer slots than one layer-0
+                // pass would score, so the exact scan underneath is cheaper
+                // than the graph walk plus its retries and returns true top-k.
+                let selective = snap.filter_mask.as_ref().is_some_and(|m| {
+                    m.count_ones()
+                        <= query.hnsw_ef().unwrap_or_else(|| index.default_ef())
+                });
+                if selective {
+                    let results =
+                        self.search_exact(query, &snap, metric, next_slot, filtered, started);
+                    drop(published);
+                    return results;
+                }
                 let results = self.search_hnsw(index.as_ref(), query, &snap, &pending);
                 self.metrics
                     .record_search(SearchPath::Hnsw, filtered, started.elapsed());
@@ -160,76 +171,7 @@ impl CollectionStore {
             // Fall through to exact on error.
         }
 
-        // 1. Parallel exact scan with streaming top-K. The parallel heap
-        //    avoids materializing the full (score, slot) set when the
-        //    collection is large, cutting peak memory to O(k). The heap only
-        //    ever holds slots that already passed the full payload filter
-        //    (bitmap pre-check plus `matches`), so the shared post-processing
-        //    below must not filter a second time.
-        let k = query.offset.unwrap_or(0).saturating_add(query.limit);
-        let heap: BinaryHeap<std::cmp::Reverse<ScoredSlot>> = (0..next_slot as u32)
-            .into_par_iter()
-            .filter(|s| !tombstones.bit(*s as usize))
-            .fold(
-                || BinaryHeap::with_capacity(k),
-                |mut acc, s| {
-                    self.exact_scan_step(
-                        &mut acc,
-                        s,
-                        k,
-                        metric,
-                        query,
-                        &SearchSnapshot {
-                            dim,
-                            segment_slots,
-                            tombstones: &tombstones,
-                            vsnap: &vsnap,
-                            keysnap: &keysnap,
-                            filter_mask: snap.filter_mask,
-                            payload_view,
-                        },
-                    );
-                    acc
-                },
-            )
-            .reduce(
-                || BinaryHeap::with_capacity(k),
-                |mut acc, other| {
-                    for item in other.into_iter() {
-                        if acc.len() < k {
-                            acc.push(item);
-                        } else if let Some(std::cmp::Reverse(min)) = acc.peek() {
-                            if item.0 > *min {
-                                acc.pop();
-                                acc.push(item);
-                            }
-                        }
-                    }
-                    acc
-                },
-            );
-
-        let mut candidates: Vec<(f32, u32)> = heap
-            .into_iter()
-            .map(|std::cmp::Reverse(s)| (s.score, s.slot))
-            .collect();
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-
-        self.metrics
-            .record_search(SearchPath::Exact, filtered, started.elapsed());
-        self.finish_scored(
-            candidates,
-            query,
-            &SearchSnapshot {
-                dim,
-                segment_slots,
-                tombstones: &tombstones,
-                vsnap: &vsnap,
-                keysnap: &keysnap,
-                filter_mask: None,
-                payload_view,
-            },
-        )
+        self.search_exact(query, &snap, metric, next_slot, filtered, started)
     }
 }
 

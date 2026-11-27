@@ -6,6 +6,11 @@ use crate::storage::vectors::Vectors;
 
 use super::*;
 
+thread_local! {
+    static GREEDY_NEIGHBORS: std::cell::RefCell<Vec<u32>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
 impl HnswIndex {
     /// Traversal distance for one slot: quantized code distance when a
     /// quantized context is present, exact vector distance otherwise.
@@ -51,17 +56,26 @@ impl HnswIndex {
             let Some(node) = self.node(best.slot) else {
                 return best;
             };
-            let neighbors = node.layer(layer).read().clone();
-            let mut improved = false;
-            for slot in neighbors {
-                let Some(dist) = self.cand_dist(query, qctx, vectors, segment_slots, slot) else {
-                    continue;
-                };
-                if (Cand { dist, slot }).cmp(&best) == std::cmp::Ordering::Less {
-                    best = Cand { dist, slot };
-                    improved = true;
+            // Copy the adjacency into the per-thread buffer under the short
+            // read guard, then score after the guard is released, so writers
+            // are never held across distance math and no vector is allocated.
+            let improved = GREEDY_NEIGHBORS.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                buf.extend_from_slice(&node.layer(layer).read());
+                let mut improved = false;
+                for &slot in buf.iter() {
+                    let Some(dist) = self.cand_dist(query, qctx, vectors, segment_slots, slot)
+                    else {
+                        continue;
+                    };
+                    if (Cand { dist, slot }).cmp(&best) == std::cmp::Ordering::Less {
+                        best = Cand { dist, slot };
+                        improved = true;
+                    }
                 }
-            }
+                improved
+            });
             if !improved {
                 return best;
             }

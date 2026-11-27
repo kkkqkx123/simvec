@@ -1,13 +1,99 @@
 use std::collections::BinaryHeap;
+use std::time::Instant;
+
+use rayon::prelude::*;
 
 use super::super::keys::Keys;
 use super::super::vectors::Vectors;
 use super::super::CollectionStore;
-use crate::types::{PointId, SearchQuery};
+use crate::error::Result;
+use crate::metrics::SearchPath;
+use crate::types::{PointId, SearchQuery, SearchResult};
 
 use super::{ScoredSlot, SearchSnapshot};
 
 impl CollectionStore {
+    /// Parallel exact scan with streaming top-K over every live slot.
+    /// The parallel heap avoids materializing the full (score, slot) set,
+    /// cutting peak memory to O(k). The heap only ever holds slots that
+    /// already passed the full payload filter (bitmap pre-check plus
+    /// `matches`), so the shared post-processing below must not filter a
+    /// second time.
+    pub(super) fn search_exact(
+        &self,
+        query: &SearchQuery,
+        snap: &SearchSnapshot<'_>,
+        metric: crate::types::DistanceMetric,
+        next_slot: u64,
+        filtered: bool,
+        started: Instant,
+    ) -> Result<Vec<SearchResult>> {
+        let k = query.offset.unwrap_or(0).saturating_add(query.limit);
+        let heap: BinaryHeap<std::cmp::Reverse<ScoredSlot>> = (0..next_slot as u32)
+            .into_par_iter()
+            .filter(|s| !snap.tombstones.bit(*s as usize))
+            .fold(
+                || BinaryHeap::with_capacity(k),
+                |mut acc, s| {
+                    self.exact_scan_step(
+                        &mut acc,
+                        s,
+                        k,
+                        metric,
+                        query,
+                        &SearchSnapshot {
+                            dim: snap.dim,
+                            segment_slots: snap.segment_slots,
+                            tombstones: snap.tombstones,
+                            vsnap: snap.vsnap,
+                            keysnap: snap.keysnap,
+                            filter_mask: snap.filter_mask,
+                            payload_view: snap.payload_view,
+                        },
+                    );
+                    acc
+                },
+            )
+            .reduce(
+                || BinaryHeap::with_capacity(k),
+                |mut acc, other| {
+                    for item in other.into_iter() {
+                        if acc.len() < k {
+                            acc.push(item);
+                        } else if let Some(std::cmp::Reverse(min)) = acc.peek() {
+                            if item.0 > *min {
+                                acc.pop();
+                                acc.push(item);
+                            }
+                        }
+                    }
+                    acc
+                },
+            );
+
+        let mut candidates: Vec<(f32, u32)> = heap
+            .into_iter()
+            .map(|std::cmp::Reverse(s)| (s.score, s.slot))
+            .collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        self.metrics
+            .record_search(SearchPath::Exact, filtered, started.elapsed());
+        self.finish_scored(
+            candidates,
+            query,
+            &SearchSnapshot {
+                dim: snap.dim,
+                segment_slots: snap.segment_slots,
+                tombstones: snap.tombstones,
+                vsnap: snap.vsnap,
+                keysnap: snap.keysnap,
+                filter_mask: None,
+                payload_view: snap.payload_view,
+            },
+        )
+    }
+
     /// Single live-slot evaluation for the streaming exact scan.
     ///
     /// The payload filter is evaluated inline so the heap is only ever
