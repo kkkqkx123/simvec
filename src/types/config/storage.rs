@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
 
+/// Payload page value compression.
+///
+/// Stored per value as a codec byte, so mixed generations decode by what
+/// each value carries rather than by the current configuration. Changing
+/// the configuration only affects newly written values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PayloadCompression {
+    /// Raw JSON bytes, no compression.
+    #[default]
+    None,
+    /// LZ4-compressed JSON bytes (block format with prepended size).
+    Lz4,
+}
+
 /// Engine-level storage tuning for the local engine.
 ///
 /// One instance governs every collection under the engine root: these knobs
@@ -25,6 +39,9 @@ pub struct StorageConfig {
     pub payload_block_size: usize,
     /// Payload store page size in bytes.
     pub payload_page_size: usize,
+    /// Payload page value compression for newly written values.
+    #[serde(default)]
+    pub payload_compression: PayloadCompression,
 }
 
 impl Default for StorageConfig {
@@ -36,6 +53,7 @@ impl Default for StorageConfig {
             meta_save_interval: 64,
             payload_block_size: 128,
             payload_page_size: 32 * 1024 * 1024,
+            payload_compression: PayloadCompression::None,
         }
     }
 }
@@ -86,6 +104,7 @@ impl StorageConfig {
         crate::storage::payload_store::StoreConfig {
             block_size: self.payload_block_size,
             page_size: self.payload_page_size,
+            compression: self.payload_compression,
         }
     }
 }

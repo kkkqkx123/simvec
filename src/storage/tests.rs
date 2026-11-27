@@ -1200,3 +1200,126 @@ fn test_generation_advances_with_checkpoint_and_compaction() {
     assert_eq!(reopened.data_dir(), after);
     assert_eq!(reopened.count(), 3);
 }
+
+/// Per-segment accounting tracks garbage and the appendable tail
+/// never compacts on its own.
+#[test]
+fn test_segment_entries_and_selective_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_segments");
+    let store = CollectionStore::create_with_segment_slots(
+        &store_dir,
+        "col_segments",
+        &config(4),
+        4,
+    )
+    .unwrap();
+    for id in 1..=8u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    // Two tombstones in the first frozen segment: 50% garbage.
+    delete_logged(&store, &PointId::from(1u64));
+    delete_logged(&store, &PointId::from(2u64));
+    store.checkpoint().unwrap();
+    let entries = store.segment_entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!((entries[0].start, entries[0].end), (0, 4));
+    assert_eq!(entries[0].tombstone_count, 2);
+    assert_eq!(entries[0].live_count, 2);
+    assert_eq!((entries[1].start, entries[1].end), (4, 8));
+    let picked = store.segments_needing_compaction(0.20);
+    assert_eq!(picked, vec![0], "only the frozen garbage segment compacts");
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 6);
+    let entries = reopened.segment_entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].tombstone_count, 2);
+}
+
+/// A live WAL pin holds the acknowledge back; releasing it lets the
+/// next checkpoint advance.
+#[test]
+fn test_wal_pin_holds_back_truncate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_pin");
+    let store = CollectionStore::create(&store_dir, "col_pin", &config(4)).unwrap();
+    for id in 1..=4u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+    let ack_before = store.wal().acked_lsn();
+    assert!(ack_before > 0);
+    let pin = store.pin_wal_ack(ack_before);
+    assert_eq!(store.lowest_wal_pin(), Some(ack_before));
+    for id in 5..=6u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+    assert_eq!(
+        store.wal().acked_lsn(),
+        ack_before,
+        "a pin at the old watermark must hold the ack back"
+    );
+    assert_eq!(store.count(), 6, "pinned writes stay readable and replayable");
+    drop(pin);
+    assert_eq!(store.lowest_wal_pin(), None);
+    store.checkpoint().unwrap();
+    assert!(
+        store.wal().acked_lsn() >= ack_before,
+        "releasing the pin lets the ack advance"
+    );
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 6);
+}
+
+/// The durable floor is the minimum persisted LSN clamped by pins.
+#[test]
+fn test_durable_floor_reflects_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_floor");
+    let store = CollectionStore::create(&store_dir, "col_floor", &config(4)).unwrap();
+    for id in 1..=3u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+    let floor = store.durable_wal_floor();
+    assert_eq!(floor, store.meta().last_applied_txn);
+    let pin = store.pin_wal_ack(floor);
+    assert_eq!(store.lowest_wal_pin(), Some(floor));
+    assert_eq!(
+        store.durable_wal_floor(),
+        floor.saturating_sub(1),
+        "a pin at the floor holds the durable view back by one"
+    );
+    drop(pin);
+}
+
+/// LZ4-compressed payloads round-trip through checkpoint and reopen.
+#[test]
+fn test_lz4_payloads_round_trip_through_collection() {
+    use crate::types::{PayloadCompression, StorageConfig};
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_lz4");
+    let storage = StorageConfig {
+        payload_compression: PayloadCompression::Lz4,
+        ..StorageConfig::default()
+    };
+    let store = CollectionStore::create_with_storage(&store_dir, "col_lz4", &config(4), &storage)
+        .unwrap();
+    let big = "payload-text ".repeat(300);
+    let mut payload = crate::types::Payload::new();
+    payload.insert("body".to_string(), serde_json::Value::String(big.clone()));
+    payload.insert("tag".to_string(), serde_json::Value::String("lz4".to_string()));
+    upsert_logged(&store, &point_with_payload(1, 4, payload));
+    upsert_logged(&store, &point(2, 4));
+    store.checkpoint().unwrap();
+    drop(store);
+    let reopened =
+        CollectionStore::open_with_storage(&store_dir, &StorageConfig::default()).unwrap();
+    let got = reopened.get(&PointId::Num(1)).unwrap().unwrap();
+    let body = got.payload.as_ref().unwrap().get("body").unwrap();
+    assert_eq!(body.as_str().unwrap(), &big);
+    assert_eq!(reopened.count(), 2);
+}

@@ -225,6 +225,7 @@ impl CollectionStore {
         // on the same id inside one transaction all take effect. A replay of
         // that transaction later still sees the version and is skipped.
         let mut touched: Vec<PointId> = Vec::new();
+        let mut applied_slots: Vec<u32> = Vec::new();
         for op in ops {
             match op {
                 WalRecord::Upsert { point } => {
@@ -234,12 +235,18 @@ impl CollectionStore {
                     }
                     let point = point.to_point()?;
                     self.apply_upsert_locked(inner, &point, lsn)?;
+                    if let Some(slot) = inner.reverse.get(&id) {
+                        applied_slots.push(slot);
+                    }
                     touched.push(id);
                 }
                 WalRecord::Delete { point_id } => {
                     let id = PointId::from(point_id.as_str());
                     if stale_for_id(inner, &id, lsn) {
                         continue;
+                    }
+                    if let Some(slot) = inner.reverse.get(&id) {
+                        applied_slots.push(slot);
                     }
                     self.apply_delete_locked(inner, &id)?;
                     touched.push(id);
@@ -249,6 +256,9 @@ impl CollectionStore {
                         let id = PointId::from(id.as_str());
                         if stale_for_id(inner, &id, lsn) {
                             continue;
+                        }
+                        if let Some(slot) = inner.reverse.get(&id) {
+                            applied_slots.push(slot);
                         }
                         self.apply_delete_locked(inner, &id)?;
                         touched.push(id);
@@ -267,6 +277,7 @@ impl CollectionStore {
                     };
                     self.write_payload_at(slot, parsed.as_ref(), lsn)?;
                     self.refresh_filter_bitmap_locked(inner, slot);
+                    applied_slots.push(slot);
                 }
                 WalRecord::DeletePayloadKeys { point_id, keys } => {
                     let Some(slot) = self.payload_slot_of_locked(inner, point_id) else {
@@ -275,6 +286,7 @@ impl CollectionStore {
                     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
                     self.delete_keys_at(slot, &key_refs, lsn)?;
                     self.refresh_filter_bitmap_locked(inner, slot);
+                    applied_slots.push(slot);
                 }
                 WalRecord::SetPayloadField {
                     point_id,
@@ -288,6 +300,7 @@ impl CollectionStore {
                     let partial = Payload::from([(key.clone(), parsed)]);
                     self.merge_payload_at(slot, &partial, lsn)?;
                     self.refresh_filter_bitmap_locked(inner, slot);
+                    applied_slots.push(slot);
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
                 WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
@@ -301,6 +314,21 @@ impl CollectionStore {
         }
         for id in touched {
             inner.versions.insert_value(&id, lsn);
+        }
+        if !applied_slots.is_empty() && inner.meta.segment_slots != 0 {
+            let segment_slots = inner.meta.segment_slots;
+            let needed = applied_slots
+                .iter()
+                .map(|s| super::segments::segment_index(*s as u64, segment_slots) + 1)
+                .max()
+                .unwrap_or(0);
+            inner.ensure_segment_len(needed);
+            for slot in applied_slots {
+                let index = super::segments::segment_index(slot as u64, segment_slots);
+                if let Some(cell) = inner.segment_applied.get_mut(index) {
+                    *cell = (*cell).max(lsn);
+                }
+            }
         }
         Ok(())
     }

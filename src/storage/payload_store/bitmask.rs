@@ -383,7 +383,8 @@ mod tests {
     fn test_config() -> StoreConfig {
         StoreConfig {
             block_size: 128,
-            page_size: 1024, // 8 blocks per page
+            page_size: 1024,
+            compression: crate::types::PayloadCompression::None, // 8 blocks per page
         }
     }
 
@@ -413,7 +414,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = StoreConfig {
             block_size: 128,
-            page_size: 256, // 2 blocks per page
+            page_size: 256,
+            compression: crate::types::PayloadCompression::None, // 2 blocks per page
         };
         let bm = MmapBitmask::create(dir.path(), &config).unwrap();
 

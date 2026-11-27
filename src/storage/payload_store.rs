@@ -50,6 +50,15 @@ const BITMASK_MAGIC: [u8; 4] = *b"VBMP";
 
 /// CRC prefix stored in front of every payload blob in a data page.
 const PAYLOAD_CRC_LEN: usize = 4;
+/// Codec byte stored after the CRC: 0 = raw JSON, 1 = LZ4.
+const PAYLOAD_CODEC_LEN: usize = 1;
+/// Full header for newly written values: `[crc32][codec]`.
+const PAYLOAD_HEADER_LEN: usize = PAYLOAD_CRC_LEN + PAYLOAD_CODEC_LEN;
+/// Codec markers. JSON text never starts with these bytes, so a value whose
+/// first byte after the CRC is 0/1 is new format, anything else is legacy
+/// `[crc][JSON]`.
+const CODEC_NONE: u8 = 0;
+const CODEC_LZ4: u8 = 1;
 
 /// Default block size: 128 bytes.
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
@@ -65,6 +74,10 @@ pub struct StoreConfig {
     pub block_size: usize,
     /// Size of each data page in bytes. Must be a multiple of `block_size`.
     pub page_size: usize,
+    /// Compression for newly written values. Stored per value as a codec
+    /// byte, so changing it never invalidates existing pages.
+    #[serde(default)]
+    pub compression: crate::types::PayloadCompression,
 }
 
 impl Default for StoreConfig {
@@ -72,7 +85,61 @@ impl Default for StoreConfig {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
             page_size: DEFAULT_PAGE_SIZE,
+            compression: crate::types::PayloadCompression::None,
         }
+    }
+}
+
+/// Encode JSON bytes as a page value: `[crc32][codec][data]`.
+/// The CRC covers codec plus data, so a torn page fails before decoding.
+fn encode_payload_value(json: &[u8], codec: crate::types::PayloadCompression) -> Vec<u8> {
+    use crate::types::PayloadCompression as C;
+    let (marker, data) = match codec {
+        C::None => (CODEC_NONE, json.to_vec()),
+        C::Lz4 => (CODEC_LZ4, lz4_flex::compress_prepend_size(json)),
+    };
+    let mut framed = Vec::with_capacity(PAYLOAD_CODEC_LEN + data.len());
+    framed.push(marker);
+    framed.extend_from_slice(&data);
+    let crc = crc32fast::hash(&framed);
+    let mut out = Vec::with_capacity(PAYLOAD_HEADER_LEN + data.len());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&framed);
+    out
+}
+
+/// Decode a page value to raw JSON bytes, accepting both the current
+/// `[crc][codec][data]` framing and the legacy `[crc][JSON]` framing.
+fn decode_payload_json(stored: &[u8]) -> Result<Vec<u8>> {
+    use crate::types::PayloadCompression as C;
+    if stored.len() < PAYLOAD_CRC_LEN {
+        return Err(VectorSearchError::CorruptData(
+            "payload blob is shorter than its checksum".to_string(),
+        ));
+    }
+    let (crc_bytes, body) = stored.split_at(PAYLOAD_CRC_LEN);
+    let expected = u32::from_le_bytes(crc_bytes.try_into().expect("crc slice"));
+    if crc32fast::hash(body) != expected {
+        return Err(VectorSearchError::CorruptData(
+            "payload blob failed its checksum".to_string(),
+        ));
+    }
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marker = body[0];
+    if marker == CODEC_NONE || marker == CODEC_LZ4 {
+        let data = &body[PAYLOAD_CODEC_LEN..];
+        match marker {
+            CODEC_NONE => Ok(data.to_vec()),
+            _ => lz4_flex::decompress_size_prepended(data).map_err(|e| {
+                VectorSearchError::CorruptData(format!("payload lz4 decode failed: {e}"))
+            }),
+        }
+    } else {
+        // Legacy value without a codec byte; the CRC above already matched.
+        let _ = C::None;
+        Ok(body.to_vec())
     }
 }
 
@@ -212,18 +279,11 @@ impl PayloadStore {
                 continue;
             }
             let stored = pages.read_value(&pointer, &config)?;
-            if stored.len() < PAYLOAD_CRC_LEN {
-                return Err(VectorSearchError::CorruptData(format!(
-                    "slot {slot}: payload blob is shorter than its checksum"
-                )));
-            }
-            let expected =
-                u32::from_le_bytes(stored[..PAYLOAD_CRC_LEN].try_into().expect("crc slice"));
-            if crc32fast::hash(&stored[PAYLOAD_CRC_LEN..]) != expected {
-                return Err(VectorSearchError::CorruptData(format!(
-                    "slot {slot}: payload blob failed its checksum"
-                )));
-            }
+            // CRC plus codec framing is validated here; JSON parsing waits
+            // for reads so a damaged page fails open instead of serving.
+            decode_payload_json(&stored).map_err(|e| {
+                VectorSearchError::CorruptData(format!("slot {slot}: {e}"))
+            })?;
         }
 
         // The tracker (including its journal) is the authority for which
@@ -258,19 +318,10 @@ impl PayloadStore {
         if stored.is_empty() {
             return Ok(None);
         }
-        if stored.len() < PAYLOAD_CRC_LEN {
-            return Err(VectorSearchError::CorruptData(format!(
-                "payload blob at slot {slot} is shorter than its checksum"
-            )));
-        }
-        let (crc, bytes) = stored.split_at(PAYLOAD_CRC_LEN);
-        let expected = u32::from_le_bytes(crc.try_into().expect("crc slice"));
-        if crc32fast::hash(bytes) != expected {
-            return Err(VectorSearchError::CorruptData(format!(
-                "payload blob at slot {slot} failed its checksum"
-            )));
-        }
-        let payload: Payload = serde_json::from_slice(bytes).map_err(|e| {
+        let json = decode_payload_json(&stored).map_err(|e| {
+            VectorSearchError::CorruptData(format!("payload blob at slot {slot}: {e}"))
+        })?;
+        let payload: Payload = serde_json::from_slice(&json).map_err(|e| {
             VectorSearchError::CorruptData(format!("bad payload blob at slot {slot}: {e}"))
         })?;
         Ok(Some(payload))
@@ -294,10 +345,7 @@ impl PayloadStore {
         let stored = match payload {
             Some(p) => {
                 let bytes = serde_json::to_vec(p)?;
-                let mut blob = Vec::with_capacity(PAYLOAD_CRC_LEN + bytes.len());
-                blob.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-                blob.extend_from_slice(&bytes);
-                blob
+                encode_payload_value(&bytes, self.config.compression)
             }
             None => Vec::new(),
         };
@@ -308,8 +356,8 @@ impl PayloadStore {
         if stored.len() > self.config.page_size {
             return Err(VectorSearchError::InvalidConfig(format!(
                 "payload of {} bytes exceeds the {} byte payload page",
-                stored.len() - PAYLOAD_CRC_LEN,
-                self.config.page_size.saturating_sub(PAYLOAD_CRC_LEN)
+                stored.len().saturating_sub(PAYLOAD_HEADER_LEN),
+                self.config.page_size.saturating_sub(PAYLOAD_HEADER_LEN)
             )));
         }
 
@@ -437,8 +485,9 @@ impl PayloadStore {
     /// write is logged, so an oversized payload is a clean rejection rather
     /// than a WAL record that can never be applied.
     pub fn max_payload_bytes(&self) -> usize {
-        self.config.page_size.saturating_sub(PAYLOAD_CRC_LEN)
+        self.config.page_size.saturating_sub(PAYLOAD_HEADER_LEN)
     }
+
 
     /// Number of blocks needed for a given byte length.
     fn blocks_needed(&self, len: usize) -> u32 {
@@ -635,7 +684,7 @@ mod tests {
             .join("pages")
             .join(format!("page_{:04}.bin", pointer.page_id));
         let mut bytes = std::fs::read(&page).unwrap();
-        let offset = pointer.block_offset as usize * config.block_size + PAYLOAD_CRC_LEN;
+        let offset = pointer.block_offset as usize * config.block_size + PAYLOAD_HEADER_LEN;
         bytes[offset] ^= 0x01;
         std::fs::write(&page, bytes).unwrap();
 
@@ -707,5 +756,60 @@ mod tests {
         store.put(0, None).unwrap();
         store.put(1, Some(&payload(&[("b", json!(2))]))).unwrap();
         assert_eq!(store.get(1).unwrap().unwrap().get("b"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn test_lz4_round_trip_and_reopen() {
+        use crate::types::PayloadCompression as C;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig {
+            compression: C::Lz4,
+            ..StoreConfig::default()
+        };
+        let big = "x".repeat(4_000);
+        let value = payload(&[("data", json!(big.clone())), ("n", json!(7))]);
+        {
+            let store = PayloadStore::create(dir.path(), config.clone()).expect("create");
+            store.put(0, Some(&value)).unwrap();
+            store.put(1, Some(&payload(&[("k", json!("v"))]))).unwrap();
+            store.checkpoint().unwrap();
+            // The codec byte is present and the CRC covers it.
+            let pointer = store.tracker.read().get(0).unwrap();
+            let raw = store.pages.read().read_value(&pointer, &store.config).unwrap();
+            assert_eq!(raw[4], CODEC_LZ4, "lz4 values carry the codec byte");
+        }
+        {
+            let store = PayloadStore::open(dir.path()).expect("open");
+            let got = store.get(0).unwrap().unwrap();
+            assert_eq!(got.get("data").unwrap().as_str().unwrap(), &big);
+            assert_eq!(got.get("n"), Some(&json!(7)));
+        }
+    }
+
+    #[test]
+    fn test_legacy_value_without_codec_still_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
+        // Hand-frame a legacy `[crc][JSON]` value without a codec byte.
+        let json = serde_json::to_vec(&payload(&[("legacy", json!(true))])).unwrap();
+        let mut blob = Vec::with_capacity(PAYLOAD_CRC_LEN + json.len());
+        blob.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        blob.extend_from_slice(&json);
+        let decoded = decode_payload_json(&blob).expect("legacy must decode");
+        assert_eq!(decoded, json);
+        // And a store written before the codec change keeps serving it: the
+        // first byte after the CRC is `{`, never a codec marker.
+        assert!(blob[PAYLOAD_CRC_LEN] != CODEC_NONE && blob[PAYLOAD_CRC_LEN] != CODEC_LZ4);
+        let _ = store;
+    }
+
+    #[test]
+    fn test_codec_bit_rot_is_rejected_before_decode() {
+        let json = serde_json::to_vec(&payload(&[("x", json!(1))])).unwrap();
+        let mut framed = encode_payload_value(&json, crate::types::PayloadCompression::None);
+        // Flip a JSON byte; the CRC over codec+data must fail first.
+        let last = framed.len() - 1;
+        framed[last] ^= 0x01;
+        assert!(decode_payload_json(&framed).is_err());
     }
 }

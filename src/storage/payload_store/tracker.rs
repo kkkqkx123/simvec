@@ -342,6 +342,7 @@ mod tests {
         StoreConfig {
             block_size: 128,
             page_size: 1024,
+            compression: crate::types::PayloadCompression::None,
         }
     }
 

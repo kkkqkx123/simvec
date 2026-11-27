@@ -117,7 +117,7 @@ impl Pages {
         if pointer.is_empty() {
             return Ok(());
         }
-        if (pointer.length as usize) < super::PAYLOAD_CRC_LEN {
+        if (pointer.length as usize) < super::PAYLOAD_HEADER_LEN {
             return Err(VectorSearchError::CorruptData(format!(
                 "payload pointer at page {} offset {} is shorter than its checksum",
                 pointer.page_id, pointer.block_offset
@@ -301,6 +301,7 @@ mod tests {
         StoreConfig {
             block_size: 128,
             page_size: 1024,
+            compression: crate::types::PayloadCompression::None,
         }
     }
 

@@ -377,7 +377,11 @@ impl CollectionStore {
         // Lock-free attempts: hold build_mutex together with compact_mutex
         // (order: compact -> build) so index/quant builds cannot interleave
         // slot renumbering. The build guard is scoped per attempt so a race
-        // retry does not stall builds for the whole compaction.
+        // retry does not stall builds for the whole compaction. An explicit
+        // compact reclaims every tombstone; the per-segment selection stays
+        // advisory for scheduling and future physical splits, not a gate.
+        let advisory = self.segments_needing_compaction(self.storage.compaction_threshold);
+        tracing::debug!(selected = ?advisory, "compaction segment selection");
         for _ in 0..COMMIT_ATTEMPTS {
             let _build_guard = self.build_mutex.lock();
             let plan = {
@@ -597,7 +601,17 @@ impl CollectionStore {
             tombstones: Vec::new(),
         };
         DenseSnapshot::write(dir, &snapshot)?;
-        segments::write(dir, meta.segment_slots, meta.next_slot)?;
+        // Freshly compacted generations carry no tombstones: every segment
+        // is fully live, so the manifest can record zero garbage directly.
+        {
+            let entries = segments::derive_entries(
+                meta.next_slot,
+                meta.segment_slots,
+                |_| false,
+                meta.last_applied_txn,
+            );
+            segments::write_with_entries(dir, meta.segment_slots, meta.next_slot, &entries)?;
+        }
         meta.save(dir)?;
 
         let hnsw = match &meta.index {
@@ -712,10 +726,10 @@ impl CollectionStore {
         // The manifest is published; recovery replays from its lsn even if the
         // old WAL segments survive a crash here. The gate is drained, so no
         // transaction is newer than the watermark: truncating through it
-        // empties the log. No marker is written — the surviving generation
-        // lsn plus the published ack pin the replay floor, and the next
-        // allocated LSN cannot collide.
-        self.wal.truncate_through(watermark)?;
+        // empties the log, clamped by live snapshot pins. No marker is
+        // written — the surviving generation lsn plus the published ack pin
+        // the replay floor, and the next allocated LSN cannot collide.
+        self.truncate_wal_through(watermark)?;
 
         // Old mmaps stay valid for readers that loaded them before the swap.
         // The directory is removed only after the last guard is gone.

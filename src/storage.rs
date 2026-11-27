@@ -44,7 +44,8 @@ pub(crate) mod postings;
 pub(crate) mod payload_store;
 pub(crate) mod quant;
 mod queue;
-mod segments;
+pub(crate) mod segments;
+mod wal_ack;
 mod search;
 mod segment_hnsw;
 mod segment_ivf;
@@ -75,6 +76,7 @@ pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
 pub use snapshot::{verify_snapshot, SnapshotInfo};
 pub(crate) use tombstones::TombstoneBits;
+pub(crate) use wal_ack::{WalAckPinGuard, WalAckPins};
 pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 
 use self::filter_bitmap::FilterBitmap;
@@ -248,6 +250,35 @@ struct StoreInner {
     filter_bitmap: FilterBitmap,
     /// Declared per-field payload indexes (MapIndex / NumericIndex).
     payload_indexes: PayloadIndexManager,
+    /// Highest applied LSN per dense segment index. Advanced on every
+    /// applied batch for the segments its slots touch; drives the flush
+    /// water mark without a global stop-the-world pass.
+    segment_applied: Vec<u64>,
+    /// Highest durable LSN per dense segment index. Advanced by checkpoint
+    /// once the segment files covering it are synced; the WAL ack is the
+    /// minimum over all segments, clamped by live pins.
+    segment_persisted: Vec<u64>,
+}
+
+impl StoreInner {
+    /// Ensure per-segment water marks cover `segment_count` segments.
+    pub(super) fn ensure_segment_len(&mut self, segment_count: usize) {
+        if self.segment_applied.len() < segment_count {
+            self.segment_applied.resize(segment_count, 0);
+        }
+        if self.segment_persisted.len() < segment_count {
+            self.segment_persisted.resize(segment_count, 0);
+        }
+    }
+
+    /// Minimum durable LSN over all tracked segments, or the generation
+    /// water mark when no segment has been tracked yet.
+    pub(super) fn min_persisted(&self, fallback: u64) -> u64 {
+        if self.segment_persisted.is_empty() {
+            return fallback;
+        }
+        self.segment_persisted.iter().copied().min().unwrap_or(fallback)
+    }
 }
 
 thread_local! {
@@ -377,6 +408,10 @@ pub struct CollectionStore {
     storage: StorageConfig,
     inner: RwLock<StoreInner>,
     wal: Wal,
+    /// Live WAL acknowledge pins. Snapshots and copies pin the log before
+    /// capturing files so a concurrent checkpoint cannot unlink the segments
+    /// they still need. Truncation always clamps to the lowest pin.
+    wal_pins: WalAckPins,
     /// Commit queue: group commit for the WAL plus the single applier thread.
     /// Shared with that thread, which observes the store through a weak
     /// reference so a dropped collection is never kept alive by it.
@@ -440,7 +475,10 @@ impl CollectionStore {
     /// The maintenance lock, queue gate and store read lock are held for the
     /// whole copy: no checkpoint can truncate the log, no compaction can swap
     /// the generation and no config write can replace `meta.bin` while files
-    /// are being read. Because the copied WAL is complete at that point, the
+    /// are being read. A WAL acknowledge pin is also registered over the
+    /// copy window, so a future concurrent checkpoint that no longer holds
+    /// the gate for the whole copy still cannot unlink the segments being
+    /// read. Because the copied WAL is complete at that point, the
     /// manifest's replay floor pins a self-consistent restore point.
     pub fn snapshot_to(&self, dest: impl AsRef<Path>) -> Result<SnapshotInfo> {
         let dest = dest.as_ref();
@@ -455,6 +493,10 @@ impl CollectionStore {
         let _gate = self.queue.quiesce();
         let _inner = self.inner.read();
         let generation = self.generation.read().clone();
+        let pin = self.pin_wal_ack(generation.lsn());
+        pin.set(generation.lsn());
+        debug_assert_eq!(pin.version(), generation.lsn());
+        let _pin = pin;
 
         std::fs::create_dir_all(dest)?;
         let mut files = Vec::new();
@@ -495,6 +537,70 @@ impl CollectionStore {
             )));
         }
         Ok(())
+    }
+
+    /// Pin the WAL acknowledge at `version` for the lifetime of the guard.
+    /// Callers capture files first under the pin, then release it.
+    pub(crate) fn pin_wal_ack(&self, version: u64) -> WalAckPinGuard {
+        self.wal_pins.pin(version)
+    }
+
+    /// Lowest pinned acknowledge version, if any pin is live.
+    pub(crate) fn lowest_wal_pin(&self) -> Option<u64> {
+        self.wal_pins.lowest()
+    }
+
+    /// Truncate the WAL through `watermark`, clamped by live pins.
+    /// A pin at or below the watermark holds the truncate back so a
+    /// snapshot or copy window keeps the segments it still needs.
+    pub(crate) fn truncate_wal_through(&self, watermark: u64) -> Result<()> {
+        let effective = match self.lowest_wal_pin() {
+            Some(lowest) if lowest <= watermark => lowest.saturating_sub(1),
+            _ => watermark,
+        };
+        if effective == 0 && watermark != 0 {
+            return Ok(());
+        }
+        self.wal.truncate_through(effective)
+    }
+
+    /// Mark every tracked segment durable through `watermark` after a
+    /// successful flush. Failures leave the marks untouched so the ack
+    /// cannot advance past unwritten bytes.
+    fn note_segments_persisted(&self, inner: &mut StoreInner, watermark: u64) {
+        let segment_slots = inner.meta.segment_slots;
+        let count = if segment_slots == 0 || inner.meta.next_slot == 0 {
+            0
+        } else {
+            inner.meta.next_slot.div_ceil(segment_slots as u64) as usize
+        };
+        inner.ensure_segment_len(count);
+        for cell in inner.segment_persisted.iter_mut() {
+            *cell = (*cell).max(watermark);
+        }
+    }
+
+    /// Snapshot-facing view of the flush water mark: the minimum durable
+    /// LSN over all segments, clamped by live pins.
+    pub fn durable_wal_floor(&self) -> u64 {
+        let inner = self.inner.read();
+        let floor = inner.min_persisted(inner.meta.last_applied_txn);
+        self.wal_pins.clamp(floor)
+    }
+
+    /// Per-segment live/tombstone accounting for the current generation.
+    pub(crate) fn segment_entries(&self) -> Vec<segments::SegmentEntry> {
+        let inner = self.inner.read();
+        let tombstones = self.data_arc().tombstones.load();
+        let watermark = inner.meta.last_applied_txn;
+        let next_slot = inner.meta.next_slot;
+        let segment_slots = inner.meta.segment_slots;
+        segments::derive_entries(next_slot, segment_slots, |s| tombstones.bit(s), watermark)
+    }
+
+    /// Starts of frozen segments whose garbage ratio meets `threshold`.
+    pub(crate) fn segments_needing_compaction(&self, threshold: f64) -> Vec<u32> {
+        segments::select_for_compaction(&self.segment_entries(), threshold)
     }
 
     // ── Payload routing helpers ────────────────────────────────────────

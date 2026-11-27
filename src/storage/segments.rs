@@ -16,11 +16,40 @@ use crate::error::Result;
 const SEGMENTS_FILE: &str = "segments.json";
 const FORMAT_VERSION: u32 = 1;
 
+/// Per-segment persisted accounting. Derived from `meta.bin` plus the
+/// tombstone table; the manifest is never authoritative over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct SegmentEntry {
+    /// First slot of the segment.
+    pub start: u32,
+    /// One past the last slot covered by this entry.
+    pub end: u32,
+    /// Live slots in `[start, end)`.
+    pub live_count: u64,
+    /// Tombstoned slots in `[start, end)`.
+    pub tombstone_count: u64,
+    /// Highest LSN known durable for this segment at publish time.
+    pub persisted_lsn: u64,
+}
+
+impl SegmentEntry {
+    /// Fraction of garbage in the segment, for compaction planning.
+    pub(crate) fn garbage_ratio(&self) -> f64 {
+        let total = self.live_count + self.tombstone_count;
+        if total == 0 {
+            return 0.0;
+        }
+        self.tombstone_count as f64 / total as f64
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     segment_slots: u32,
     next_slot: u64,
+    #[serde(default)]
+    segments: Vec<SegmentEntry>,
 }
 
 /// Frozen prefix and appendable tail of one published generation.
@@ -58,6 +87,77 @@ impl SegmentSet {
     }
 }
 
+/// Which segment a slot belongs to.
+pub(crate) fn segment_index(slot: u64, segment_slots: u32) -> usize {
+    if segment_slots == 0 {
+        return 0;
+    }
+    (slot / segment_slots as u64) as usize
+}
+
+/// Slot range covered by one segment index, clipped to `next_slot`.
+pub(crate) fn segment_range(index: usize, segment_slots: u32, next_slot: u64) -> (u32, u32) {
+    if segment_slots == 0 {
+        return (0, next_slot.min(u32::MAX as u64) as u32);
+    }
+    let start = index as u64 * segment_slots as u64;
+    let end = ((index as u64 + 1) * segment_slots as u64).min(next_slot);
+    (start.min(u32::MAX as u64) as u32, end.min(u32::MAX as u64) as u32)
+}
+
+/// Derive per-segment live/tombstone counts by scanning the tombstone table.
+///
+/// The caller passes a slot predicate so this module stays decoupled from the
+/// tombstone representation; production passes the live tombstone bits.
+pub(crate) fn derive_entries(
+    next_slot: u64,
+    segment_slots: u32,
+    mut is_tombstoned: impl FnMut(usize) -> bool,
+    persisted_lsn: u64,
+) -> Vec<SegmentEntry> {
+    if segment_slots == 0 || next_slot == 0 {
+        return Vec::new();
+    }
+    let count = next_slot.div_ceil(segment_slots as u64) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let (start, end) = segment_range(index, segment_slots, next_slot);
+        let mut live = 0u64;
+        let mut tomb = 0u64;
+        for slot in start..end {
+            if is_tombstoned(slot as usize) {
+                tomb += 1;
+            } else {
+                live += 1;
+            }
+        }
+        entries.push(SegmentEntry {
+            start,
+            end,
+            live_count: live,
+            tombstone_count: tomb,
+            persisted_lsn,
+        });
+    }
+    entries
+}
+
+/// Segments whose garbage ratio meets `threshold`. The appendable tail is
+/// never selected: it is still receiving writes, so compacting it would race
+/// the write path without reclaiming stable garbage.
+pub(crate) fn select_for_compaction(entries: &[SegmentEntry], threshold: f64) -> Vec<u32> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let appendable = entries.last().map(|e| e.start).unwrap_or(0);
+    entries
+        .iter()
+        .filter(|e| e.start != appendable || entries.len() == 1)
+        .filter(|e| e.garbage_ratio() >= threshold && e.tombstone_count > 0)
+        .map(|e| e.start)
+        .collect()
+}
+
 /// Publish the derived segment manifest for a generation.
 pub(crate) fn write(dir: &Path, segment_slots: u32, next_slot: u64) -> Result<()> {
     snapshot::write(
@@ -66,8 +166,41 @@ pub(crate) fn write(dir: &Path, segment_slots: u32, next_slot: u64) -> Result<()
             version: FORMAT_VERSION,
             segment_slots,
             next_slot,
+            segments: Vec::new(),
         },
     )
+}
+
+/// Publish the manifest together with per-segment accounting.
+pub(crate) fn write_with_entries(
+    dir: &Path,
+    segment_slots: u32,
+    next_slot: u64,
+    entries: &[SegmentEntry],
+) -> Result<()> {
+    snapshot::write(
+        &dir.join(SEGMENTS_FILE),
+        &Manifest {
+            version: FORMAT_VERSION,
+            segment_slots,
+            next_slot,
+            segments: entries.to_vec(),
+        },
+    )
+}
+
+/// Load persisted per-segment accounting, if the manifest carries current data.
+pub(crate) fn read_entries(dir: &Path, segment_slots: u32, next_slot: u64) -> Vec<SegmentEntry> {
+    let Ok(Some(manifest)) = snapshot::read::<Manifest>(&dir.join(SEGMENTS_FILE)) else {
+        return Vec::new();
+    };
+    if manifest.version != FORMAT_VERSION
+        || manifest.segment_slots != segment_slots
+        || manifest.next_slot != next_slot
+    {
+        return Vec::new();
+    }
+    manifest.segments
 }
 
 /// Load the segment manifest, refreshing it when it disagrees with `meta.bin`.
@@ -102,5 +235,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.next_slot, 8);
+    }
+
+    #[test]
+    fn entries_split_slots_and_report_garbage() {
+        let tomb = [false, true, false, false, true, true, false, false];
+        let entries = derive_entries(8, 4, |s| tomb[s], 9);
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].start, entries[0].end), (0, 4));
+        assert_eq!(entries[0].live_count, 3);
+        assert_eq!(entries[0].tombstone_count, 1);
+        assert_eq!((entries[1].start, entries[1].end), (4, 8));
+        assert_eq!(entries[1].live_count, 2);
+        assert_eq!(entries[1].tombstone_count, 2);
+        let picked = select_for_compaction(&entries, 0.20);
+        assert_eq!(picked, vec![0]);
+    }
+
+    #[test]
+    fn entries_round_trip_through_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = derive_entries(4, 4, |_| false, 7);
+        write_with_entries(dir.path(), 4, 4, &entries).unwrap();
+        let loaded = read_entries(dir.path(), 4, 4);
+        assert_eq!(loaded, entries);
+        assert!(read_entries(dir.path(), 4, 8).is_empty());
     }
 }

@@ -17,7 +17,7 @@ use super::quant::QuantStore;
 use super::queue::CommitQueue;
 use super::tombstones::TombstoneBits;
 use super::vectors::Vectors;
-use super::{CollectionStore, DataFiles, StoreInner};
+use super::{CollectionStore, DataFiles, StoreInner, WalAckPins};
 use super::{Wal, WalRecord};
 
 use crate::error::{Result, VectorSearchError};
@@ -210,8 +210,11 @@ impl CollectionStore {
                 last_drift_ratio: None,
                 filter_bitmap: FilterBitmap::with_capacity(slot_capacity as usize),
                 payload_indexes: PayloadIndexManager::new(),
+                segment_applied: Vec::new(),
+                segment_persisted: Vec::new(),
             }),
             wal,
+            wal_pins: WalAckPins::new(),
             queue: Arc::new(CommitQueue::new()),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
@@ -346,8 +349,11 @@ impl CollectionStore {
                 last_drift_ratio: None,
                 filter_bitmap,
                 payload_indexes,
+                segment_applied: Vec::new(),
+                segment_persisted: Vec::new(),
             }),
             wal,
+            wal_pins: WalAckPins::new(),
             queue: Arc::new(CommitQueue::new()),
             pending: Mutex::new(Vec::new()),
             build_mutex: Mutex::new(()),
@@ -394,6 +400,36 @@ impl CollectionStore {
         let water_changed = inner.meta.last_applied_txn != last;
         inner.meta.last_applied_txn = inner.meta.last_applied_txn.max(last);
         inner.next_lsn = inner.meta.last_applied_txn + 1;
+        // Files contain everything up to the generation floor; replayed tail
+        // marks its segments applied, persisted stays at the floor until the
+        // next checkpoint advances it.
+        {
+            let segment_slots = inner.meta.segment_slots;
+            let next_slot = inner.meta.next_slot;
+            let count = if segment_slots == 0 || next_slot == 0 {
+                0
+            } else {
+                next_slot.div_ceil(segment_slots as u64) as usize
+            };
+            inner.ensure_segment_len(count);
+            // Prefer per-segment marks published by the last checkpoint;
+            // fall back to the generation floor when the manifest carries
+            // no current accounting.
+            let persisted = super::segments::read_entries(
+                &self.data_dir(),
+                segment_slots,
+                next_slot,
+            );
+            if persisted.len() == count && count > 0 {
+                for (cell, entry) in inner.segment_persisted.iter_mut().zip(persisted.iter()) {
+                    *cell = entry.persisted_lsn;
+                }
+            } else {
+                for cell in inner.segment_persisted.iter_mut() {
+                    *cell = (*cell).max(floor);
+                }
+            }
+        }
         let live = inner.reverse.len() as u64;
         let tomb = self.data_arc().tombstones.load().count_ones();
         let changed = water_changed

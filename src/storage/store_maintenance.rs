@@ -71,23 +71,46 @@ impl CollectionStore {
         // Compaction and index builds rewrite or replace the files flushed
         // below, so they must not run concurrently with this pass.
         let _maintenance = self.compact_mutex.lock();
-        // The log is truncated below, so no transaction may be queued — or
-        // halfway through the worker — while this runs.
-        let _gate = self.queue.quiesce();
-        let (capacity, live) = {
-            let inner = self.inner.read();
-            (inner.meta.slot_capacity, inner.meta.live_count)
-        };
+        // Phase 1 runs without the queue gate so appendable segments keep
+        // receiving writes while the bulk of the files is flushed. Only the
+        // tail delta is flushed under the gate in phase 2, which bounds the
+        // stop-the-world window to a re-sync plus the water mark publish.
+        // The live count is reported from the publish point, after the gate
+        // drained the queue, so a checkpoint racing queued writes still
+        // reports every transaction it waited for.
+        let first_capacity = self.inner.read().meta.slot_capacity;
 
-        // Phase 1: the expensive part, without the store lock.
+        // Phase 1: the expensive part, without the store lock and without the
+        // gate. Writes that land concurrently stay in the WAL; phase 2
+        // re-flushes the delta under the gate before publishing.
         on_flush();
-        self.flush_data_files(capacity)?;
+        self.flush_data_files(first_capacity)?;
 
-        // Phase 2: durable water marks.
+        // Phase 2: gate the queue, re-flush the raced tail, then publish.
+        // The log is truncated below, so no transaction may be queued — or
+        // halfway through the worker — while the marks are published.
+        let _gate = self.queue.quiesce();
+        let second_capacity = self.inner.read().meta.slot_capacity;
+        self.flush_data_files(second_capacity)?;
         let mut inner = self.inner.write();
         let data_dir = self.data_dir();
         inner.meta.save(&data_dir)?;
-        segments::write(&data_dir, inner.meta.segment_slots, inner.meta.next_slot)?;
+        {
+            let tombstones = self.data_arc().tombstones.load();
+            let watermark = inner.meta.last_applied_txn;
+            let entries = segments::derive_entries(
+                inner.meta.next_slot,
+                inner.meta.segment_slots,
+                |s| tombstones.bit(s),
+                watermark,
+            );
+            segments::write_with_entries(
+                &data_dir,
+                inner.meta.segment_slots,
+                inner.meta.next_slot,
+                &entries,
+            )?;
+        }
         // The snapshot and the manifest describe one generation. Writing the
         // snapshot first means a crash can only leave it ahead of the
         // manifest, which open detects and discards; the WAL is still intact
@@ -109,9 +132,10 @@ impl CollectionStore {
         self.generation.write().set_lsn(inner.meta.last_applied_txn)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
         // Marker first (this append itself fsyncs the log), then truncate
-        // through the water mark: every segment covered by `meta.bin` is
-        // unlinked, and only transactions newer than it would survive (there
-        // are none — the queue gate is closed for the whole call).
+        // through the water mark clamped by live pins. A snapshot pin holds
+        // the truncate back so its copy window keeps the segments it needs;
+        // the marker segment itself always survives because its LSN is above
+        // every truncate water mark.
         //
         // The marker takes a freshly allocated LSN, never the watermark:
         // reusing the watermark would duplicate the previous tail's LSN and
@@ -119,6 +143,7 @@ impl CollectionStore {
         // stays at the watermark (the files contain exactly that); the marker
         // is a no-op whose segment survives the truncate below.
         let watermark = inner.meta.last_applied_txn;
+        self.note_segments_persisted(&mut inner, watermark);
         let marker_lsn = inner.next_lsn;
         inner.next_lsn = marker_lsn + 1;
         if let Err(e) = self.wal.append(&WalTxn {
@@ -134,22 +159,29 @@ impl CollectionStore {
         // exactly that); the marker is a no-op whose LSN was consumed from
         // `next_lsn`, so a back-to-back checkpoint naturally allocates a new
         // one. Replay converges on the same numbering.
-        self.wal.truncate_through(watermark)?;
+        let effective = self.wal_pins.clamp(watermark);
+        let live_now = inner.meta.live_count;
+        let collection = inner.meta.collection.clone();
         drop(inner);
+        if effective != 0 || watermark == 0 {
+            self.wal.truncate_through(effective)?;
+        }
         self.metrics.record_checkpoint(started.elapsed());
         tracing::debug!(
-            collection = %self.inner.read().meta.collection,
-            live,
+            collection = %collection,
+            live = live_now,
             "wal checkpoint committed"
         );
-        Ok(live)
+        Ok(live_now)
     }
 
     /// Flush every data file touched since the last checkpoint.
     ///
-    /// Requires the queue gate to be closed (no transaction can be applied)
-    /// but takes no store lock, so readers are unaffected. `slot_capacity` is
-    /// captured under the gate, where no growth can race it.
+    /// Takes no store lock, so readers are unaffected. The bulk pass runs
+    /// without the queue gate while appendable segments keep receiving
+    /// writes; the gate-time re-flush in phase 2 covers the raced tail
+    /// before any water mark is published, so the WAL stays authoritative
+    /// for whatever the first pass missed.
     fn flush_data_files(&self, slot_capacity: u64) -> Result<()> {
         let data = self.data_arc();
         // Payload store: dirty pages, block bitmask, slot→pointer table.
