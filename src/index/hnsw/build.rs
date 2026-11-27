@@ -226,7 +226,8 @@ impl HnswIndex {
                 slot_base,
             );
             let previous = {
-                let mut adjacency = timed_write_lock(self.lock_metrics.as_deref(), node.layer(layer));
+                let mut adjacency =
+                    timed_write_lock(self.lock_metrics.as_deref(), node.layer(layer));
                 let previous = adjacency.clone();
                 *adjacency = selected.iter().map(|c| c.slot).collect();
                 previous
@@ -385,9 +386,7 @@ impl HnswIndex {
             let previous = adj.clone();
             adj.push(slot);
             drop(adj);
-            self.record_neighbor_change(neighbor, layer, &previous, &[
-                slot,
-            ]);
+            self.record_neighbor_change(neighbor, layer, &previous, &[slot]);
             return;
         }
 

@@ -669,7 +669,6 @@ impl CollectionStore {
     pub(crate) fn segments_needing_compaction(&self, threshold: f64) -> Vec<u32> {
         segments::select_for_compaction(&self.segment_entries(), threshold)
     }
-
 }
 
 impl Drop for CollectionStore {

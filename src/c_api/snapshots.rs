@@ -41,7 +41,10 @@ pub unsafe extern "C" fn simvec_snapshot_collection(
                 if code == simvec_error_code_t::SIMVEC_OK as c_int {
                     handle.ok()
                 } else {
-                    handle.fail_code(simvec_error_code_t::SIMVEC_ERROR, "serialize snapshot".into())
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "serialize snapshot".into(),
+                    )
                 }
             }
             Err(err) => handle.fail(&err),
@@ -80,7 +83,10 @@ pub unsafe extern "C" fn simvec_snapshot_collection_incremental(
                 if code == simvec_error_code_t::SIMVEC_OK as c_int {
                     handle.ok()
                 } else {
-                    handle.fail_code(simvec_error_code_t::SIMVEC_ERROR, "serialize snapshot".into())
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "serialize snapshot".into(),
+                    )
                 }
             }
             Err(err) => handle.fail(&err),
@@ -106,7 +112,10 @@ pub unsafe extern "C" fn simvec_verify_snapshot(
                 if code == simvec_error_code_t::SIMVEC_OK as c_int {
                     handle.ok()
                 } else {
-                    handle.fail_code(simvec_error_code_t::SIMVEC_ERROR, "serialize snapshot".into())
+                    handle.fail_code(
+                        simvec_error_code_t::SIMVEC_ERROR,
+                        "serialize snapshot".into(),
+                    )
                 }
             }
             Err(err) => handle.fail(&err),

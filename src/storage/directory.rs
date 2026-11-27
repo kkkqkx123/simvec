@@ -120,7 +120,8 @@ impl BlobDirectory {
     /// Create a new file with `initial_capacity` records.
     pub fn create(
         path: &Path,
-            rec_size: usize,
+        magic: [u8; 4],
+        rec_size: usize,
         initial_capacity: u64,
     ) -> Result<Self> {
         if rec_size < MIN_REC_SIZE {
@@ -295,6 +296,84 @@ impl BlobDirectory {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
+}
+
+impl std::fmt::Debug for BlobDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let view = self.view.load();
+        f.debug_struct("BlobDirectory")
+            .field("path", &self.path)
+            .field("rec_size", &self.rec_size)
+            .field("rec_capacity", &view.rec_capacity)
+            .field("blob_len", &view.blob_len)
+            .finish()
+    }
+}
+
+fn encode_rec(off: u32, len: u32, flags: u8, rec_size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rec_size);
+    out.extend_from_slice(&off.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    if rec_size >= 12 {
+        out.push(flags);
+        out.extend_from_slice(&[0u8; 3]);
+    }
+    out.truncate(rec_size);
+    out
+}
+
+fn write_header(
+    file: &File,
+    magic: [u8; 4],
+    rec_size: usize,
+    rec_capacity: u64,
+    blob_len: u64,
+) -> Result<()> {
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(&magic);
+    header.extend_from_slice(&FILE_VERSION.to_le_bytes());
+    header.extend_from_slice(&(rec_size as u32).to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    header.extend_from_slice(&rec_capacity.to_le_bytes());
+    header.extend_from_slice(&blob_len.to_le_bytes());
+    write_at(file, &header, 0)?;
+    Ok(())
+}
+
+fn read_magic(file: &File) -> Result<[u8; 4]> {
+    let mut buf = [0u8; 4];
+    read_exact_at(file, &mut buf, 0)?;
+    Ok(buf)
+}
+
+fn read_version(file: &File) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    read_exact_at(file, &mut buf, OFF_VERSION)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_rec_size(file: &File) -> Result<usize> {
+    let mut buf = [0u8; 4];
+    read_exact_at(file, &mut buf, OFF_REC_SIZE)?;
+    let rec_size = u32::from_le_bytes(buf) as usize;
+    if rec_size < MIN_REC_SIZE {
+        return Err(VectorSearchError::CorruptData(format!(
+            "directory record size {rec_size} < minimum {MIN_REC_SIZE}"
+        )));
+    }
+    Ok(rec_size)
+}
+
+fn read_rec_capacity(file: &File) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    read_exact_at(file, &mut buf, OFF_REC_CAPACITY)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_blob_len(file: &File) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    read_exact_at(file, &mut buf, OFF_BLOB_LEN)?;
+    Ok(u64::from_le_bytes(buf))
 }
 
 fn map_file(file: &File, len: usize) -> Result<Mmap> {

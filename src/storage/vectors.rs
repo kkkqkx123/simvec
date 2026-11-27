@@ -9,8 +9,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use memmap2::{Mmap, MmapOptions};
+use parking_lot::RwLock;
 
 use crate::error::{Result, VectorSearchError};
 
@@ -50,13 +50,7 @@ impl VectorSegment {
         Self::from_file(file, path.to_path_buf(), dim, slots, expected)
     }
 
-    fn from_file(
-        file: File,
-        path: PathBuf,
-        dim: usize,
-        slots: u32,
-        len: u64,
-    ) -> Result<Self> {
+    fn from_file(file: File, path: PathBuf, dim: usize, slots: u32, len: u64) -> Result<Self> {
         let mapping = Arc::new(unsafe { MmapOptions::new().len(len as usize).map(&file)? });
         Ok(Self {
             path,

@@ -1511,12 +1511,22 @@ fn test_batch_payload_merge_size_is_validated() {
         err.to_string().contains("encoded payload"),
         "unexpected error: {err}"
     );
-    assert!(store.get(&PointId::Num(1)).unwrap().unwrap().payload.is_none());
+    assert!(store
+        .get(&PointId::Num(1))
+        .unwrap()
+        .unwrap()
+        .payload
+        .is_none());
 
     drop(store);
     let reopened =
         CollectionStore::open_with_storage(&store_dir, &StorageConfig::default()).unwrap();
-    assert!(reopened.get(&PointId::Num(1)).unwrap().unwrap().payload.is_none());
+    assert!(reopened
+        .get(&PointId::Num(1))
+        .unwrap()
+        .unwrap()
+        .payload
+        .is_none());
 }
 
 /// LZ4-compressed payloads round-trip through checkpoint and reopen.
@@ -1555,13 +1565,9 @@ fn test_physical_segments_own_their_files() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_physical");
     {
-        let store = CollectionStore::create_with_segment_slots(
-            &store_dir,
-            "col_physical",
-            &config(2),
-            4,
-        )
-        .unwrap();
+        let store =
+            CollectionStore::create_with_segment_slots(&store_dir, "col_physical", &config(2), 4)
+                .unwrap();
         for id in 0..6u64 {
             upsert_logged(&store, &point(id, 2));
         }
@@ -1569,7 +1575,12 @@ fn test_physical_segments_own_their_files() {
         let generation = store.data_dir();
         let first = generation.join("segments/0000000000");
         let second = generation.join("segments/0000000004");
-        for file in ["vectors.bin", "keys.bin", "tombstones.bin", "id_tracker.bin"] {
+        for file in [
+            "vectors.bin",
+            "keys.bin",
+            "tombstones.bin",
+            "id_tracker.bin",
+        ] {
             assert!(first.join(file).exists(), "{file} must be segment-local");
             assert!(second.join(file).exists(), "{file} must be segment-local");
         }
@@ -1598,5 +1609,8 @@ fn test_segment_wal_ack_stops_at_a_live_pin() {
     assert!(held <= pin.version(), "pin must hold the ack back");
     drop(pin);
     store.checkpoint().unwrap();
-    assert!(store.durable_wal_floor() > held, "ack resumes after release");
+    assert!(
+        store.durable_wal_floor() > held,
+        "ack resumes after release"
+    );
 }

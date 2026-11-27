@@ -102,10 +102,7 @@ impl SegmentPayloadStore {
         while stores.len() < needed {
             let start = stores.len() as u32 * self.segment_slots;
             let path = segment_dir(&self.base, start).join("payloads_store");
-            stores.push(Arc::new(PayloadStore::create(
-                &path,
-                self.config.clone(),
-            )?));
+            stores.push(Arc::new(PayloadStore::create(&path, self.config.clone())?));
         }
         Ok(())
     }

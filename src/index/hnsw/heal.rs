@@ -111,8 +111,10 @@ impl HnswIndex {
                 }
                 self.record_neighbor_change(peer_slot, layer, &previous, &replacement);
                 if previous != replacement {
-                    self.healed_edges
-                        .fetch_add((previous.len() + replacement.len()) as u64, Ordering::Relaxed);
+                    self.healed_edges.fetch_add(
+                        (previous.len() + replacement.len()) as u64,
+                        Ordering::Relaxed,
+                    );
                 }
             }
 

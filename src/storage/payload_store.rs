@@ -125,9 +125,8 @@ fn decode_payload_json(stored: &[u8]) -> Result<Vec<u8>> {
     let (codec, data) = body.split_first().expect("header length checked");
     match *codec {
         CODEC_NONE => Ok(data.to_vec()),
-        CODEC_LZ4 => lz4_flex::decompress_size_prepended(data).map_err(|e| {
-            VectorSearchError::CorruptData(format!("payload lz4 decode failed: {e}"))
-        }),
+        CODEC_LZ4 => lz4_flex::decompress_size_prepended(data)
+            .map_err(|e| VectorSearchError::CorruptData(format!("payload lz4 decode failed: {e}"))),
         other => Err(VectorSearchError::CorruptData(format!(
             "payload blob has unsupported codec {other}"
         ))),

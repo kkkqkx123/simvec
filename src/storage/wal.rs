@@ -1634,7 +1634,14 @@ mod tests {
         drop(wal);
         let reopened = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
         assert_eq!(reopened.acked_lsn(), 2);
-        assert_eq!(reopened.read_all_from(reopened.acked_lsn()).unwrap().0.len(), 1);
+        assert_eq!(
+            reopened
+                .read_all_from(reopened.acked_lsn())
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
     }
 
     #[test]

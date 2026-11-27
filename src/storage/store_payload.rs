@@ -73,8 +73,7 @@ impl CollectionStore {
                     }
                     WalRecord::DeletePayloadKeys { point_id, keys } => {
                         let id = PointId::from(point_id.as_str());
-                        let mut current =
-                            self.current_payload_locked(&inner, ps, &working, &id)?;
+                        let mut current = self.current_payload_locked(&inner, ps, &working, &id)?;
                         if let Some(payload) = current.as_mut() {
                             for key in keys {
                                 payload.remove(key.as_str());
@@ -88,8 +87,7 @@ impl CollectionStore {
                         value,
                     } => {
                         let id = PointId::from(point_id.as_str());
-                        let mut current =
-                            self.current_payload_locked(&inner, ps, &working, &id)?;
+                        let mut current = self.current_payload_locked(&inner, ps, &working, &id)?;
                         let payload = current.get_or_insert_with(Payload::new);
                         payload.insert(key.clone(), serde_json::from_str(value)?);
                         (id, current)

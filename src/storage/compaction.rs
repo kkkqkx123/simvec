@@ -600,8 +600,11 @@ impl CollectionStore {
         drop(new_store);
         drop(ps_guard);
 
-        TombstoneBits::new(plan.new_capacity as usize)
-            .save_segments(dir, plan.segment_slots, plan.new_capacity)?;
+        TombstoneBits::new(plan.new_capacity as usize).save_segments(
+            dir,
+            plan.segment_slots,
+            plan.new_capacity,
+        )?;
         let defs = files.dir().join("payload_indexes.json");
         if defs.exists() {
             std::fs::copy(defs, dir.join("payload_indexes.json"))?;

@@ -562,7 +562,10 @@ fn snapshot_c_abi_roundtrip() {
         );
         let mut restored_engine: *mut simvec_engine_t = ptr::null_mut();
         assert_eq!(
-            engine::simvec_open(cstr(&restored_root.to_string_lossy()).as_ptr(), &mut restored_engine),
+            engine::simvec_open(
+                cstr(&restored_root.to_string_lossy()).as_ptr(),
+                &mut restored_engine
+            ),
             OK
         );
         let mut count = 0u64;

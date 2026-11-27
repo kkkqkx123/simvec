@@ -221,9 +221,7 @@ impl NamedStore {
                         point.touch_payload();
                     }
                 }
-                WalRecord::Upsert { .. }
-                | WalRecord::Compact
-                | WalRecord::Quantize => {
+                WalRecord::Upsert { .. } | WalRecord::Compact | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "named store commit received an unsupported record".to_string(),
                     ));
@@ -313,9 +311,7 @@ impl NamedStore {
                     serde_json::from_str::<serde_json::Value>(value)?;
                 }
                 WalRecord::DeletePayloadKeys { .. } => {}
-                WalRecord::Upsert { .. }
-                | WalRecord::Compact
-                | WalRecord::Quantize => {
+                WalRecord::Upsert { .. } | WalRecord::Compact | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "named store commit received an unsupported record".to_string(),
                     ));

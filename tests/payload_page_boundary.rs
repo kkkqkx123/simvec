@@ -31,7 +31,8 @@ fn upsert(store: &CollectionStore, id: u64, filler: usize) {
 
 fn page_sizes(collection_dir: &std::path::Path) -> Vec<u64> {
     let mut sizes = Vec::new();
-    for entry in std::fs::read_dir(collection_dir.join("segments/0000000000/payloads_store/pages")).expect("pages dir")
+    for entry in std::fs::read_dir(collection_dir.join("segments/0000000000/payloads_store/pages"))
+        .expect("pages dir")
     {
         let entry = entry.expect("page entry");
         sizes.push(entry.metadata().expect("page meta").len());

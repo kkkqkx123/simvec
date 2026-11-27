@@ -223,8 +223,8 @@ impl CollectionStore {
                     .copied()
                     .unwrap_or(inner.meta.last_applied_txn),
                 index as u32 * segment_slots,
-                ((index as u32 * segment_slots) as u64 + segment_slots as u64)
-                    .min(slot_capacity) as u32,
+                ((index as u32 * segment_slots) as u64 + segment_slots as u64).min(slot_capacity)
+                    as u32,
             )
         };
         let data = self.data_arc();
@@ -347,9 +347,7 @@ impl CollectionStore {
             let drift = dead as f64 / len as f64;
             // A few tombstones are repaired through their complete inbound
             // neighborhoods; a dense stale graph is cheaper to rebuild.
-            if !segment.index.covers_all(len)
-                || drift > 0.25
-                || segment.index.stale_ratio() > 0.25
+            if !segment.index.covers_all(len) || drift > 0.25 || segment.index.stale_ratio() > 0.25
             {
                 if let Some(rebuilt) = self.rebuild_segment_hnsw(
                     segment.start,

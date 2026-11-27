@@ -126,7 +126,10 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotInfo> {
     if generation.id() != info.generation || generation.lsn() != info.lsn {
         return Err(VectorSearchError::CorruptData(format!(
             "snapshot manifest describes generation {} at lsn {}, but generation.bin says {} at {}",
-            info.generation, info.lsn, generation.id(), generation.lsn()
+            info.generation,
+            info.lsn,
+            generation.id(),
+            generation.lsn()
         )));
     }
     for file in &info.files {
