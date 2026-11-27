@@ -83,7 +83,6 @@ impl<'a> IndexBuildParams<'a> {
         self.slot_base = base;
         self
     }
-
 }
 
 /// Upper bound for reported drift ratios so stored/serialized values stay

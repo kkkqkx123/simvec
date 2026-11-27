@@ -160,7 +160,10 @@ fn compacted_index_survives_restart() {
     // The remapped graph was written back to its segment file, so the reopen
     // loads it instead of falling back to exact scan.
     let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
-    assert!(reopened.has_index("col"), "remapped segment graph must load");
+    assert!(
+        reopened.has_index("col"),
+        "remapped segment graph must load"
+    );
     assert_eq!(reopened.count("col").unwrap(), 22);
 
     let hits = reopened

@@ -60,7 +60,9 @@ impl CollectionStore {
                         self.validate_payload_len(json.len())?;
                     }
                     WalRecord::SetPayloadField {
-                        point_id, key, value,
+                        point_id,
+                        key,
+                        value,
                     } => {
                         // Merging grows the existing payload; the merged shape
                         // is what has to fit, not just the new value. The id is
@@ -174,11 +176,7 @@ impl CollectionStore {
     /// Roll back a batch whose WAL append failed: return its LSNs and drop
     /// its reservations. Safe because the worker is the only bulk assigner
     /// and no marker can be allocated concurrently with a flushed batch.
-    pub(super) fn abort_unlogged_batch(
-        &self,
-        base: u64,
-        batch: &[super::queue::Ticket],
-    ) {
+    pub(super) fn abort_unlogged_batch(&self, base: u64, batch: &[super::queue::Ticket]) {
         let mut inner = self.inner.write();
         if inner.next_lsn == base + batch.len() as u64 {
             inner.next_lsn = base;
@@ -405,9 +403,10 @@ impl CollectionStore {
         ) else {
             return;
         };
-        let delta =
-            (crate::distance::distance(inner.meta.distance, new_vector, old) * 1e6) as u64;
-        target.index.note_overwrite_delta(slot - target.start, delta);
+        let delta = (crate::distance::distance(inner.meta.distance, new_vector, old) * 1e6) as u64;
+        target
+            .index
+            .note_overwrite_delta(slot - target.start, delta);
     }
 
     /// Resolve the id a payload mutation targets. Shared by the pre-logging
@@ -464,7 +463,9 @@ impl CollectionStore {
         slot: u32,
     ) -> Result<()> {
         self.ensure_capacity(inner, slot as u64 + 1)?;
-        self.data_arc().keys.append_key(slot as usize, &id.to_string())?;
+        self.data_arc()
+            .keys
+            .append_key(slot as usize, &id.to_string())?;
         inner.reverse.insert(id, slot);
         // Slots are assigned in log order, so the new slot is always exactly
         // the high-water mark; the mark only ever moves forward.

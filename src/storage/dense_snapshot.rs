@@ -98,7 +98,12 @@ impl DenseSnapshot {
     /// A mismatch means the snapshot belongs to an unpublished checkpoint or
     /// a different generation. It is safe to ignore: the manifest's lsn still
     /// bounds WAL replay and the files can always be scanned instead.
-    pub(crate) fn matches(&self, generation: &Generation, meta: &Meta, tombstone_count: u64) -> bool {
+    pub(crate) fn matches(
+        &self,
+        generation: &Generation,
+        meta: &Meta,
+        tombstone_count: u64,
+    ) -> bool {
         if self.generation != generation.id()
             || self.lsn != generation.lsn()
             || self.next_slot != meta.next_slot

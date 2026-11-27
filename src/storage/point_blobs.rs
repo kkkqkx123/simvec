@@ -185,7 +185,6 @@ impl PointBlobs {
     pub fn mapped_bytes(&self) -> u64 {
         self.state.read().len
     }
-
 }
 
 impl std::fmt::Debug for PointBlobs {
@@ -270,12 +269,7 @@ pub fn encode_vector(data: &VectorData) -> Vec<u8> {
             push_f32s(&mut out, values);
         }
         VectorData::Multi(multi) => {
-            push_header(
-                &mut out,
-                KIND_MULTI,
-                multi.dim as u32,
-                multi.count() as u32,
-            );
+            push_header(&mut out, KIND_MULTI, multi.dim as u32, multi.count() as u32);
             push_f32s(&mut out, &multi.flat);
         }
     }
@@ -484,10 +478,7 @@ mod tests {
     }
 
     fn multi() -> VectorData {
-        VectorData::Multi(MultiVector::new(vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-        ]))
+        VectorData::Multi(MultiVector::new(vec![vec![1.0, 2.0], vec![3.0, 4.0]]))
     }
 
     #[test]

@@ -417,7 +417,10 @@ fn test_field_index_contents_survive_checkpoint_and_fallback_rebuild() {
 
     let generation = store.data_dir();
     let index_file = generation.join("field_indexes.bin");
-    assert!(index_file.exists(), "checkpoint must publish field postings");
+    assert!(
+        index_file.exists(),
+        "checkpoint must publish field postings"
+    );
 
     let query = || {
         SearchQuery::new(vec![0.5, 0.5], 10).with_filter(
@@ -474,7 +477,9 @@ fn test_incremental_snapshot_reuses_unchanged_files() {
     let base = store.snapshot_to(&base_dir).unwrap();
     assert_eq!(base.reused_files, 0);
 
-    let second = store.snapshot_to_incremental(&base_dir, &second_dir).unwrap();
+    let second = store
+        .snapshot_to_incremental(&base_dir, &second_dir)
+        .unwrap();
     assert_eq!(second.reused_files, second.files.len());
     #[cfg(unix)]
     {
@@ -489,7 +494,9 @@ fn test_incremental_snapshot_reuses_unchanged_files() {
     }
 
     upsert_logged(&store, &point(2, 4));
-    let third = store.snapshot_to_incremental(&base_dir, &third_dir).unwrap();
+    let third = store
+        .snapshot_to_incremental(&base_dir, &third_dir)
+        .unwrap();
     verify_snapshot(&third_dir).unwrap();
     assert!(third.reused_files < third.files.len());
     drop(store);
@@ -886,11 +893,18 @@ fn test_segment_ivf_corruption_is_isolated() {
         std::fs::write(super::segment_ivf::file_path(&data, 4), b"broken").unwrap();
     }
     let reopened = CollectionStore::open(&store_dir).unwrap();
-    assert!(reopened.has_index(), "the intact segment still has an IVF index");
+    assert!(
+        reopened.has_index(),
+        "the intact segment still has an IVF index"
+    );
     let hits = reopened
         .search(&SearchQuery::new(vec![0.0, 1.0], 9))
         .unwrap();
-    assert_eq!(hits.len(), 9, "the corrupt segment falls back to exact scan");
+    assert_eq!(
+        hits.len(),
+        9,
+        "the corrupt segment falls back to exact scan"
+    );
 }
 
 /// Quantization codes are published with the segment graph.
@@ -1328,13 +1342,9 @@ fn test_generation_advances_with_checkpoint_and_compaction() {
 fn test_segment_entries_and_selective_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let store_dir = tmp.path().join("col_segments");
-    let store = CollectionStore::create_with_segment_slots(
-        &store_dir,
-        "col_segments",
-        &config(4),
-        4,
-    )
-    .unwrap();
+    let store =
+        CollectionStore::create_with_segment_slots(&store_dir, "col_segments", &config(4), 4)
+            .unwrap();
     for id in 1..=8u64 {
         upsert_logged(&store, &point(id, 4));
     }
@@ -1382,7 +1392,11 @@ fn test_wal_pin_holds_back_truncate() {
         ack_before,
         "a pin at the old watermark must hold the ack back"
     );
-    assert_eq!(store.count(), 6, "pinned writes stay readable and replayable");
+    assert_eq!(
+        store.count(),
+        6,
+        "pinned writes stay readable and replayable"
+    );
     drop(pin);
     assert_eq!(store.lowest_wal_pin(), None);
     store.checkpoint().unwrap();
@@ -1427,12 +1441,15 @@ fn test_lz4_payloads_round_trip_through_collection() {
         payload_compression: PayloadCompression::Lz4,
         ..StorageConfig::default()
     };
-    let store = CollectionStore::create_with_storage(&store_dir, "col_lz4", &config(4), &storage)
-        .unwrap();
+    let store =
+        CollectionStore::create_with_storage(&store_dir, "col_lz4", &config(4), &storage).unwrap();
     let big = "payload-text ".repeat(300);
     let mut payload = crate::types::Payload::new();
     payload.insert("body".to_string(), serde_json::Value::String(big.clone()));
-    payload.insert("tag".to_string(), serde_json::Value::String("lz4".to_string()));
+    payload.insert(
+        "tag".to_string(),
+        serde_json::Value::String("lz4".to_string()),
+    );
     upsert_logged(&store, &point_with_payload(1, 4, payload));
     upsert_logged(&store, &point(2, 4));
     store.checkpoint().unwrap();

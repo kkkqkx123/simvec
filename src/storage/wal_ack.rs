@@ -41,8 +41,7 @@ impl WalAckPins {
     pub fn lowest(&self) -> Option<u64> {
         let mut pins = self.pins.lock();
         pins.retain(|p| p.strong_count() > 0);
-        pins
-            .iter()
+        pins.iter()
             .filter_map(Weak::upgrade)
             .map(|v| *v.lock())
             .min()

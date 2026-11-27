@@ -71,10 +71,7 @@ impl HnswIndex {
                 };
                 let mut candidates = Vec::with_capacity(cap + former.len());
                 for &existing in peer.layer(layer).read().iter() {
-                    if existing == neighbor
-                        || existing == slot
-                        || deleted(existing + slot_base)
-                    {
+                    if existing == neighbor || existing == slot || deleted(existing + slot_base) {
                         continue;
                     }
                     if let Some(other) = Vectors::read_slot(
@@ -109,13 +106,8 @@ impl HnswIndex {
                 }
                 candidates.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
                 candidates.dedup_by_key(|candidate| candidate.slot);
-                let selected = self.select_neighbors(
-                    &candidates,
-                    cap,
-                    vectors,
-                    segment_slots,
-                    slot_base,
-                );
+                let selected =
+                    self.select_neighbors(&candidates, cap, vectors, segment_slots, slot_base);
                 let replacement: Vec<u32> = selected.iter().map(|c| c.slot).collect();
                 let mut adjacency = peer.layer(layer).write();
                 if adjacency.as_slice() != replacement.as_slice() {

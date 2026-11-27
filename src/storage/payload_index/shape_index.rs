@@ -116,13 +116,7 @@ impl ShapeIndex {
 }
 
 fn matches_count(count: u32, range: &ValuesCountCondition) -> bool {
-    eval_uint_range(
-        count as u64,
-        range.gt,
-        range.gte,
-        range.lt,
-        range.lte,
-    )
+    eval_uint_range(count as u64, range.gt, range.gte, range.lt, range.lte)
 }
 
 #[cfg(test)]

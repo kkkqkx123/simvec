@@ -323,10 +323,12 @@ fn named_patch_preserves_other_spaces() {
     let dir = tempfile::tempdir().unwrap();
     let engine = LocalVectorEngine::open(dir.path()).unwrap();
     engine.create_collection("named", &named_config()).unwrap();
-    engine.upsert(
-        "named",
-        point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]),
-    ).unwrap();
+    engine
+        .upsert(
+            "named",
+            point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]),
+        )
+        .unwrap();
     engine
         .update_named_vectors(
             "named",
@@ -361,7 +363,10 @@ fn named_multi_space_and_multi_target_fusion() {
     engine.create_collection("named", &config).unwrap();
     let point = VectorPoint::with_named("p1", "text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]))
         .with_named_vector("keywords", VectorData::sparse(vec![1], vec![1.0]))
-        .with_named_vector("late", VectorData::multi(vec![vec![1.0, 0.0], vec![0.0, 1.0]]));
+        .with_named_vector(
+            "late",
+            VectorData::multi(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+        );
     engine.upsert("named", point).unwrap();
 
     let hits = engine
@@ -388,19 +393,26 @@ fn named_multi_space_and_multi_target_fusion() {
 fn fusion_configs_are_configurable_and_effective() {
     use crate::types::{FusionConfig, SearchResult};
 
-    let a = || vec![
-        SearchResult::new("p1", 1.0).with_named_vector("s1", VectorData::dense(vec![1.0])),
-        SearchResult::new("p2", 0.5).with_named_vector("s1", VectorData::dense(vec![0.0])),
-    ];
-    let b = || vec![
-        SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0])),
-        SearchResult::new("p1", 0.5).with_named_vector("s2", VectorData::dense(vec![0.0])),
-    ];
+    let a = || {
+        vec![
+            SearchResult::new("p1", 1.0).with_named_vector("s1", VectorData::dense(vec![1.0])),
+            SearchResult::new("p2", 0.5).with_named_vector("s1", VectorData::dense(vec![0.0])),
+        ]
+    };
+    let b = || {
+        vec![
+            SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0])),
+            SearchResult::new("p1", 0.5).with_named_vector("s2", VectorData::dense(vec![0.0])),
+        ]
+    };
 
     // Equal weights: both appear once at the top; union carries both spaces.
     let even = crate::types::query::fuse_rankings(
         vec![a(), b()],
-        &FusionConfig::Rrf { k: None, weights: vec![] },
+        &FusionConfig::Rrf {
+            k: None,
+            weights: vec![],
+        },
         0,
         10,
     );
@@ -408,12 +420,14 @@ fn fusion_configs_are_configurable_and_effective() {
     assert!(even.iter().all(|r| r.vectors.len() == 2));
 
     // Weighting a disjoint second list heavily promotes its sole result.
-    let only_p2 = || vec![
-        SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0])),
-    ];
+    let only_p2 =
+        || vec![SearchResult::new("p2", 1.0).with_named_vector("s2", VectorData::dense(vec![1.0]))];
     let weighted = crate::types::query::fuse_rankings(
         vec![a(), only_p2()],
-        &FusionConfig::Rrf { k: None, weights: vec![1.0, 100.0] },
+        &FusionConfig::Rrf {
+            k: None,
+            weights: vec![1.0, 100.0],
+        },
         0,
         10,
     );
@@ -485,13 +499,22 @@ fn named_restart_loads_the_posting_dictionaries() {
     {
         let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
         let points: Vec<VectorPoint> = (0..20u32)
-            .map(|i| point(&format!("p{i}"), vec![1.0, 0.0, 0.0, 0.0], (0..32).map(|t| (t, 1.0)).collect()))
+            .map(|i| {
+                point(
+                    &format!("p{i}"),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    (0..32).map(|t| (t, 1.0)).collect(),
+                )
+            })
             .collect();
         store.upsert_batch(&points).unwrap();
         store.checkpoint().unwrap();
         (blob_bytes, posting_bytes) = store.storage_bytes();
         assert!(blob_bytes > 0);
-        assert!(posting_bytes > 0, "sparse spaces must persist their postings");
+        assert!(
+            posting_bytes > 0,
+            "sparse spaces must persist their postings"
+        );
         let snapshot = std::fs::metadata(data_dir(&dir).join("named_snapshot.bin"))
             .unwrap()
             .len();
@@ -519,7 +542,11 @@ fn named_patch_reallocates_the_point_and_its_postings() {
     let storage = crate::types::StorageConfig::default();
     let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
     store
-        .upsert_batch(&[point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0), (2, 1.0)])])
+        .upsert_batch(&[point(
+            "p1",
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![(1, 1.0), (2, 1.0)],
+        )])
         .unwrap();
     store.checkpoint().unwrap();
     store
@@ -535,12 +562,18 @@ fn named_patch_reallocates_the_point_and_its_postings() {
     // The replaced space's old terms must be gone; a stale posting on a live
     // slot would surface as a phantom hit.
     assert!(store
-        .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+        .search(&named_query(
+            "keywords",
+            VectorData::sparse(vec![1], vec![1.0])
+        ))
         .unwrap()
         .is_empty());
     assert_eq!(
         store
-            .search(&named_query("keywords", VectorData::sparse(vec![3], vec![1.0])))
+            .search(&named_query(
+                "keywords",
+                VectorData::sparse(vec![3], vec![1.0])
+            ))
             .unwrap()
             .len(),
         1
@@ -553,12 +586,18 @@ fn named_patch_reallocates_the_point_and_its_postings() {
     let reopened = NamedStore::open(&dir, &storage).unwrap();
     assert_eq!(reopened.count(), 1);
     assert!(reopened
-        .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+        .search(&named_query(
+            "keywords",
+            VectorData::sparse(vec![1], vec![1.0])
+        ))
         .unwrap()
         .is_empty());
     assert_eq!(
         reopened
-            .search(&named_query("keywords", VectorData::sparse(vec![3], vec![1.0])))
+            .search(&named_query(
+                "keywords",
+                VectorData::sparse(vec![3], vec![1.0])
+            ))
             .unwrap()
             .len(),
         1
@@ -589,7 +628,10 @@ fn named_compaction_reclaims_blob_bytes() {
     assert!(reopened.postings_restored());
     assert_eq!(
         reopened
-            .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+            .search(&named_query(
+                "keywords",
+                VectorData::sparse(vec![1], vec![1.0])
+            ))
             .unwrap()
             .len(),
         5

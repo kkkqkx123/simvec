@@ -248,14 +248,10 @@ impl Postings {
         let flush = {
             let mut state = self.state.lock();
             for (index, value) in indices.iter().zip(values.iter()) {
-                state
-                    .pending
-                    .entry(*index)
-                    .or_default()
-                    .push(Posting {
-                        slot,
-                        weight: *value,
-                    });
+                state.pending.entry(*index).or_default().push(Posting {
+                    slot,
+                    weight: *value,
+                });
             }
             state.pending_bytes += indices.len() * POSTING_BYTES;
             state.pending_bytes >= SOFT_FLUSH_BYTES
@@ -315,7 +311,10 @@ impl Postings {
             }
             debug_assert_eq!(start % POSTING_BYTES, 0);
             let slice = unsafe {
-                std::slice::from_raw_parts(map[start..].as_ptr() as *const Posting, chain.count as usize)
+                std::slice::from_raw_parts(
+                    map[start..].as_ptr() as *const Posting,
+                    chain.count as usize,
+                )
             };
             for posting in slice {
                 f(posting.slot, posting.weight);
@@ -407,7 +406,10 @@ impl State {
             let bucket = Bucket::open(&bucket_path(dir, bucket_id), len)?;
             self.buckets.insert(bucket_id, bucket);
         }
-        Ok(self.buckets.get_mut(&bucket_id).expect("bucket opened above"))
+        Ok(self
+            .buckets
+            .get_mut(&bucket_id)
+            .expect("bucket opened above"))
     }
 
     /// Collapse one bucket into a single record per term. Bounded by the
@@ -589,7 +591,10 @@ fn refresh_doc_freq(state: &mut State) -> Result<()> {
                     )));
                 }
                 let slice = unsafe {
-                    std::slice::from_raw_parts(map[start..].as_ptr() as *const Posting, chain.count as usize)
+                    std::slice::from_raw_parts(
+                        map[start..].as_ptr() as *const Posting,
+                        chain.count as usize,
+                    )
                 };
                 for posting in slice {
                     set.insert(posting.slot);
@@ -607,7 +612,11 @@ fn refresh_doc_freq(state: &mut State) -> Result<()> {
 fn write_manifest(dir: &Path, state: &State, lsn: u64) -> Result<()> {
     let manifest = Manifest {
         lsn,
-        buckets: state.lens.iter().map(|(bucket, len)| (*bucket, *len)).collect(),
+        buckets: state
+            .lens
+            .iter()
+            .map(|(bucket, len)| (*bucket, *len))
+            .collect(),
         terms: state
             .dict
             .iter()
@@ -789,7 +798,9 @@ mod tests {
         let postings = open(dir.path(), None);
         let terms = [0u32, 1, (1 << BUCKET_SHIFT) - 1, 1 << BUCKET_SHIFT, 1 << 30];
         for (i, term) in terms.iter().enumerate() {
-            postings.index(i as u32, std::slice::from_ref(term), &[1.0]).unwrap();
+            postings
+                .index(i as u32, std::slice::from_ref(term), &[1.0])
+                .unwrap();
         }
         postings.flush(Some(1)).unwrap();
         let files = std::fs::read_dir(dir.path())
@@ -862,5 +873,4 @@ mod tests {
         assert_eq!(reopened.term_count(), 0, "a short bucket forces a rebuild");
         assert!(collect(&reopened, 1).is_empty());
     }
-
 }

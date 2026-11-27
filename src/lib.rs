@@ -26,11 +26,11 @@ pub mod wasm_api;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::{LocalVectorEngine, TxnOp, VectorEngine};
-#[cfg(not(target_arch = "wasm32"))]
-pub use storage::restore_snapshot;
 pub use error::VectorEngineError;
 pub use error::{EngineResult, Result, VectorSearchError};
 pub use metrics::{IndexTier, Metrics, MetricsSnapshot, SearchPath, SearchRetry};
+#[cfg(not(target_arch = "wasm32"))]
+pub use storage::restore_snapshot;
 pub use types::*;
 
 #[cfg(all(feature = "c_api", not(target_arch = "wasm32")))]

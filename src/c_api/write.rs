@@ -131,10 +131,7 @@ pub unsafe extern "C" fn simvec_upsert_batch(
             Ok(batch) => batch,
             Err(code) => return handle.fail_code(code, "invalid points JSON".to_string()),
         };
-        let points: Vec<VectorPoint> = batch
-            .into_iter()
-            .map(PointDto::into_point)
-            .collect();
+        let points: Vec<VectorPoint> = batch.into_iter().map(PointDto::into_point).collect();
         match handle.engine.upsert_batch(collection, &points) {
             Ok(()) => handle.ok(),
             Err(err) => handle.fail(&err),
@@ -519,11 +516,10 @@ pub unsafe extern "C" fn simvec_update_named_vectors(
             Ok(raw) => raw,
             Err(code) => return handle.fail_code(code, "invalid vectors string".to_string()),
         };
-        let vectors: std::collections::BTreeMap<String, VectorData> =
-            match parse_input_json(raw) {
-                Ok(vectors) => vectors,
-                Err(code) => return handle.fail_code(code, "invalid vectors JSON".to_string()),
-            };
+        let vectors: std::collections::BTreeMap<String, VectorData> = match parse_input_json(raw) {
+            Ok(vectors) => vectors,
+            Err(code) => return handle.fail_code(code, "invalid vectors JSON".to_string()),
+        };
         match handle
             .engine
             .update_named_vectors(collection, &PointId::from(id), vectors)
@@ -538,14 +534,8 @@ pub unsafe extern "C" fn simvec_update_named_vectors(
 #[derive(serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum TxnOpDto {
-    Upsert {
-        collection: String,
-        point: PointDto,
-    },
-    Delete {
-        collection: String,
-        id: String,
-    },
+    Upsert { collection: String, point: PointDto },
+    Delete { collection: String, id: String },
 }
 
 /// Commit a JSON array of upsert/delete operations grouped per collection.

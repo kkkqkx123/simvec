@@ -128,9 +128,7 @@ impl LocalVectorEngine {
     pub fn collection_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.stores.read().keys().cloned().collect();
         names.retain(|name| {
-            !name.contains(".rebuild-")
-                && !name.contains(".old-")
-                && !name.contains(".suspect-")
+            !name.contains(".rebuild-") && !name.contains(".old-") && !name.contains(".suspect-")
         });
         names.sort_unstable();
         names
@@ -341,7 +339,9 @@ impl LocalVectorEngine {
             match store.kind() {
                 crate::types::VectorKind::Sparse => {}
                 crate::types::VectorKind::Multi => {
-                    config.multi_config = Some(crate::types::MultiConfig::new(store.max_vectors_per_point()));
+                    config.multi_config = Some(crate::types::MultiConfig::new(
+                        store.max_vectors_per_point(),
+                    ));
                 }
                 crate::types::VectorKind::Dense => {}
             }
@@ -389,7 +389,9 @@ impl LocalVectorEngine {
             let mut config = CollectionConfig::new(store.vector_size(), store.distance());
             config.kind = store.kind();
             if store.kind() == crate::types::VectorKind::Multi {
-                config.multi_config = Some(crate::types::MultiConfig::new(store.max_vectors_per_point()));
+                config.multi_config = Some(crate::types::MultiConfig::new(
+                    store.max_vectors_per_point(),
+                ));
             }
             config.index = IndexConfig::Flat;
             config.max_points = store.max_points();

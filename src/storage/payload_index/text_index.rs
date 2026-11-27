@@ -170,7 +170,11 @@ impl TextIndex {
         postings.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut lengths: Vec<_> = self.lengths.iter().map(|(&s, &l)| (s, l)).collect();
         lengths.sort_unstable_by_key(|(slot, _)| *slot);
-        let mut documents: Vec<_> = self.documents.iter().map(|(&s, d)| (s, d.clone())).collect();
+        let mut documents: Vec<_> = self
+            .documents
+            .iter()
+            .map(|(&s, d)| (s, d.clone()))
+            .collect();
         documents.sort_unstable_by_key(|(slot, _)| *slot);
         TextExport {
             postings,

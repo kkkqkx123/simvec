@@ -169,19 +169,15 @@ impl CollectionConfig {
             // named layout never gets rewritten this way. This keeps the
             // convenience boundary adapter working while the map stays the
             // authority for reads and for multi-space layouts.
-            let disagree = self
-                .vectors
-                .get(DEFAULT_VECTOR_NAME)
-                .is_some_and(|space| {
-                    self.vector_size != space.vector_size()
-                        || self.distance != space.distance()
-                        || self.kind != space.kind()
-                        || self.multi_config != space.multi_config()
-                });
+            let disagree = self.vectors.get(DEFAULT_VECTOR_NAME).is_some_and(|space| {
+                self.vector_size != space.vector_size()
+                    || self.distance != space.distance()
+                    || self.kind != space.kind()
+                    || self.multi_config != space.multi_config()
+            });
             if disagree {
                 let space = self.space_from_primary_fields();
-                self.vectors
-                    .insert(DEFAULT_VECTOR_NAME.to_string(), space);
+                self.vectors.insert(DEFAULT_VECTOR_NAME.to_string(), space);
             }
         }
         self.sync_primary_fields();

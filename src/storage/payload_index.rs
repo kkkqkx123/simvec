@@ -139,10 +139,9 @@ impl FieldIndex {
                 );
                 true
             }
-            (
-                Self::Numeric(index),
-                PersistedFieldIndex::Numeric { values, slots },
-            ) if values.len() == slots.len() => {
+            (Self::Numeric(index), PersistedFieldIndex::Numeric { values, slots })
+                if values.len() == slots.len() =>
+            {
                 index.restore(values, slots, capacity);
                 true
             }
@@ -530,7 +529,12 @@ impl PayloadIndexManager {
     /// Adopt a checkpointed index file when it describes exactly this
     /// generation, lsn and definition set. Any mismatch leaves the manager
     /// untouched so open can rebuild from payloads and WAL replay.
-    pub(crate) fn restore(&mut self, persisted: PersistedIndexes, generation: u64, lsn: u64) -> bool {
+    pub(crate) fn restore(
+        &mut self,
+        persisted: PersistedIndexes,
+        generation: u64,
+        lsn: u64,
+    ) -> bool {
         if persisted.version != PERSISTED_VERSION
             || persisted.generation != generation
             || persisted.lsn != lsn
@@ -683,12 +687,19 @@ mod tests {
         );
         let saved = m.export(11, 21);
         let mut opened = PayloadIndexManager::new();
-        opened.declare("tag", PayloadSchemaType::Keyword, 4).unwrap();
-        opened.declare("size", PayloadSchemaType::Integer, 4).unwrap();
+        opened
+            .declare("tag", PayloadSchemaType::Keyword, 4)
+            .unwrap();
+        opened
+            .declare("size", PayloadSchemaType::Integer, 4)
+            .unwrap();
         assert!(opened.restore(saved.clone(), 11, 21));
         let filter = VectorFilter::new()
             .must(FilterCondition::match_value("tag", "red"))
-            .must(FilterCondition::range("size", RangeCondition::new().gte(2.0)));
+            .must(FilterCondition::range(
+                "size",
+                RangeCondition::new().gte(2.0),
+            ));
         assert_eq!(
             m.plan_filter(&filter, 4).pre_mask,
             opened.plan_filter(&filter, 4).pre_mask
@@ -697,7 +708,9 @@ mod tests {
         // A file from another generation / lsn must not be adopted.
         let mut stale = PayloadIndexManager::new();
         stale.declare("tag", PayloadSchemaType::Keyword, 4).unwrap();
-        stale.declare("size", PayloadSchemaType::Integer, 4).unwrap();
+        stale
+            .declare("size", PayloadSchemaType::Integer, 4)
+            .unwrap();
         assert!(!stale.restore(saved, 12, 21));
     }
 
@@ -705,8 +718,7 @@ mod tests {
     fn text_geo_and_shape_indexes_answer_mixed_filters() {
         let mut m = PayloadIndexManager::new();
         m.declare("title", PayloadSchemaType::Text, 4).unwrap();
-        m.declare("location", PayloadSchemaType::Geo, 4)
-            .unwrap();
+        m.declare("location", PayloadSchemaType::Geo, 4).unwrap();
         m.declare("active", PayloadSchemaType::Bool, 4).unwrap();
         m.declare("tags", PayloadSchemaType::Keyword, 4).unwrap();
         for (slot, title, lat, active, tags) in [
@@ -716,10 +728,7 @@ mod tests {
         ] {
             let payload = Payload::from([
                 ("title".to_string(), json!(title)),
-                (
-                    "location".to_string(),
-                    json!({ "lat": lat, "lon": 2.3522 }),
-                ),
+                ("location".to_string(), json!({ "lat": lat, "lon": 2.3522 })),
                 ("active".to_string(), json!(active)),
                 ("tags".to_string(), json!(tags)),
             ]);

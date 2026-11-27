@@ -177,7 +177,7 @@ impl KindStore {
             // this snapshot exists to avoid decoding.
             {
                 let blobs_guard = self.blobs.load();
-        let reader = blobs_guard.reader();
+                let reader = blobs_guard.reader();
                 let view = reader.view(point.blob).ok_or_else(|| {
                     VectorSearchError::CorruptData(format!(
                         "snapshot slot {} references a missing vector blob",

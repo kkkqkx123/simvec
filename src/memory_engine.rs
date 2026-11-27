@@ -35,12 +35,19 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn validate_point(config: &CollectionConfig, point: &VectorPoint) -> Result<()> {
-    if point.vectors.len() != 1 || !point.vectors.contains_key(crate::types::DEFAULT_VECTOR_NAME) {
+    if point.vectors.len() != 1
+        || !point
+            .vectors
+            .contains_key(crate::types::DEFAULT_VECTOR_NAME)
+    {
         return Err(VectorSearchError::InvalidConfig(
             "memory engine points must carry a single dense vector".to_string(),
         ));
     }
-    if point.data().is_some_and(|data| data.kind() != crate::types::VectorKind::Dense) {
+    if point
+        .data()
+        .is_some_and(|data| data.kind() != crate::types::VectorKind::Dense)
+    {
         return Err(VectorSearchError::InvalidConfig(
             "memory engine points must be dense".to_string(),
         ));

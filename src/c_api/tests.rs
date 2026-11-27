@@ -481,10 +481,15 @@ fn named_patch_round_trip() {
             read::simvec_search(handle, name.as_ptr(), query.as_ptr(), &mut out),
             OK
         );
-        let hits: serde_json::Value =
-            serde_json::from_str(&take_string(out)).expect("named hits");
-        let first = hits.as_array().and_then(|items| items.first()).expect("one hit");
-        let spaces = first.get("vectors").and_then(|v| v.as_object()).expect("vector map");
+        let hits: serde_json::Value = serde_json::from_str(&take_string(out)).expect("named hits");
+        let first = hits
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("one hit");
+        let spaces = first
+            .get("vectors")
+            .and_then(|v| v.as_object())
+            .expect("vector map");
         assert!(spaces.contains_key("text"));
         assert!(spaces.contains_key("tags"));
         let bad = cstr(r#"{"ghost":{"Dense":[1.0,0.0]}}"#);

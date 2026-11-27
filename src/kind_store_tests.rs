@@ -19,11 +19,7 @@ fn sparse_config() -> CollectionConfig {
 }
 
 fn multi_config() -> CollectionConfig {
-    CollectionConfig::with_multi(
-        2,
-        DistanceMetric::Dot,
-        MultiConfig::new(4),
-    )
+    CollectionConfig::with_multi(2, DistanceMetric::Dot, MultiConfig::new(4))
 }
 
 fn sparse_point(id: &str, pairs: &[(u32, f32)]) -> VectorPoint {
@@ -74,22 +70,13 @@ fn sparse_empty_and_zero_weight_queries_return_no_results() {
     let engine = LocalVectorEngine::open(tmp.path()).unwrap();
     engine.create_collection("kb", &sparse_config()).unwrap();
     engine
-        .upsert_batch(
-            "kb",
-            &[sparse_point("p1", &[(1, 1.0), (2, 2.0)])],
-        )
+        .upsert_batch("kb", &[sparse_point("p1", &[(1, 1.0), (2, 2.0)])])
         .unwrap();
 
-    let empty = SearchQuery::with_data(
-        VectorData::sparse(vec![], vec![]),
-        10,
-    );
+    let empty = SearchQuery::with_data(VectorData::sparse(vec![], vec![]), 10);
     assert!(engine.search("kb", &empty).unwrap().is_empty());
 
-    let zero = SearchQuery::with_data(
-        VectorData::sparse(vec![1, 2], vec![0.0, 0.0]),
-        10,
-    );
+    let zero = SearchQuery::with_data(VectorData::sparse(vec![1, 2], vec![0.0, 0.0]), 10);
     assert!(engine.search("kb", &zero).unwrap().is_empty());
 }
 
@@ -257,7 +244,10 @@ fn coordinated_upsert_is_durable() {
     let engine = LocalVectorEngine::open(tmp.path()).unwrap();
     assert_eq!(engine.count("kb").unwrap(), 1);
     let hits = engine
-        .search("kb", &SearchQuery::with_data(VectorData::sparse(vec![1, 3], vec![1.0, 1.0]), 5))
+        .search(
+            "kb",
+            &SearchQuery::with_data(VectorData::sparse(vec![1, 3], vec![1.0, 1.0]), 5),
+        )
         .unwrap();
     assert_eq!(hits.len(), 1);
 }
@@ -276,7 +266,10 @@ fn sparse_unsorted_input_is_normalized() {
         )
         .expect("unsorted sparse upsert");
     let hits = engine
-        .search("kb", &SearchQuery::with_data(VectorData::sparse(vec![2], vec![1.0]), 5))
+        .search(
+            "kb",
+            &SearchQuery::with_data(VectorData::sparse(vec![2], vec![1.0]), 5),
+        )
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].score, 2.0);
@@ -289,9 +282,15 @@ fn exact_store_compaction_reclaims_slots_and_cap_is_enforced() {
     config.max_points = Some(2);
     let engine = LocalVectorEngine::open(tmp.path()).unwrap();
     engine.create_collection("kb", &config).expect("create");
-    engine.upsert("kb", sparse_point("p1", &[(1, 1.0)])).unwrap();
-    engine.upsert("kb", sparse_point("p2", &[(2, 1.0)])).unwrap();
-    assert!(engine.upsert("kb", sparse_point("p3", &[(3, 1.0)])).is_err());
+    engine
+        .upsert("kb", sparse_point("p1", &[(1, 1.0)]))
+        .unwrap();
+    engine
+        .upsert("kb", sparse_point("p2", &[(2, 1.0)]))
+        .unwrap();
+    assert!(engine
+        .upsert("kb", sparse_point("p3", &[(3, 1.0)]))
+        .is_err());
     engine.delete("kb", &PointId::from("p1")).unwrap();
     assert!(engine.compact_collection("kb").unwrap() >= 1);
     assert_eq!(engine.count("kb").unwrap(), 1);
@@ -337,7 +336,10 @@ fn filtered_sparse_search_matches_post_filter_and_cost_paths_agree() {
 
     // Filtered path (lazy accept over posting hits).
     let filtered = engine
-        .search("kb", &SearchQuery::with_data(query_vec.clone(), 100).with_filter(filter.clone()))
+        .search(
+            "kb",
+            &SearchQuery::with_data(query_vec.clone(), 100).with_filter(filter.clone()),
+        )
         .unwrap();
     // Post-filter path: search everything, then keep matching payloads.
     let unfiltered = engine
@@ -360,13 +362,16 @@ fn filtered_sparse_search_matches_post_filter_and_cost_paths_agree() {
     // Engine tie-break is ascending insertion slot, which here follows the
     // numeric suffix of the id (p0, p1, ... inserted in order).
     let slot_order = |r: &crate::types::SearchResult| -> u64 {
-        r.id
-            .to_string()
+        r.id.to_string()
             .trim_start_matches('p')
             .parse()
             .unwrap_or(u64::MAX)
     };
-    expected.sort_by(|a, b| b.score.total_cmp(&a.score).then(slot_order(a).cmp(&slot_order(b))));
+    expected.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(slot_order(a).cmp(&slot_order(b)))
+    });
 
     let got_ids: Vec<_> = filtered.iter().map(|r| r.id.to_string()).collect();
     let expected_ids: Vec<_> = expected.iter().map(|r| r.id.to_string()).collect();
@@ -379,7 +384,9 @@ fn invalid_upsert_never_reaches_wal_and_reopen_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let engine = LocalVectorEngine::open(tmp.path()).unwrap();
-        engine.create_collection("kb", &sparse_config()).expect("create");
+        engine
+            .create_collection("kb", &sparse_config())
+            .expect("create");
         // A dense payload on a sparse collection is rejected before append.
         let bad = VectorPoint::with_data("bad", VectorData::Dense(vec![1.0, 2.0]));
         assert!(engine.upsert("kb", bad).is_err());
@@ -484,7 +491,11 @@ fn kind_deleted_points_leave_no_phantom_hits() {
     let reopened = KindStore::open(&dir, &storage).unwrap();
     assert_eq!(reopened.count(), 2);
     let hits = reopened.search(&query).unwrap();
-    assert_eq!(hits.len(), 2, "stale postings must not resurrect deleted points");
+    assert_eq!(
+        hits.len(),
+        2,
+        "stale postings must not resurrect deleted points"
+    );
     assert!(hits.iter().all(|hit| hit.id != PointId::from("p1")));
 }
 
@@ -530,16 +541,15 @@ fn kind_payload_edits_survive_a_restart_without_touching_vectors() {
     let storage = crate::types::StorageConfig::default();
     {
         let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        store.upsert_batch(&[sparse_wide("p1", 4, 1.0)]).unwrap();
         store
-            .upsert_batch(&[sparse_wide("p1", 4, 1.0)])
+            .set_payload_fields(
+                &PointId::from("p1"),
+                [("tag".to_string(), serde_json::json!("a"))]
+                    .into_iter()
+                    .collect(),
+            )
             .unwrap();
-        store.set_payload_fields(
-            &PointId::from("p1"),
-            [("tag".to_string(), serde_json::json!("a"))]
-                .into_iter()
-                .collect(),
-        )
-        .unwrap();
         store.checkpoint().unwrap();
     }
     let reopened = KindStore::open(&dir, &storage).unwrap();
@@ -592,11 +602,17 @@ fn kind_payloads_are_blobbed_and_reblobbed_on_edit() {
             )
             .unwrap();
         store.checkpoint().unwrap();
-        assert!(store.payload_bytes() > bytes, "an edit must append a new blob");
+        assert!(
+            store.payload_bytes() > bytes,
+            "an edit must append a new blob"
+        );
     }
     let reopened = KindStore::open(&dir, &storage).unwrap();
     let point = reopened.get(&id).unwrap().unwrap();
-    assert_eq!(point.payload.as_ref().unwrap()["tag"], serde_json::json!("v2"));
+    assert_eq!(
+        point.payload.as_ref().unwrap()["tag"],
+        serde_json::json!("v2")
+    );
     assert_eq!(
         point.payload.as_ref().unwrap()["note"],
         serde_json::json!(big)

@@ -73,19 +73,18 @@ impl CollectionStore {
     }
 
     /// Merge the given fields into a slot's payload in PayloadStore.
-    pub(super) fn merge_payload_at(
-        &self,
-        slot: u32,
-        partial: &Payload,
-        lsn: u64,
-    ) -> Result<()> {
+    pub(super) fn merge_payload_at(&self, slot: u32, partial: &Payload, lsn: u64) -> Result<()> {
         let data = self.data_arc();
         let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        ps.merge_at(slot, partial.iter().map(|(k, v)| (k.clone(), v.clone())), lsn)
+        ps.merge_at(
+            slot,
+            partial.iter().map(|(k, v)| (k.clone(), v.clone())),
+            lsn,
+        )
     }
 
     /// Re-index a slot's pre-filter structures after a non-upsert payload
@@ -203,11 +202,9 @@ impl CollectionStore {
         let data_dir = self.data_dir();
         let generation = self.generation.read().clone();
         inner.payload_indexes.save_defs(&data_dir)?;
-        inner.payload_indexes.save(
-            &data_dir,
-            generation.id(),
-            generation.lsn(),
-        )?;
+        inner
+            .payload_indexes
+            .save(&data_dir, generation.id(), generation.lsn())?;
         Ok(())
     }
 
@@ -221,11 +218,9 @@ impl CollectionStore {
         let data_dir = self.data_dir();
         inner.payload_indexes.save_defs(&data_dir)?;
         let generation = self.generation.read().clone();
-        inner.payload_indexes.save(
-            &data_dir,
-            generation.id(),
-            generation.lsn(),
-        )?;
+        inner
+            .payload_indexes
+            .save(&data_dir, generation.id(), generation.lsn())?;
         Ok(true)
     }
 

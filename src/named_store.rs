@@ -38,8 +38,8 @@ mod write;
 
 pub(crate) use self::score::score_pair;
 pub(crate) use self::score::sparse_scores;
-pub(crate) use crate::kind_store::truncate_topk;
 pub use self::write::named_upsert_record;
+pub(crate) use crate::kind_store::truncate_topk;
 
 /// One live point of a named collection: a handle to its blob plus payload.
 /// The vectors are decoded out of the blob on demand, per space.
@@ -195,7 +195,8 @@ impl NamedStore {
     /// Sparse spaces in declaration order, with their indices.
     fn sparse_spaces(&self) -> impl Iterator<Item = (&str, u16)> {
         self.spaces.iter().filter_map(|(name, meta)| {
-            (meta.kind == VectorKind::Sparse).then(|| (name.as_str(), self.order_of(name).unwrap_or(0)))
+            (meta.kind == VectorKind::Sparse)
+                .then(|| (name.as_str(), self.order_of(name).unwrap_or(0)))
         })
     }
 

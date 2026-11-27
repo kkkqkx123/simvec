@@ -61,9 +61,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use memmap2::MmapMut;
 #[cfg(test)]
 use memmap2::Mmap;
+use memmap2::MmapMut;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
@@ -135,7 +135,11 @@ pub struct WalPoint {
 
 impl WalPoint {
     pub fn from_point(point: &VectorPoint) -> Result<Self> {
-        if point.vectors.len() != 1 || !point.vectors.contains_key(crate::types::DEFAULT_VECTOR_NAME) {
+        if point.vectors.len() != 1
+            || !point
+                .vectors
+                .contains_key(crate::types::DEFAULT_VECTOR_NAME)
+        {
             return Err(VectorSearchError::InvalidConfig(
                 "dense WAL upserts must carry exactly the default vector space".to_string(),
             ));
@@ -671,7 +675,10 @@ impl Wal {
         // contain the whole log. Publish that fact before unlinking so a
         // crash cannot leave a reused segment replayable.
         let covered = if state.active_last_lsn == u64::MAX {
-            state.segments.last().map_or(0, |name| name.saturating_sub(1))
+            state
+                .segments
+                .last()
+                .map_or(0, |name| name.saturating_sub(1))
         } else {
             state.active_last_lsn
         };
@@ -824,8 +831,8 @@ impl std::fmt::Debug for Wal {
 
 /// Framed length of a record holding `data_len` payload bytes, 8-aligned.
 fn record_total_len(data_len: usize) -> u64 {
-    ((RECORD_HEADER_LEN as usize + data_len + RECORD_ALIGN as usize - 1)
-        / RECORD_ALIGN as usize * RECORD_ALIGN as usize) as u64
+    ((RECORD_HEADER_LEN as usize + data_len + RECORD_ALIGN as usize - 1) / RECORD_ALIGN as usize
+        * RECORD_ALIGN as usize) as u64
 }
 
 /// Normalize a segment capacity: at least header plus one minimal record,
@@ -917,8 +924,11 @@ fn read_segment_bytes(
     let mut offset = SEG_HEADER_LEN;
     let len = bytes.len() as u64;
     while offset + RECORD_HEADER_LEN <= len {
-        let record_len =
-            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        let record_len = u32::from_le_bytes(
+            bytes[offset as usize..offset as usize + 4]
+                .try_into()
+                .expect("len slice"),
+        );
         if record_len == 0 {
             // Preallocated slack: end of the valid prefix.
             break;
@@ -947,8 +957,11 @@ fn read_segment_bytes(
         let mut len_le = [0u8; 4];
         len_le.copy_from_slice(&bytes[offset as usize..offset as usize + 4]);
         let expected = chain_crc(crc, &len_le, &bytes[data_start..data_end], pad);
-        let stored =
-            u32::from_le_bytes(bytes[offset as usize + 4..offset as usize + 8].try_into().expect("crc slice"));
+        let stored = u32::from_le_bytes(
+            bytes[offset as usize + 4..offset as usize + 8]
+                .try_into()
+                .expect("crc slice"),
+        );
         if !pad_ok || expected != stored {
             // Torn write or bit rot. In the tail segment nothing after it can
             // be trusted either, so the replay simply ends; in an earlier
@@ -994,8 +1007,11 @@ fn walk_tail_prefix(dir: &Path, name: u64) -> (u64, Option<u32>) {
     let mut offset = SEG_HEADER_LEN;
     let len = bytes.len() as u64;
     while offset + RECORD_HEADER_LEN <= len {
-        let record_len =
-            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        let record_len = u32::from_le_bytes(
+            bytes[offset as usize..offset as usize + 4]
+                .try_into()
+                .expect("len slice"),
+        );
         if record_len == 0 || record_len > MAX_RECORD_LEN {
             break;
         }
@@ -1010,8 +1026,11 @@ fn walk_tail_prefix(dir: &Path, name: u64) -> (u64, Option<u32>) {
         let mut len_le = [0u8; 4];
         len_le.copy_from_slice(&bytes[offset as usize..offset as usize + 4]);
         let expected = chain_crc(crc, &len_le, &bytes[data_start..data_end], pad);
-        let stored =
-            u32::from_le_bytes(bytes[offset as usize + 4..offset as usize + 8].try_into().expect("crc slice"));
+        let stored = u32::from_le_bytes(
+            bytes[offset as usize + 4..offset as usize + 8]
+                .try_into()
+                .expect("crc slice"),
+        );
         if !pad_ok || expected != stored {
             break;
         }
@@ -1038,8 +1057,11 @@ fn walk_valid_prefix(dir: &Path, name: u64) -> Result<u64> {
     let mut offset = SEG_HEADER_LEN;
     let len = bytes.len() as u64;
     while offset + RECORD_HEADER_LEN <= len {
-        let record_len =
-            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        let record_len = u32::from_le_bytes(
+            bytes[offset as usize..offset as usize + 4]
+                .try_into()
+                .expect("len slice"),
+        );
         if record_len == 0 || record_len > MAX_RECORD_LEN {
             break;
         }
@@ -1102,7 +1124,11 @@ fn take_spare(dir: &Path, target: &Path, capacity: u64) -> Result<bool> {
 fn make_spare(dir: &Path, capacity: u64) -> Result<()> {
     let spare = dir.join(SPARE_NAME);
     if spare.exists() {
-        if std::fs::metadata(&spare).map(|meta| meta.len()).unwrap_or(0) == capacity {
+        if std::fs::metadata(&spare)
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            == capacity
+        {
             return Ok(());
         }
         let _ = std::fs::remove_file(&spare);
@@ -1306,7 +1332,11 @@ mod tests {
         let segment = segment_path(&path, 1);
         let valid = wal.active_valid_len_for_test().unwrap();
         {
-            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment)
+                .unwrap();
             let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
             let last = (valid - 1) as usize;
             mmap[last] ^= 0xFF;
@@ -1333,7 +1363,11 @@ mod tests {
         let valid = first.active_valid_len_for_test().unwrap();
         {
             let segment = segment_path(&path, 1);
-            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment)
+                .unwrap();
             let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
             mmap[valid as usize] = 0xFF;
             mmap.flush().unwrap();
@@ -1348,7 +1382,10 @@ mod tests {
         let reopened = wal(&path);
         let (txns, last) = reopened.read_all().unwrap();
         assert_eq!(last, 2);
-        assert_eq!(txns.iter().map(|t| t.txn_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            txns.iter().map(|t| t.txn_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]
@@ -1365,7 +1402,11 @@ mod tests {
         {
             use std::io::{Seek, SeekFrom};
             let segment = segment_path(&path, 1);
-            let mut file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment)
+                .unwrap();
             file.set_len(valid + 16).unwrap();
             file.seek(SeekFrom::Start(valid)).unwrap();
             file.write_all(&[0xFF]).unwrap();
@@ -1401,7 +1442,11 @@ mod tests {
         let segment = segment_path(&path, 1);
         let file_len = wal.active_valid_len_for_test().unwrap();
         {
-            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment)
+                .unwrap();
             let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
             let last = (file_len - 1) as usize;
             mmap[last] ^= 0xFF;
@@ -1466,7 +1511,7 @@ mod tests {
         let last = wal
             .replay(|t| {
                 seen.push((t.txn_id, t.ops.clone()));
-            Ok(())
+                Ok(())
             })
             .unwrap();
         assert_eq!(last, 2);
@@ -1665,7 +1710,11 @@ mod tests {
         // replay cannot treat that as a torn tail, because the log evidently
         // continues behind it.
         let segment = segment_path(&path, names[0]);
-        let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment)
+            .unwrap();
         let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         // Flip a byte inside the first record's payload: the length prefix
         // still parses but the chained CRC no longer matches.
@@ -1729,7 +1778,11 @@ mod tests {
         // Rewrite the header's first-lsn so it disagrees with the file name.
         let segment = segment_path(&path, 5);
         {
-            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment)
+                .unwrap();
             let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
             mmap[12..20].copy_from_slice(&99u64.to_le_bytes());
             mmap.flush().unwrap();
@@ -1756,16 +1809,15 @@ mod tests {
             let mmap = read_segment_mmap(&segment_path(&path, name)).unwrap();
             let mut offset = SEG_HEADER_LEN as usize;
             while offset + RECORD_HEADER_LEN as usize <= mmap.len() {
-                let record_len = u32::from_le_bytes(
-                    mmap[offset..offset + 4].try_into().expect("len slice"),
-                );
+                let record_len =
+                    u32::from_le_bytes(mmap[offset..offset + 4].try_into().expect("len slice"));
                 if record_len == 0 {
                     break;
                 }
-                let framed =
-                    record_total_len(record_len as usize) as usize;
+                let framed = record_total_len(record_len as usize) as usize;
                 let txn: WalTxn = postcard::from_bytes(
-                    &mmap[offset + RECORD_HEADER_LEN as usize..offset + RECORD_HEADER_LEN as usize + record_len as usize],
+                    &mmap[offset + RECORD_HEADER_LEN as usize
+                        ..offset + RECORD_HEADER_LEN as usize + record_len as usize],
                 )
                 .unwrap();
                 assert_eq!(txn.txn_id, expected, "record index order");

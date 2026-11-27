@@ -411,8 +411,7 @@ impl CollectionStore {
                     || inner.meta.next_slot != plan.next_slot
                     || inner.meta.tombstone_count != plan.tombstone_count;
                 if !raced {
-                    let live =
-                        self.commit_generation(&mut inner, &plan, staged, remapped)?;
+                    let live = self.commit_generation(&mut inner, &plan, staged, remapped)?;
                     self.metrics.record_compaction(started.elapsed());
                     return Ok(live);
                 }

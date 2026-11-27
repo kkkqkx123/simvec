@@ -16,6 +16,8 @@
 //! reads as missing and `Generation::open` reports corruption instead of
 //! silently falling back to an older generation.
 
+#[cfg(unix)]
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
@@ -25,8 +27,6 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::OnceLock;
-#[cfg(unix)]
-use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -133,9 +133,11 @@ impl Generation {
 
     /// Create the next generation's staging directory.
     pub(crate) fn stage(&self) -> Result<StagedGeneration> {
-        let id = self.manifest.generation.checked_add(1).ok_or_else(|| {
-            VectorSearchError::Internal("generation id overflow".to_string())
-        })?;
+        let id = self
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| VectorSearchError::Internal("generation id overflow".to_string()))?;
         let generations = self.root.join(GENERATIONS_DIR);
         let path = generations.join(format!(".g{id:020}-staging"));
         // A previous publish may have renamed the directory but crashed
@@ -158,7 +160,8 @@ impl Generation {
     /// covers directories created by helpers that only sync file contents.
     pub(crate) fn publish(self, staged: StagedGeneration, lsn: u64) -> Result<Self> {
         sync_tree(staged.path())?;
-        let target = self.root
+        let target = self
+            .root
             .join(GENERATIONS_DIR)
             .join(format!("g{:020}", staged.id));
         if target.exists() {
@@ -232,9 +235,7 @@ impl CollectionLock {
                 .open(root.join(".lock"))?;
             let metadata = file.metadata()?;
             let key = (metadata.dev(), metadata.ino());
-            let mut locks = LOCKS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock();
+            let mut locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock();
             if let Some(entry) = locks.get_mut(&key) {
                 entry.users += 1;
                 return Ok(Self { key });

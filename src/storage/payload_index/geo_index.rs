@@ -54,8 +54,10 @@ impl GeoIndex {
             }
             ConditionType::GeoBoundingBox(bbox) => {
                 for (&slot, point) in &self.points {
-                    let in_lat = point.lat <= bbox.top_left.lat && point.lat >= bbox.bottom_right.lat;
-                    let in_lon = point.lon >= bbox.top_left.lon && point.lon <= bbox.bottom_right.lon;
+                    let in_lat =
+                        point.lat <= bbox.top_left.lat && point.lat >= bbox.bottom_right.lat;
+                    let in_lon =
+                        point.lon >= bbox.top_left.lon && point.lon <= bbox.bottom_right.lon;
                     if in_lat && in_lon && (slot as usize) < mask.len() {
                         mask.set(slot as usize, true);
                     }

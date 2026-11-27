@@ -123,9 +123,7 @@ pub(crate) fn truncate_topk(scored: &mut Vec<(u32, f32)>, offset: usize, limit: 
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         return;
     }
-    scored.select_nth_unstable_by(need, |a, b| {
-        b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
-    });
+    scored.select_nth_unstable_by(need, |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     scored.truncate(need);
     scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 }

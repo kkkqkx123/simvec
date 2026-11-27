@@ -134,9 +134,10 @@ impl CollectionStore {
             ivf_segments: &ivf_segments,
         };
         if !snap.hnsw_segments.is_empty() {
-            let selective = snap.filter_mask.as_ref().is_some_and(|m| {
-                m.count_ones() <= snap.hnsw_segments[0].index.default_ef()
-            });
+            let selective = snap
+                .filter_mask
+                .as_ref()
+                .is_some_and(|m| m.count_ones() <= snap.hnsw_segments[0].index.default_ef());
             let results = if selective {
                 self.search_exact(query, &snap, metric, next_slot, filtered, started)
             } else {

@@ -377,7 +377,11 @@ pub fn named_upsert_record(point: &VectorPoint) -> Result<WalRecord> {
             "named collection upserts must carry named-space vectors".to_string(),
         ));
     }
-    if point.vectors.len() == 1 && point.vectors.contains_key(crate::types::DEFAULT_VECTOR_NAME) {
+    if point.vectors.len() == 1
+        && point
+            .vectors
+            .contains_key(crate::types::DEFAULT_VECTOR_NAME)
+    {
         return Err(VectorSearchError::InvalidConfig(
             "named collection upserts must target declared named spaces".to_string(),
         ));

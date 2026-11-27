@@ -136,7 +136,10 @@ fn test_partial_wal_record_is_tolerated() {
         use std::io::Write;
         let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
         let active = wal.active_segment_path().expect("log has a tail segment");
-        let mut f = std::fs::OpenOptions::new().append(true).open(active).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(active)
+            .unwrap();
         f.write_all(&4096u32.to_le_bytes()).unwrap();
         f.sync_all().unwrap();
     }

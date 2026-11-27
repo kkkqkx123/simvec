@@ -362,9 +362,7 @@ impl LocalVectorEngine {
             match op {
                 TxnOp::Upsert { collection, point } => {
                     let record = match self.require_handle(&collection)? {
-                        SpaceHandle::Named(_) => {
-                            crate::named_store::named_upsert_record(&point)?
-                        }
+                        SpaceHandle::Named(_) => crate::named_store::named_upsert_record(&point)?,
                         SpaceHandle::Kind(_) => kind_upsert_record(&point)?,
                         SpaceHandle::Dense(_) => WalRecord::Upsert {
                             point: WalPoint::from_point(&point)?,

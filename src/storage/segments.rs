@@ -102,7 +102,10 @@ pub(crate) fn segment_range(index: usize, segment_slots: u32, next_slot: u64) ->
     }
     let start = index as u64 * segment_slots as u64;
     let end = ((index as u64 + 1) * segment_slots as u64).min(next_slot);
-    (start.min(u32::MAX as u64) as u32, end.min(u32::MAX as u64) as u32)
+    (
+        start.min(u32::MAX as u64) as u32,
+        end.min(u32::MAX as u64) as u32,
+    )
 }
 
 /// Derive per-segment live/tombstone counts by scanning the tombstone table.

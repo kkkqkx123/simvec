@@ -8,9 +8,7 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
 
-use super::{
-    prefer_posting_scan, score_view, sparse_candidate_scores, truncate_topk, KindStore,
-};
+use super::{prefer_posting_scan, score_view, sparse_candidate_scores, truncate_topk, KindStore};
 
 impl KindStore {
     /// Collection kind served by this store.
@@ -87,8 +85,8 @@ impl KindStore {
     /// in the mapped blob file.
     pub fn memory_bytes(&self) -> u64 {
         let inner = self.inner.lock();
-        let directory = inner.points.capacity() as u64
-            * std::mem::size_of::<Option<super::KindPoint>>() as u64;
+        let directory =
+            inner.points.capacity() as u64 * std::mem::size_of::<Option<super::KindPoint>>() as u64;
         let norms = (inner.norms.capacity() as u64) * (std::mem::size_of::<(u32, f32)>() as u64);
         let postings = self.postings.load().memory_bytes();
         directory + norms + postings + self.blobs.load().mapped_bytes()
@@ -318,10 +316,9 @@ impl KindStore {
             }
             let vectors = match reader.as_ref() {
                 Some(reader) => match reader.to_data(point.blob) {
-                    Some(data) => BTreeMap::from([(
-                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
-                        data,
-                    )]),
+                    Some(data) => {
+                        BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), data)])
+                    }
                     None => continue,
                 },
                 None => BTreeMap::new(),

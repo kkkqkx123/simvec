@@ -22,7 +22,8 @@ impl NamedStore {
                     crate::types::VectorKind::Multi => VectorSpaceConfig::multi(
                         meta.vector_size,
                         meta.distance,
-                        meta.multi_config.unwrap_or_else(|| crate::types::MultiConfig::new(1)),
+                        meta.multi_config
+                            .unwrap_or_else(|| crate::types::MultiConfig::new(1)),
                     ),
                     crate::types::VectorKind::Dense => {
                         VectorSpaceConfig::dense(meta.vector_size, meta.distance)
@@ -67,14 +68,21 @@ impl NamedStore {
     /// means at least one was rebuilt from the snapshot, which is what a crash
     /// between the manifest write and the snapshot leaves behind.
     pub fn postings_restored(&self) -> bool {
-        self.postings.load().values().all(|space| space.was_restored())
+        self.postings
+            .load()
+            .values()
+            .all(|space| space.was_restored())
     }
 
     /// (bytes of the vector blob file, bytes of all posting buckets).
     pub fn storage_bytes(&self) -> (u64, u64) {
         (
             self.blobs.load().len(),
-            self.postings.load().values().map(|space| space.disk_bytes()).sum(),
+            self.postings
+                .load()
+                .values()
+                .map(|space| space.disk_bytes())
+                .sum(),
         )
     }
 
@@ -398,7 +406,7 @@ impl NamedStore {
             }
             let vectors = if with_vector {
                 let blobs_guard = self.blobs.load();
-        let reader = blobs_guard.reader();
+                let reader = blobs_guard.reader();
                 let mut vectors = BTreeMap::new();
                 if let Some(bytes) = reader.bytes(point.blob) {
                     for (index, entry) in named_entries(bytes).unwrap_or_default() {

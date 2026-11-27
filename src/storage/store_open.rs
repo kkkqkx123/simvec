@@ -173,8 +173,10 @@ impl CollectionStore {
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
         // New collections always use the Gridstore-style PayloadStore.
-        let payload_store =
-            PayloadStore::create(&data_dir.join("payloads_store"), storage.payload_store_config())?;
+        let payload_store = PayloadStore::create(
+            &data_dir.join("payloads_store"),
+            storage.payload_store_config(),
+        )?;
         let files = ArcSwap::from(Arc::new(DataFiles {
             dir: data_dir,
             vectors,
@@ -278,9 +280,7 @@ impl CollectionStore {
         // exact generation view; otherwise the payload store and WAL replay
         // rebuild the masks from scratch.
         let restored = PayloadIndexManager::load(&data_dir, generation.id(), generation.lsn())
-            .is_some_and(|data| {
-                payload_indexes.restore(data, generation.id(), generation.lsn())
-            });
+            .is_some_and(|data| payload_indexes.restore(data, generation.id(), generation.lsn()));
         if !restored && !definitions.is_empty() {
             payload_indexes = PayloadIndexManager::new();
             declare_all(&mut payload_indexes);
@@ -295,7 +295,10 @@ impl CollectionStore {
             .filter(|snapshot| snapshot.matches(&generation, &meta, tombstone_count));
         {
             let ps_guard = files.payload_store.load();
-            let payload_store = ps_guard.as_ref().as_ref().expect("payload store is present");
+            let payload_store = ps_guard
+                .as_ref()
+                .as_ref()
+                .expect("payload store is present");
             if let Some(snapshot) = &snapshot {
                 for point in &snapshot.points {
                     let id = DenseSnapshot::point_id(point);
@@ -425,11 +428,8 @@ impl CollectionStore {
             // Prefer per-segment marks published by the last checkpoint;
             // fall back to the generation floor when the manifest carries
             // no current accounting.
-            let persisted = super::segments::read_entries(
-                &self.data_dir(),
-                segment_slots,
-                next_slot,
-            );
+            let persisted =
+                super::segments::read_entries(&self.data_dir(), segment_slots, next_slot);
             if persisted.len() == count && count > 0 {
                 for (cell, entry) in inner.segment_persisted.iter_mut().zip(persisted.iter()) {
                     *cell = entry.persisted_lsn;
@@ -442,9 +442,8 @@ impl CollectionStore {
         }
         let live = inner.reverse.len() as u64;
         let tomb = self.data_arc().tombstones.load().count_ones();
-        let changed = water_changed
-            || inner.meta.live_count != live
-            || inner.meta.tombstone_count != tomb;
+        let changed =
+            water_changed || inner.meta.live_count != live || inner.meta.tombstone_count != tomb;
         inner.meta.live_count = live;
         inner.meta.tombstone_count = tomb;
         if changed {

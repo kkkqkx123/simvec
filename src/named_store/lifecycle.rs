@@ -187,15 +187,15 @@ impl NamedStore {
             // point was logged.
             {
                 let blobs_guard = self.blobs.load();
-        let reader = blobs_guard.reader();
+                let reader = blobs_guard.reader();
                 let bytes = reader.bytes(point.blob).ok_or_else(|| {
                     VectorSearchError::CorruptData(format!(
                         "snapshot slot {} references a missing vector blob",
                         point.slot
                     ))
                 })?;
-                for (index, entry) in crate::storage::point_blobs::named_entries(bytes)
-                    .ok_or_else(|| {
+                for (index, entry) in
+                    crate::storage::point_blobs::named_entries(bytes).ok_or_else(|| {
                         VectorSearchError::CorruptData(format!(
                             "snapshot slot {} holds an unreadable vector blob",
                             point.slot
@@ -208,12 +208,13 @@ impl NamedStore {
                             point.slot
                         ))
                     })?;
-                    let view = crate::storage::point_blobs::decode_vector(entry).ok_or_else(|| {
-                        VectorSearchError::CorruptData(format!(
-                            "snapshot slot {} holds an undecodable {space} vector",
-                            point.slot
-                        ))
-                    })?;
+                    let view =
+                        crate::storage::point_blobs::decode_vector(entry).ok_or_else(|| {
+                            VectorSearchError::CorruptData(format!(
+                                "snapshot slot {} holds an undecodable {space} vector",
+                                point.slot
+                            ))
+                        })?;
                     self.check_view(space, &view)?;
                     if rebuild_postings {
                         if let Some(postings) = self.postings_of(space) {
@@ -325,12 +326,7 @@ impl NamedStore {
             &staged.path().join(PAYLOADS_FILE),
             Some(staged_state.payloads_len),
         )?;
-        let postings = open_postings(
-            staged.path(),
-            &self.spaces,
-            &self.space_order,
-            Some(lsn),
-        )?;
+        let postings = open_postings(staged.path(), &self.spaces, &self.space_order, Some(lsn))?;
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
@@ -409,8 +405,12 @@ impl NamedStore {
                         for (index, entry) in
                             crate::storage::point_blobs::named_entries(bytes).unwrap_or_default()
                         {
-                            let Some(space) = self.space_at(index) else { continue };
-                            let Some(space_postings) = postings.get(space) else { continue };
+                            let Some(space) = self.space_at(index) else {
+                                continue;
+                            };
+                            let Some(space_postings) = postings.get(space) else {
+                                continue;
+                            };
                             if let Some(crate::types::VectorView::Sparse { indices, values }) =
                                 crate::storage::point_blobs::decode_vector(entry)
                             {
@@ -597,7 +597,10 @@ impl NamedStore {
             inner.tombstone_slot(slot);
         }
         let slot = inner.points.len() as u32;
-        let blob = self.blobs.load().append(&encode_named(&vectors, &self.space_order))?;
+        let blob = self
+            .blobs
+            .load()
+            .append(&encode_named(&vectors, &self.space_order))?;
         for (space, data) in &vectors {
             if let (VectorData::Sparse { indices, values }, Some(postings)) =
                 (data, self.postings_of(space))
@@ -649,7 +652,7 @@ impl NamedStore {
         }
         let merged = {
             let blobs_guard = self.blobs.load();
-        let reader = blobs_guard.reader();
+            let reader = blobs_guard.reader();
             let bytes = reader.bytes(existing.blob).ok_or_else(|| {
                 VectorSearchError::CorruptData(format!("point {id} references a missing blob"))
             })?;
@@ -792,7 +795,6 @@ impl NamedStore {
         }
         Ok(())
     }
-
 }
 
 /// Assign each declared space a stable index. `BTreeMap` iterates in name
@@ -819,7 +821,10 @@ fn open_postings(
         }
         let index = order.get(name).copied().unwrap_or(0);
         let space_dir = dir.join(POSTINGS_DIR).join(format!("{index:03}"));
-        postings.insert(name.clone(), Arc::new(Postings::open(&space_dir, snapshot_lsn)?));
+        postings.insert(
+            name.clone(),
+            Arc::new(Postings::open(&space_dir, snapshot_lsn)?),
+        );
     }
     Ok(postings)
 }

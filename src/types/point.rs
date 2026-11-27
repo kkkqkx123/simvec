@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
 use crate::filter_cond::PointId;
-use crate::types::config::{DEFAULT_VECTOR_NAME, VectorKind};
+use crate::types::config::{VectorKind, DEFAULT_VECTOR_NAME};
 
 pub type Payload = std::collections::HashMap<String, serde_json::Value>;
 
@@ -90,7 +90,10 @@ impl VectorData {
     /// Length, uniqueness and finiteness are still checked by [`Self::validate`].
     pub fn normalized(self) -> Self {
         match self {
-            VectorData::Sparse { mut indices, mut values } => {
+            VectorData::Sparse {
+                mut indices,
+                mut values,
+            } => {
                 let mut pairs: Vec<(u32, f32)> = indices.drain(..).zip(values.drain(..)).collect();
                 pairs.sort_unstable_by_key(|(index, _)| *index);
                 let (indices, values) = pairs.into_iter().unzip();

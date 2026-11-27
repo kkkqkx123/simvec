@@ -171,7 +171,8 @@ impl Vectors {
         }
         let file = self.file.lock();
         file.sync_all()?;
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 

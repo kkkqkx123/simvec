@@ -131,14 +131,14 @@ impl CollectionStore {
         // generation/lsn as the snapshot avoids a full rebuild at open. A
         // crash before the manifest advance leaves it ahead of the manifest
         // and open discards it.
-        inner.payload_indexes.save(
-            &data_dir,
-            generation.id(),
-            inner.meta.last_applied_txn,
-        )?;
+        inner
+            .payload_indexes
+            .save(&data_dir, generation.id(), inner.meta.last_applied_txn)?;
         // Publish the generation's lsn before the WAL watermark: recovery
         // never replays past what this generation's files contain.
-        self.generation.write().set_lsn(inner.meta.last_applied_txn)?;
+        self.generation
+            .write()
+            .set_lsn(inner.meta.last_applied_txn)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
         // Marker first (this append itself fsyncs the log), then truncate
         // through the water mark clamped by live pins. A snapshot pin holds

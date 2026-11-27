@@ -763,7 +763,9 @@ fn test_healing_removes_deleted_neighbor_without_rebuild() {
     bits.set(removed as usize, true);
     let tombstones = TombstoneBits::from_bits(bits);
 
-    index.heal_deleted(removed, &mmaps, 256, 0, |slot| tombstones.bit(slot as usize));
+    index.heal_deleted(removed, &mmaps, 256, 0, |slot| {
+        tombstones.bit(slot as usize)
+    });
 
     for slot in slots {
         let Some(node) = index.node(slot) else {

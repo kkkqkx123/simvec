@@ -340,7 +340,8 @@ impl VectorEngine for LocalVectorEngine {
             let mut config = CollectionConfig::new(kind.vector_size(), kind.distance());
             config.kind = kind.kind();
             if kind.kind() == crate::types::VectorKind::Multi {
-                config.multi_config = Some(crate::types::MultiConfig::new(kind.max_vectors_per_point()));
+                config.multi_config =
+                    Some(crate::types::MultiConfig::new(kind.max_vectors_per_point()));
             }
             config.index = crate::types::IndexConfig::Flat;
             config.max_points = kind.max_points();

@@ -39,20 +39,20 @@ mod keys;
 mod meta;
 mod payload_index;
 mod payload_key;
+pub(crate) mod payload_store;
 pub(crate) mod point_blobs;
 pub(crate) mod postings;
-pub(crate) mod payload_store;
 pub(crate) mod quant;
 mod queue;
-pub(crate) mod segments;
-mod wal_ack;
 mod search;
 mod segment_hnsw;
 mod segment_ivf;
+pub(crate) mod segments;
 pub(crate) mod snapshot;
 mod tombstones;
 pub(crate) mod vectors;
 mod wal;
+mod wal_ack;
 
 mod dense_snapshot;
 mod store_maintenance;
@@ -76,8 +76,8 @@ pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
 pub use snapshot::{verify_snapshot, SnapshotInfo};
 pub(crate) use tombstones::TombstoneBits;
-pub(crate) use wal_ack::{WalAckPinGuard, WalAckPins};
 pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
+pub(crate) use wal_ack::{WalAckPinGuard, WalAckPins};
 
 use self::filter_bitmap::FilterBitmap;
 use self::keys::Keys;
@@ -277,7 +277,11 @@ impl StoreInner {
         if self.segment_persisted.is_empty() {
             return fallback;
         }
-        self.segment_persisted.iter().copied().min().unwrap_or(fallback)
+        self.segment_persisted
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(fallback)
     }
 }
 
@@ -350,12 +354,9 @@ impl DataFiles {
         )?;
         let keys = Keys::open(&dir.join("keys.bin"))?;
         let segments = segments::read_or_derive(&dir, meta.segment_slots, meta.next_slot)?;
-        let tombstones = TombstoneBits::load(
-            &dir,
-            meta.slot_capacity as usize,
-            meta.tombstone_count,
-        )?
-        .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
+        let tombstones =
+            TombstoneBits::load(&dir, meta.slot_capacity as usize, meta.tombstone_count)?
+                .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
         let payload_store = PayloadStore::open_with_repair(
             &dir.join("payloads_store"),
             replay_floor,
@@ -535,10 +536,7 @@ impl CollectionStore {
                 &mut reused_files,
             )
         };
-        copy(
-            &self.dir.join("generation.bin"),
-            "generation.bin",
-        )?;
+        copy(&self.dir.join("generation.bin"), "generation.bin")?;
         let generation_rel = format!("{}/g{:020}", generation::GENERATIONS_DIR, generation.id());
         copy(&generation.path(), &generation_rel)?;
         copy(&self.dir.join("wal"), "wal")?;
@@ -560,8 +558,7 @@ impl CollectionStore {
     /// Such a collection stays readable but must be reopened before more
     /// writes are accepted.
     pub fn is_poisoned(&self) -> bool {
-        self.generation_poisoned
-            .load(AtomicOrdering::Acquire)
+        self.generation_poisoned.load(AtomicOrdering::Acquire)
     }
 
     fn ensure_not_poisoned(&self) -> Result<()> {
@@ -734,11 +731,9 @@ fn copy_snapshot_file(
     let (len, crc32) = snapshot::file_checksum(src)?;
     let reusable = base.and_then(|(base_dir, info)| {
         info.files.iter().find(|file| {
-            file.path == rel
-                && file.version == version
-                && file.len == len
-                && file.crc32 == crc32
-        })?; snapshot::checked_path(base_dir, rel).ok()
+            file.path == rel && file.version == version && file.len == len && file.crc32 == crc32
+        })?;
+        snapshot::checked_path(base_dir, rel).ok()
     });
     let mut linked = false;
     if let Some(from) = reusable {

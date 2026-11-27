@@ -425,9 +425,7 @@ fn failed_batch_retry_checkpoint_reopen_is_identical() {
         store.apply_ops(&[upsert_op(point)]).unwrap();
     }
     // Payload edits resolve by external id on both the live and replay paths.
-    store
-        .set_payload(&PointId::Num(1), payload("q1"))
-        .unwrap();
+    store.set_payload(&PointId::Num(1), payload("q1")).unwrap();
     store
         .set_payload_fields(&PointId::Num(3), payload("q3"))
         .unwrap();

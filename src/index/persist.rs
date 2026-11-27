@@ -294,10 +294,7 @@ mod tests {
             load_at(&path).unwrap().is_none(),
             "CRC mismatch must be treated as corrupt"
         );
-        assert!(
-            !path.exists(),
-            "corrupt payload file must be deleted"
-        );
+        assert!(!path.exists(), "corrupt payload file must be deleted");
     }
 
     #[test]

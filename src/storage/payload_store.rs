@@ -281,9 +281,8 @@ impl PayloadStore {
             let stored = pages.read_value(&pointer, &config)?;
             // CRC plus codec framing is validated here; JSON parsing waits
             // for reads so a damaged page fails open instead of serving.
-            decode_payload_json(&stored).map_err(|e| {
-                VectorSearchError::CorruptData(format!("slot {slot}: {e}"))
-            })?;
+            decode_payload_json(&stored)
+                .map_err(|e| VectorSearchError::CorruptData(format!("slot {slot}: {e}")))?;
         }
 
         // The tracker (including its journal) is the authority for which
@@ -487,7 +486,6 @@ impl PayloadStore {
     pub fn max_payload_bytes(&self) -> usize {
         self.config.page_size.saturating_sub(PAYLOAD_HEADER_LEN)
     }
-
 
     /// Number of blocks needed for a given byte length.
     fn blocks_needed(&self, len: usize) -> u32 {
@@ -775,7 +773,11 @@ mod tests {
             store.checkpoint().unwrap();
             // The codec byte is present and the CRC covers it.
             let pointer = store.tracker.read().get(0).unwrap();
-            let raw = store.pages.read().read_value(&pointer, &store.config).unwrap();
+            let raw = store
+                .pages
+                .read()
+                .read_value(&pointer, &store.config)
+                .unwrap();
             assert_eq!(raw[4], CODEC_LZ4, "lz4 values carry the codec byte");
         }
         {

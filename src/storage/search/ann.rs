@@ -196,14 +196,11 @@ impl CollectionStore {
         // candidates (pgvector-style iterative scan) before widening ef.
         self.metrics
             .record_search_retry(SearchRetry::IterativeExpansion);
-        let candidates =
-            self.probe_segmented_hnsw_iterative(query, ef, snap, quant)?;
+        let candidates = self.probe_segmented_hnsw_iterative(query, ef, snap, quant)?;
         let candidates = self.merge_pending(candidates, pending, query, snap);
         let candidates = self.rescore_exact(candidates, do_rescore, query, snap);
         let results = self.finish_candidates(candidates, query, snap)?;
-        if results.len() >= query.limit
-            || ef >= snap.hnsw_segments[0].index.node_count()
-        {
+        if results.len() >= query.limit || ef >= snap.hnsw_segments[0].index.node_count() {
             self.metrics
                 .record_search(SearchPath::Hnsw, true, started.elapsed());
             return Ok(results);
