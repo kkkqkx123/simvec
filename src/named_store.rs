@@ -17,15 +17,17 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
+use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::storage::point_blobs::{BlobRef, PointBlobs};
 use crate::storage::postings::Postings;
-use crate::storage::{Generation, IdMap, Wal};
+use crate::storage::{CollectionLock, Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
 mod lifecycle;
@@ -122,6 +124,8 @@ struct NamedSnapshot {
 /// A single opened named-vectors collection.
 pub struct NamedStore {
     dir: PathBuf,
+    _dir_lock: CollectionLock,
+    generation_poisoned: AtomicBool,
     name: String,
     spaces: BTreeMap<String, NamedSpaceMeta>,
     /// Stable space index, the key a point blob uses for each space. Derived
@@ -146,6 +150,24 @@ pub struct NamedStore {
     /// Sparse postings per space, keyed by space name. Dense and multi spaces
     /// have no entry.
     postings: ArcSwap<HashMap<String, Arc<Postings>>>,
+}
+
+impl NamedStore {
+    /// Whether a generation publish left the in-memory switch unfinished.
+    pub fn is_poisoned(&self) -> bool {
+        self.generation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(VectorSearchError::Internal(format!(
+                "collection {} must be reopened after an interrupted generation publish",
+                self.dir.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for NamedStore {

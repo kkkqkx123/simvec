@@ -218,13 +218,14 @@ impl BlobDirectory {
     /// Flush writes since the last `sync` to stable storage. Returns whether
     /// anything was flushed. Called at checkpoint time only; the WAL carries
     /// the same data for recovery, so per-append fsync is not needed.
-    pub fn sync(&self) -> bool {
-        if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return false;
+    pub fn sync(&self) -> Result<bool> {
+        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
         }
         let file = self.file.lock();
-        file.sync_all().ok();
-        true
+        file.sync_all()?;
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
     }
 
     pub fn snapshot(&self) -> arc_swap::Guard<Arc<DirView>> {
@@ -512,7 +513,7 @@ mod tests {
         {
             let dir_file = BlobDirectory::create(&path, *b"VTST", 12, 4).unwrap();
             dir_file.append_blob(0, b"hello", 1).unwrap();
-            assert!(dir_file.sync());
+            assert!(dir_file.sync().unwrap());
         }
 
         let dir_file = BlobDirectory::open(&path, *b"VTST").unwrap();

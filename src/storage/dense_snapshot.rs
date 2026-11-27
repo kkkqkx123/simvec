@@ -41,8 +41,6 @@ pub(crate) struct DenseSnapshot {
     pub slot_capacity: u64,
     pub live_count: u64,
     pub tombstone_count: u64,
-    /// Version of the payload store's slot→pointer table at checkpoint time.
-    pub tracker_version: u64,
     pub points: Vec<SnapshotPoint>,
     pub tombstones: Vec<u32>,
 }
@@ -77,7 +75,6 @@ impl DenseSnapshot {
         reverse: &IdMap,
         versions: &IdMap<u64>,
         tombstones: &TombstoneBits,
-        tracker_version: u64,
     ) -> Self {
         let points = Self::capture_points(reverse, versions);
         let tombstone_slots = (0..meta.next_slot as usize)
@@ -91,7 +88,6 @@ impl DenseSnapshot {
             slot_capacity: meta.slot_capacity,
             live_count: meta.live_count,
             tombstone_count: meta.tombstone_count,
-            tracker_version,
             points,
             tombstones: tombstone_slots,
         }

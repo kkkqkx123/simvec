@@ -42,6 +42,20 @@ fn delete_logged(store: &CollectionStore, id: &PointId) -> bool {
     existed
 }
 
+#[test]
+fn test_collection_lock_is_shared_within_a_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+    let store = CollectionStore::create(&store_dir, "col", &config(4)).unwrap();
+    // The engine keeps several handles for one directory (maintenance clones),
+    // so the lock is shared in-process and exclusive only against other processes.
+    let second = CollectionStore::open(&store_dir).unwrap();
+    drop(store);
+    assert_eq!(second.count(), 0);
+    drop(second);
+    assert!(CollectionStore::open(&store_dir).is_ok());
+}
+
 /// Result-returning upsert for the rejection tests.
 fn upsert_logged_result(store: &CollectionStore, point: &VectorPoint) -> Result<()> {
     store.apply_ops(&[WalRecord::Upsert {

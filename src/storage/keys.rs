@@ -37,7 +37,7 @@ impl Keys {
     }
 
     /// Flush appends since the last `sync` (batched at checkpoint time).
-    pub fn sync(&self) -> bool {
+    pub fn sync(&self) -> Result<bool> {
         self.dir.sync()
     }
 

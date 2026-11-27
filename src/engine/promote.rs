@@ -68,16 +68,17 @@ impl LocalVectorEngine {
         self.stores
             .write()
             .insert(live.to_string(), SpaceHandle::Dense(store));
+        // The old live directory is now the backup. Its lock must be
+        // released before the backup handle is opened.
+        drop(live_store);
         // Keep the backup handle loaded for inspection (`count`, reverse
         // recovery) without exposing it to search: nothing routes to
         // `.old-*` names and `collection_names` hides them.
         if backup_dir.exists() {
-            if let Ok(backup_store) = CollectionStore::open_with_storage(&backup_dir, &self.storage)
-            {
-                self.stores
-                    .write()
-                    .insert(backup_name.clone(), SpaceHandle::Dense(backup_store));
-            }
+            let backup_store = CollectionStore::open_with_storage(&backup_dir, &self.storage)?;
+            self.stores
+                .write()
+                .insert(backup_name.clone(), SpaceHandle::Dense(backup_store));
         }
         self.prune_old_backups(live, Some(&backup_name));
         Ok(())

@@ -66,7 +66,7 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
-pub(crate) use generation::Generation;
+pub(crate) use generation::{CollectionLock, Generation};
 pub(crate) use meta::Meta;
 pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
@@ -80,7 +80,7 @@ use self::quant::QuantStore;
 use self::queue::CommitQueue;
 use self::vectors::Vectors;
 
-use crate::error::Result;
+use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 
@@ -326,6 +326,12 @@ impl DataFiles {
 /// A single opened collection.
 pub struct CollectionStore {
     dir: PathBuf,
+    /// Cross-process single-writer lock on `dir`, shared by in-process handles.
+    _dir_lock: CollectionLock,
+    /// Set when a generation manifest was published but the in-memory
+    /// switch did not finish. The collection stays readable but refuses
+    /// further mutations until it is reopened from the published manifest.
+    generation_poisoned: AtomicBool,
     /// Published generation. Its lsn bounds every WAL replay.
     generation: RwLock<Generation>,
     /// File-backed handles of the published generation, swapped as a unit.
@@ -390,6 +396,24 @@ impl CollectionStore {
     /// Directory holding the currently published generation's data files.
     pub fn data_dir(&self) -> PathBuf {
         self.data_arc().dir.clone()
+    }
+
+    /// Whether a generation publish left the in-memory switch unfinished.
+    /// Such a collection stays readable but must be reopened before more
+    /// writes are accepted.
+    pub fn is_poisoned(&self) -> bool {
+        self.generation_poisoned
+            .load(AtomicOrdering::Acquire)
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(VectorSearchError::Internal(format!(
+                "collection {} must be reopened after an interrupted generation publish",
+                self.dir.display()
+            )));
+        }
+        Ok(())
     }
 
     // ── Payload routing helpers ────────────────────────────────────────

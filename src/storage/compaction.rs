@@ -276,6 +276,7 @@ impl CollectionStore {
     /// surfaces as [`VectorSearchError::InsufficientSpace`] instead of a
     /// half-rewritten collection.
     pub fn compact(&self) -> Result<u64> {
+        self.ensure_not_poisoned()?;
         let _compact_guard = self.compact_mutex.lock();
         self.ensure_compaction_space()?;
         // Hold build_mutex jointly with compact_mutex (order: compact -> build)
@@ -473,7 +474,7 @@ impl CollectionStore {
             .as_ref()
             .expect("PayloadStore must be present");
         let new_store = old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
-        let tracker_version = new_store.tracker_version();
+        drop(new_store);
         drop(ps_guard);
 
         TombstoneBits::new(plan.new_capacity as usize).save(dir, plan.new_capacity)?;
@@ -499,7 +500,6 @@ impl CollectionStore {
             slot_capacity: meta.slot_capacity,
             live_count: meta.live_count,
             tombstone_count: 0,
-            tracker_version,
             points,
             tombstones: Vec::new(),
         };
@@ -533,6 +533,12 @@ impl CollectionStore {
         let had_index = self.data_arc().index.load().is_some();
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, watermark)?;
+        // From here on the disk manifest already names the new generation.
+        // Any failure before the in-memory switch completes must stop writes
+        // instead of letting this process keep mutating files the manifest
+        // no longer describes.
+        self.generation_poisoned
+            .store(true, AtomicOrdering::Release);
         // The watermark written by the truncate below belongs to the new
         // generation, not to the one the log was opened with.
         self.wal.bind_generation(next_generation.id());
@@ -615,6 +621,8 @@ impl CollectionStore {
                 tracing::warn!(error = %e, "failed to remove superseded generation");
             }
         });
+        self.generation_poisoned
+            .store(false, AtomicOrdering::Release);
         Ok(plan.live_count)
     }
 

@@ -67,6 +67,7 @@ impl CollectionStore {
     }
 
     fn checkpoint_inner(&self, on_flush: impl FnOnce()) -> Result<u64> {
+        self.ensure_not_poisoned()?;
         let started = std::time::Instant::now();
         // Compaction and index builds rewrite or replace the files flushed
         // below, so they must not run concurrently with this pass.
@@ -93,12 +94,6 @@ impl CollectionStore {
         // at that point.
         let generation = self.generation.read().clone();
         let data = self.data_arc();
-        let tracker_version = data
-            .payload_store
-            .load()
-            .as_ref()
-            .as_ref()
-            .map_or(0, |store| store.tracker_version());
         let tombstones = data.tombstones.load();
         let snapshot = DenseSnapshot::capture(
             generation.id(),
@@ -107,7 +102,6 @@ impl CollectionStore {
             &inner.reverse,
             &inner.versions,
             &tombstones,
-            tracker_version,
         );
         DenseSnapshot::write(&data_dir, &snapshot)?;
         // Publish the generation's lsn before the WAL watermark: recovery
@@ -148,8 +142,8 @@ impl CollectionStore {
         }
         drop(ps_guard);
         // Directory and vector files touched since the last checkpoint.
-        data.keys.sync();
-        data.vectors.sync();
+        data.keys.sync()?;
+        data.vectors.sync()?;
         // Tombstones before meta and before the truncate: they are the only
         // surviving record of the deletes once the log is cleared.
         data.tombstones.load().save(data.dir(), slot_capacity)?;
@@ -299,6 +293,7 @@ impl CollectionStore {
     /// serializes index builds and compaction. The product codebook requires
     /// k-means; scalar/binary need only a range scan.
     pub fn build_quantization(&self) -> Result<bool> {
+        self.ensure_not_poisoned()?;
         let qc = {
             let inner = self.inner.read();
             match &inner.meta.quantization_config {
@@ -384,6 +379,7 @@ impl CollectionStore {
     /// collection reopens without quantization (fallback to exact); orphan
     /// quant files are discarded on the next open.
     pub fn set_quantization_config(&self, config: QuantizationConfig) -> Result<()> {
+        self.ensure_not_poisoned()?;
         config.validate(self.inner.read().meta.vector_size)?;
         // Create quant files before persisting meta, so a crash
         // cannot leave meta claiming quantization while files are missing.

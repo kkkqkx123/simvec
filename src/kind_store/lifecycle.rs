@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -8,7 +9,7 @@ use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::storage::point_blobs::{encode_vector, BlobRef, PointBlobs};
 use crate::storage::postings::Postings;
-use crate::storage::{snapshot, Generation, IdMap, Wal, WalRecord, WalTxn};
+use crate::storage::{snapshot, CollectionLock, Generation, IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData};
 
 use super::{Inner, KindMeta, KindPoint, KindSnapshot, KindSnapshotPoint, KindStore};
@@ -40,6 +41,7 @@ impl KindStore {
     ) -> Result<Arc<Self>> {
         config.validate_kind()?;
         std::fs::create_dir_all(dir)?;
+        let dir_lock = CollectionLock::acquire(dir)?;
         let meta = KindMeta {
             collection: name.to_string(),
             kind: config.kind,
@@ -59,6 +61,8 @@ impl KindStore {
         let postings = Postings::open(&data_dir.join(POSTINGS_DIR), None)?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             name: name.to_string(),
             kind: config.kind,
             dim: config.vector_size,
@@ -80,6 +84,7 @@ impl KindStore {
     /// Open an existing kind collection: map the vector file, load the posting
     /// dictionary, then replay whatever the snapshot does not cover.
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
+        let dir_lock = CollectionLock::acquire(dir)?;
         let bytes = std::fs::read(dir.join("kind.bin"))?;
         let meta: KindMeta = postcard::from_bytes(&bytes)?;
         let generation = Generation::open(dir)?;
@@ -129,6 +134,8 @@ impl KindStore {
         let rebuild_postings = !postings.was_restored();
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             name: meta.collection.clone(),
             kind: meta.kind,
             dim: meta.vector_size,
@@ -210,6 +217,7 @@ impl KindStore {
     /// middle costs the posting index (its manifest lsn no longer matches the
     /// snapshot, so it is rebuilt) but never a committed point.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
         self.checkpoint_from_locked(&mut inner)
@@ -217,7 +225,7 @@ impl KindStore {
 
     pub(super) fn checkpoint_from_locked(&self, inner: &mut Inner) -> Result<()> {
         let lsn = inner.next_lsn.saturating_sub(1);
-        self.blobs.load().sync();
+        self.blobs.load().sync()?;
         // The manifest carries `lsn`: it is the promise that these postings
         // describe exactly the snapshot written below.
         self.postings.load().flush(Some(lsn))?;
@@ -255,6 +263,7 @@ impl KindStore {
     /// generation. Nothing in the serving generation is overwritten, so a
     /// failure leaves both the files and the WAL exactly as they were.
     pub fn compact(&self) -> Result<u64> {
+        self.ensure_not_poisoned()?;
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
         let reclaimed = (inner.points.len() as u64).saturating_sub(inner.live_count);
@@ -285,6 +294,8 @@ impl KindStore {
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
+        self.generation_poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
         self.wal.bind_generation(next_generation.id());
 
         let data_dir = next_generation.path();
@@ -309,6 +320,8 @@ impl KindStore {
         // if the checkpoint crash window leaves old WAL segments behind.
         self.wal.truncate_through(lsn)?;
         old_generation.retire()?;
+        self.generation_poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(reclaimed)
     }
 
@@ -365,8 +378,8 @@ impl KindStore {
                 }));
             }
         }
-        staging_blobs.sync();
-        staging_payloads.sync();
+        staging_blobs.sync()?;
+        staging_payloads.sync()?;
         postings.flush(Some(lsn))?;
 
         let snapshot = KindSnapshot {
@@ -420,7 +433,7 @@ impl KindStore {
                 point.payload_blob = Some(self.payloads.load().append(&bytes)?);
             }
         }
-        self.payloads.load().sync();
+        self.payloads.load().sync()?;
         Ok(())
     }
 

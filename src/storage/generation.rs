@@ -16,8 +16,17 @@
 //! reads as missing and `Generation::open` reports corruption instead of
 //! silently falling back to an older generation.
 
-use std::fs::{self, File};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -183,6 +192,89 @@ impl Generation {
 
     fn write_manifest(&self) -> Result<()> {
         snapshot::write(&self.root.join(MANIFEST_FILE), &self.manifest)
+    }
+}
+
+/// Process-wide lock on a collection directory.
+///
+/// The engine can hold several handles for one directory at once (maintenance
+/// workers clone store handles), so the advisory lock is shared inside one
+/// process by reference count and is exclusive against other processes. The
+/// OS releases it on process exit.
+#[cfg(unix)]
+struct LockEntry {
+    file: File,
+    users: usize,
+}
+
+#[cfg(unix)]
+type LockKey = (u64, u64);
+
+#[cfg(unix)]
+static LOCKS: OnceLock<Mutex<HashMap<LockKey, LockEntry>>> = OnceLock::new();
+
+pub(crate) struct CollectionLock {
+    #[cfg(unix)]
+    key: LockKey,
+}
+
+impl CollectionLock {
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            // The registry is keyed by inode: promote/restore rename the
+            // collection directory, and the same lock must stay shared after
+            // the rename.
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(root.join(".lock"))?;
+            let metadata = file.metadata()?;
+            let key = (metadata.dev(), metadata.ino());
+            let mut locks = LOCKS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock();
+            if let Some(entry) = locks.get_mut(&key) {
+                entry.users += 1;
+                return Ok(Self { key });
+            }
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(VectorSearchError::Internal(format!(
+                    "collection directory {} is already open by another process",
+                    root.display()
+                )));
+            }
+            locks.insert(key.clone(), LockEntry { file, users: 1 });
+            Ok(Self { key })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for CollectionLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let mut locks = LOCKS.get().expect("lock registry is initialized").lock();
+            let release = match locks.get_mut(&self.key) {
+                Some(entry) => {
+                    entry.users -= 1;
+                    entry.users == 0
+                }
+                None => false,
+            };
+            if release {
+                let entry = locks.remove(&self.key).expect("lock entry is present");
+                unsafe {
+                    libc::flock(entry.file.as_raw_fd(), libc::LOCK_UN);
+                }
+            }
+        }
     }
 }
 

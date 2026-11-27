@@ -143,6 +143,23 @@ const hits = engine.searchVector("docs", [1, 0], 10);
 engine.close();
 ```
 
+## Command-line shell
+
+`cli/` is a standalone Rust shell built as its own Cargo package. It uses the
+public `LocalVectorEngine` API directly, so it needs no C toolchain and does
+not change the C ABI or any binding.
+
+```sh
+sh scripts/build-cli.sh             # target/release/simvec
+target/release/simvec ./data         # interactive
+target/release/simvec ./data "count docs"
+target/release/simvec --batch ./data < commands.txt
+```
+
+Dot commands control the shell (`.open`, `.tables`, `.schema`, `.mode`,
+`.bail`, `.read`, `.quit`), while other commands map one-to-one to engine API
+calls and take JSON arguments. See `cli/README.md` for the full command list.
+
 ## Testing and benchmarks
 
 ```sh

@@ -93,18 +93,19 @@ impl Pages {
     }
 
     /// Flush every page written since the last `sync` and return how many
-    /// pages were dirty. Called at checkpoint time only; WAL replay covers
-    /// page contents a crash may have lost before this point.
-    pub fn sync(&self) -> usize {
-        let dirty = std::mem::take(&mut *self.dirty.lock());
-        let count = dirty.len();
+    /// pages were dirty. Dirty pages stay registered until their fsync
+    /// succeeds, so a failed checkpoint does not publish a watermark for
+    /// payload bytes that never reached the device.
+    pub fn sync(&self) -> Result<usize> {
+        let dirty = self.dirty.lock().clone();
         let pages = self.page_files.read();
         for page_id in &dirty {
             if let Some(entry) = pages.get(page_id) {
-                let _ = entry.file.sync_all();
+                entry.file.sync_all()?;
             }
         }
-        count
+        self.dirty.lock().retain(|page_id| !dirty.contains(page_id));
+        Ok(dirty.len())
     }
 
     /// Validate that a persisted pointer stays inside its page file.

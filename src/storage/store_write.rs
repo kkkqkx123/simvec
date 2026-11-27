@@ -37,6 +37,7 @@ impl CollectionStore {
     /// only once the transaction is applied, so `get`/`search` see exactly
     /// what a successful return promises.
     pub fn apply_txn(&self, ops: &[WalRecord]) -> Result<()> {
+        self.ensure_not_poisoned()?;
         assert_not_applying();
         // Validation happens before anything is logged: a logged record that
         // fails while being applied would sit in the WAL forever and make

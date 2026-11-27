@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -10,7 +11,7 @@ use crate::storage::point_blobs::{
     encode_named, encode_vector, rewrite_named, BlobRef, PointBlobs,
 };
 use crate::storage::postings::Postings;
-use crate::storage::{snapshot, Generation, IdMap, Wal, WalRecord, WalTxn};
+use crate::storage::{snapshot, CollectionLock, Generation, IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{CollectionConfig, Payload, PointId, VectorData, VectorKind, VectorSpaceConfig};
 
 use super::{
@@ -46,6 +47,7 @@ impl NamedStore {
         config.max_points = max_points;
         config.validate_kind()?;
         std::fs::create_dir_all(dir)?;
+        let dir_lock = CollectionLock::acquire(dir)?;
         let meta = NamedMeta {
             collection: name.to_string(),
             spaces: spaces
@@ -76,6 +78,8 @@ impl NamedStore {
         let postings = open_postings(&data_dir, &meta.spaces, &space_order, None)?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             name: name.to_string(),
             spaces: meta.spaces,
             space_order,
@@ -95,6 +99,7 @@ impl NamedStore {
     /// Open an existing named collection: map the vector file, load the
     /// per-space dictionaries, then replay what the snapshot does not cover.
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
+        let dir_lock = CollectionLock::acquire(dir)?;
         let bytes = std::fs::read(dir.join("named.bin"))?;
         let meta: NamedMeta = postcard::from_bytes(&bytes)?;
         let generation = Generation::open(dir)?;
@@ -142,6 +147,8 @@ impl NamedStore {
         let rebuild_postings = postings.values().any(|space| !space.was_restored());
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             name: meta.collection.clone(),
             spaces: meta.spaces,
             space_order,
@@ -242,6 +249,7 @@ impl NamedStore {
     /// Same ordering contract as `KindStore`: data files, then the posting
     /// manifests, then the snapshot that references them, then the log.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
         self.checkpoint_from_locked(&mut inner)
@@ -249,7 +257,7 @@ impl NamedStore {
 
     pub(super) fn checkpoint_from_locked(&self, inner: &mut Inner) -> Result<()> {
         let lsn = inner.next_lsn.saturating_sub(1);
-        self.blobs.load().sync();
+        self.blobs.load().sync()?;
         for postings in self.postings.load().values() {
             postings.flush(Some(lsn))?;
         }
@@ -292,6 +300,7 @@ impl NamedStore {
     /// Reclaim tombstoned slots by building and publishing a complete new
     /// generation. A failure leaves the serving generation and its WAL intact.
     pub fn compact(&self) -> Result<u64> {
+        self.ensure_not_poisoned()?;
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
         let reclaimed = (inner.points.len() as u64).saturating_sub(inner.live_count);
@@ -325,6 +334,8 @@ impl NamedStore {
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
+        self.generation_poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
         self.wal.bind_generation(next_generation.id());
 
         let data_dir = next_generation.path();
@@ -349,6 +360,8 @@ impl NamedStore {
 
         self.wal.truncate_through(lsn)?;
         old_generation.retire()?;
+        self.generation_poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(reclaimed)
     }
 
@@ -415,8 +428,8 @@ impl NamedStore {
                 }));
             }
         }
-        staging_blobs.sync();
-        staging_payloads.sync();
+        staging_blobs.sync()?;
+        staging_payloads.sync()?;
         for space_postings in postings.values() {
             space_postings.flush(Some(lsn))?;
         }
@@ -479,7 +492,7 @@ impl NamedStore {
                 point.payload_blob = Some(self.payloads.load().append(&bytes)?);
             }
         }
-        self.payloads.load().sync();
+        self.payloads.load().sync()?;
         Ok(())
     }
 

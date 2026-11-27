@@ -32,14 +32,16 @@ mod tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
+use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
 use crate::storage::point_blobs::{BlobRef, PointBlobs};
 use crate::storage::postings::Postings;
-use crate::storage::{Generation, IdMap, Wal};
+use crate::storage::{CollectionLock, Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
 mod lifecycle;
@@ -95,6 +97,8 @@ struct Inner {
 /// A single opened Sparse or Multi collection.
 pub struct KindStore {
     dir: PathBuf,
+    _dir_lock: CollectionLock,
+    generation_poisoned: AtomicBool,
     name: String,
     kind: VectorKind,
     /// Dense dimension / sparse vocabulary bound / multi sub-vector dimension.
@@ -120,6 +124,24 @@ pub struct KindStore {
     payloads: ArcSwap<PointBlobs>,
     /// Persisted sparse postings (`postings/`).
     postings: ArcSwap<Postings>,
+}
+
+impl KindStore {
+    /// Whether a generation publish left the in-memory switch unfinished.
+    pub fn is_poisoned(&self) -> bool {
+        self.generation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(VectorSearchError::Internal(format!(
+                "collection {} must be reopened after an interrupted generation publish",
+                self.dir.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for KindStore {

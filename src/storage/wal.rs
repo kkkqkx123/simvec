@@ -204,6 +204,11 @@ struct WalState {
     /// water mark. `u64::MAX` while unknown (a segment that was never fully
     /// read and never appended to), which makes the check conservative.
     active_last_lsn: u64,
+    /// Physical length of the valid prefix of the active segment. Replay
+    /// stops at a torn tail; appends must start at that prefix rather than
+    /// after the torn bytes, or the next replay would stop before every
+    /// transaction written since.
+    active_valid_len: Option<u64>,
 }
 
 /// Segmented append-only WAL directory. Every durable mutation goes through
@@ -256,6 +261,7 @@ impl Wal {
                 // An existing tail segment may hold transactions this process
                 // has not read; `replay`/`read_all` refines the bound.
                 active_last_lsn: if segments.is_empty() { 0 } else { u64::MAX },
+                active_valid_len: None,
                 segments,
                 active,
             }),
@@ -398,21 +404,35 @@ impl Wal {
             state.segments.push(name);
             state.active = Some(file);
             state.active_last_lsn = 0;
+            state.active_valid_len = Some(0);
         }
 
-        let file = state
+        let physical_len = state
             .active
-            .as_mut()
-            .expect("active segment opened above");
-        let start_len = file.metadata()?.len();
-        let write_result = file.write_all(&buffer).and_then(|_| file.sync_all());
-        if let Err(e) = write_result {
-            // Drop the partial batch so the log keeps a clean suffix.
-            let _ = file.set_len(start_len);
-            let _ = file.sync_all();
-            return Err(e.into());
+            .as_ref()
+            .expect("active segment opened above")
+            .metadata()?
+            .len();
+        let start_len = state.active_valid_len.unwrap_or(physical_len);
+        {
+            let file = state
+                .active
+                .as_mut()
+                .expect("active segment opened above");
+            if physical_len > start_len {
+                file.set_len(start_len)?;
+                file.sync_all()?;
+            }
+            let write_result = file.write_all(&buffer).and_then(|_| file.sync_all());
+            if let Err(e) = write_result {
+                // Drop the partial batch so the log keeps a clean suffix.
+                let _ = file.set_len(start_len);
+                let _ = file.sync_all();
+                return Err(e.into());
+            }
         }
         state.active_last_lsn = state.active_last_lsn.max(last_txn);
+        state.active_valid_len = Some(start_len + buffer.len() as u64);
         drop(state);
         self.appended_bytes
             .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -439,10 +459,11 @@ impl Wal {
     ) -> Result<u64> {
         let segments = self.state.lock().segments.clone();
         let mut last_txn = 0u64;
+        let mut valid_len = 0u64;
         for (index, name) in segments.iter().enumerate() {
             let last_segment = index + 1 == segments.len();
             let mut file = File::open(segment_path(&self.dir, *name))?;
-            last_txn = read_segment(
+            let (segment_last_txn, segment_valid_len) = read_segment(
                 &mut file,
                 last_segment,
                 after,
@@ -451,10 +472,19 @@ impl Wal {
                 &mut f,
                 last_txn,
             )?;
+            last_txn = segment_last_txn;
+            if last_segment {
+                valid_len = segment_valid_len;
+            }
         }
-        // The log's highest lsn is now known, which lets `truncate_through`
-        // decide about the tail segment without re-reading it.
-        self.state.lock().active_last_lsn = last_txn;
+        // The log's highest lsn and valid tail are now known: the first
+        // repairs the truncation decision, the second keeps future appends
+        // behind any torn record we just skipped.
+        let mut state = self.state.lock();
+        state.active_last_lsn = last_txn;
+        if !segments.is_empty() {
+            state.active_valid_len = Some(valid_len);
+        }
         Ok(last_txn)
     }
 
@@ -482,6 +512,7 @@ impl Wal {
         sync_dir(&self.dir)?;
         state.active = None;
         state.active_last_lsn = 0;
+        state.active_valid_len = None;
         drop(state);
         self.acked_lsn
             .store(new_ack, AtomicOrdering::Release);
@@ -532,6 +563,7 @@ impl Wal {
                     // append creates a new one.
                     state.active = None;
                     state.active_last_lsn = 0;
+                    state.active_valid_len = None;
                 }
             } else {
                 kept.push(*name);
@@ -600,7 +632,7 @@ impl std::fmt::Debug for Wal {
 }
 
 /// Read one segment, feeding transactions to `f`. Returns the highest lsn
-/// seen so far.
+/// seen so far and the physical end of its valid prefix.
 fn read_segment(
     file: &mut File,
     last_segment: bool,
@@ -609,9 +641,11 @@ fn read_segment(
     name: u64,
     f: &mut impl FnMut(&WalTxn) -> Result<()>,
     mut last_txn: u64,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     file.rewind()?;
     let mut header_buf = [0u8; 8];
+    let mut offset = 0u64;
+    let mut valid_len = 0u64;
     loop {
         match file.read_exact(&mut header_buf) {
             Ok(()) => {}
@@ -630,6 +664,7 @@ fn read_segment(
                 "wal record length {len} exceeds limit"
             )));
         }
+        let record_end = offset + 8 + len as u64;
         let expected_crc = u32::from_le_bytes(header_buf[4..8].try_into().expect("crc slice"));
         let mut bytes = vec![0u8; len as usize];
         if let Err(e) = file.read_exact(&mut bytes) {
@@ -661,8 +696,10 @@ fn read_segment(
             f(&txn)?;
         }
         last_txn = txn.txn_id.max(last_txn);
+        offset = record_end;
+        valid_len = record_end;
     }
-    Ok(last_txn)
+    Ok((last_txn, valid_len))
 }
 
 /// Persist the generation and replay watermark with a checksum and a
@@ -850,6 +887,33 @@ mod tests {
             .unwrap();
         assert_eq!(last, 1);
         assert_eq!(seen, vec![1]);
+    }
+
+    #[test]
+    fn test_appends_after_a_torn_tail_are_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let first = wal(&path);
+        first.append(&txn(1, 10)).unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(segment_path(&path, 1))
+                .unwrap();
+            file.write_all(&100u32.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(first);
+
+        let recovered = wal(&path);
+        assert_eq!(recovered.replay(|_| Ok(())).unwrap(), 1);
+        recovered.append(&txn(2, 20)).unwrap();
+        drop(recovered);
+
+        let reopened = wal(&path);
+        let (txns, last) = reopened.read_all().unwrap();
+        assert_eq!(last, 2);
+        assert_eq!(txns.iter().map(|t| t.txn_id).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]

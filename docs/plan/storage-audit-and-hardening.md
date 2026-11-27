@@ -1,157 +1,108 @@
-# 存储结构审计与加固计划
+# 存储结构审计与加固方案
 
-本文对比 `simvec` 当前存储实现与 `ref/qdrant`，记录完整问题清单、已落地的修改和后续方向。只讨论本地引擎的原生存储；wasm 内存引擎不在范围内。
+本文对比当前 `simvec` 原生存储与 `ref/qdrant`，给出完整问题清单、本轮已落地的修改和剩余改进方案。范围只包括本地引擎的原生存储；wasm 内存引擎不在讨论范围内。
 
 ## 现状对比
 
 | 维度 | simvec | ref/qdrant |
 | --- | --- | --- |
-| 组织方式 | 集合根目录保存类型标记、`wal/` 和 `generation.bin`； serving 数据全部位于 `generations/g<id>/`，密集、kind、named 共用同一套发布协议 | collection → shard → 多个 segment；appendable segment 接收写入，不可变 segment 承载压实后的数据和索引 |
-| 点标识 | 按 id 种类拆分的 `IdMap` + 全局 LSN 与逐点/删除版本 | id tracker 同时维护 external id → internal offset 和逐点 version / delete version |
-| 向量存储 | 分段 mmap 的定长 f32，槽位原地覆盖；`kind`/`named` 的可变长向量走 `points.bin` blob | chunked mmap（可追加）+ deleted bitvec、不可变 mmap、graph-inline、多种数据类型与 multivector |
-| Payload | `payloads_store/`：`config.json` + `tracker.bin` + `bitmask.bin` + `pages/page_*.bin`，内容由 WAL 派生 | blobstore gridstore/logstore，带 tracker journal、compacted tracker、gap 管理、打开时 pointer 一致性校验、raw payload 直通 |
-| WAL | 集合级 `wal/<20位首LSN>.bin`，postcard + CRC32，group commit；checkpoint 按整段 unlink | shard 级 mmap 段，magic/version/随机 CRC seed，CRC32C、8 字节对齐、预建段、retain closed、`first-index` ACK 水位 |
-| Checkpoint | flush 派生文件 → `meta.bin` → marker → `truncate_through`；kind/named 另有 snapshot + posting manifest LSN | segment 有 `segment.json` / version file，per-component `VersionTracker`，WAL 只在 flush 确认后截断，snapshot 带文件清单 |
-| 压实 | 重写整个集合的所有文件，逐个 rename；竞争严重时退化为全局写锁 | optimizer 在临时目录构建完整新 segment，proxy 吸收期间写入，`swap_new` 一次切换 |
-| Payload 索引 | schema 持久化到 `payload_indexes.json`，内容在内存重建；Map/Numeric 两类；只加速 `must` | 多种 field index（map/numeric/full-text/geo/facet/nested/null），mutable/immutable/on-disk，带选择性估计 |
-| ANN | 集合级 HNSW/IVF；新点进 `pending`，查询时暴力补扫；压实靠 remap 保留图 | 每个不可变 segment 独立建图，appendable segment 精确扫，图链接 mmap、graph healing、payload blocks |
-| 具名/稀疏 | `points.bin` + `payloads.bin` + `postings/` + snapshot，全程 exact scan | sparse/named/multivector 是 segment 内一等公民，有独立存储和索引 |
+| 组织方式 | 集合根目录保存类型标记、`wal/`、`.lock` 与 `generation.bin`；全部 serving 文件在 `generations/g<id>/`，dense/kind/named 共用一套发布协议 | collection → shard → 多个 segment；appendable segment 接收写入，immutable segment 承载压实后的数据和索引 |
+| 单写者 | 打开集合时持有 `.lock` 上的 advisory flock，进程退出自动释放 | WAL 目录持有 flock |
+| 点标识 | 全局 IdMap + 全局 LSN 与逐点版本（含删除版本） | 每 segment 的 id tracker：external id → internal offset + version / delete version，另有 compressed / disk 变体 |
+| 向量存储 | dense 分段 mmap 定长 f32、槽位原地覆盖；kind/named 的可变长向量进 `points.bin` blob | chunked appendable mmap + deleted bitvec、immutable mmap、graph-inline、多种数据类型与 multivector |
+| Payload | `payloads_store/`：`config.json` + `tracker.bin` + `bitmask.bin` + `pages/page_*.bin`，内容可从 WAL 派生；kind/named 用 `payloads.bin` blob | blobstore gridstore / logstore，tracker journal、compacted tracker、gap 管理、打开时 pointer 一致性校验 |
+| WAL | 集合级 `wal/<20位首LSN>.bin`，postcard + CRC32，批量 group commit，整段 unlink；torn tail 在追加前截回有效前缀 | shard 级 mmap 段，magic/version/随机 CRC seed、CRC32C、8 字节对齐、预建段队列、closed 段保留、first-index ACK |
+| Checkpoint | flush 派生文件 → `meta.bin` → snapshot → `generation.bin.lsn` → `wal/acked-lsn` → `truncate_through`；任一 fsync 失败即中止 | segment 各自维护 version tracker 与 segment.json，flush 确认后才 ACK，WAL 才回收 |
+| 压实 | 在 staging 构建完整新代、fsync、rename 目录、发布清单、切换句柄、最后截断 WAL；dense 竞争激烈时仍有写锁回退 | optimizer 构造完整新 segment，proxy 吸收期间写入，`swap` 一次切换 |
+| Payload 索引 | schema 落盘、内容内存重建；Map/Numeric；主要加速 `must` | map/numeric/full-text/geo/facet/nested/null、mutable/immutable/on-disk、选择性估计 |
+| ANN | 集合级 HNSW/IVF；新点进 `pending`，查询补扫；压实靠 remap | 每个 immutable segment 独立建图，appendable 段精确扫，graph healing、payload block |
+| 具名/稀疏 | blob + postings + snapshot，全程 exact scan | segment 内一等公民，有独立存储与索引 |
 
-## 问题清单
+## 完整问题清单
 
-### 严重：多文件提交不具备原子性
+### 数据安全
 
-1. dense 压实按顺序替换 `vectors.bin` → `quant.bin` → `keys.bin` → `payloads_store/`，随后才写 tombstones、meta、索引和截断 WAL。任一中间点崩溃都会留下不同代际的文件组合；WAL 只能覆盖上次 checkpoint 之后的增量，无法修复旧数据。
-2. `kind`/`named` 压实先用 `PointBlobs::replace_from` 覆盖 `points.bin`，之后才写新 snapshot。旧 snapshot 记录的 `blobs_len` 与截断后的新文件不兼容时，`PointBlobs::open` 直接报 `CorruptData`；此前 checkpoint 已截断 WAL 前缀，无法从头重建。
-3. 压实失败重试后会在写锁下整体重写，写入停顿与集合大小成正比；qdrant 的 optimizer 不这样做。
+1. **fsync 失败被吞掉**：`vectors.bin`、`keys.bin`、`points.bin`、`payloads.bin` 和 payload pages 的 `sync()` 曾用 `.ok()` 忽略 I/O 错误，并且先清除 dirty 标记。checkpoint 仍继续写 snapshot、推进 generation lsn 并截断 WAL，失败写到设备上的数据无法从 WAL 恢复。
+2. **torn tail 成为后续日志的墙**：最后一段的坏记录被 replay 静默跳过，但新事务仍追加在物理文件末尾。下一次启动会再次停在同一坏记录，吞掉其后所有已提交事务。
+3. **generation 发布后的错误路径**：清单替换成功后若 `DataFiles::open` 或其他步骤失败，进程继续持有旧 generation 的内存句柄；磁盘清单却已指向新代，后续 checkpoint 或 `stage()` 会写错目录，甚至删除已发布的新代。
+4. **缺少跨进程单写者约束**：没有目录锁时两个进程可同时分配相同 lsn、同时改同一组文件；同进程的多个句柄（例如维护线程克隆的 handle）则需要共享同一把锁。
+5. **derived 文件缺少重建式自愈**：payload tracker/page 在 generation lsn 尚未推进时仍只是派生状态，但 pointer 不一致会直接报 `CorruptData`，即使完整 WAL 还在。qdrant 通过 tracker journal 和打开时一致性修复处理此类窗口。
 
-### 严重：缺少逐点版本和可靠的已应用水位
+### 延迟与容量
 
-4. dense 打开从 WAL 头部全量重放，`meta.last_applied_txn` 只推进、不跳过；没有 per-point version。若已删除的 WAL 段在崩溃后重新出现，旧 upsert 会覆盖较新状态，甚至把已删除 id 以新槽位重新插入。
-5. `Wal::remove_segment` 原本只 unlink，不 fsync WAL 目录；段删除本身缺少持久化保证。
-6. kind/named 依赖 snapshot 的 LSN 跳过 WAL；snapshot 损坏时回退全量重放，但 WAL 前缀可能已被截断，这是设计上的耦合点。
+6. **压实粒度是整集合**：dense 压实重写全部文件，4 次乐观重试后退回写锁下重写；kind/named 压实全程持有 `gate` 与 `inner` 大锁，查询也被阻塞。qdrant 用 appendable/immutable segment 与 proxy 吸收期间写入。
+7. **dense snapshot 被 payload 写轻易作废**：快照曾用 payload tracker 版本做交叉校验；任何 payload-only 更新都会丢弃 id 目录，打开退化为全槽扫描并重建过滤位图与字段索引。
+8. **启动重建成本高**：过滤位图和字段索引在打开时按全部 live 槽位重建；字段索引没有持久化 posting/bitmap。
+9. **ANN 是集合级结构**：新点进入 `pending`，查询补扫成本随积压增长；压实靠 remap 整张图，覆盖不全时只能重建。
+10. **WAL 编码与 IO 偏简单**：整批先编码进 `Vec`，id/payload 双重字符串化；segment 懒创建且 append 路径 fsync 目录；没有 mmap 预分配、随机 CRC seed、8 字节对齐、预建段和 closed 段保留。
+11. **字段索引能力有限**：只有内存 Map/Numeric，`must_not` / `should` / `min_should` 退化为后置过滤；缺少 full-text、geo、facet、nested、null、on-disk immutable 索引与选择性估计。
+12. **没有快照一致性 pin**：generation 目录可被复制，但没有 qdrant 式 WAL ACK pin 和文件清单，复制期间的写入可能只存在于被排除的 WAL 中。
 
-### 中等：派生文件缺乏自愈与校验
+### 工程约束
 
-7. `bitmask.bin` 原为原地覆盖写，半写文件会让 `MmapBitmask::open` 失败并导致整个集合被隔离；qdrant 用 journal 修复 torn tracker，并对 bitmask/gap 做打开时自检。
-8. `tracker.bin` 虽走 tmp+rename，但没有 fsync 父目录；指针也没有像 qdrant `Logstore::validate_consistency` 那样与 page 文件长度交叉校验。
-9. dense 压缩/写入失败时，量化码会静默保持 `ready=true`。rescore 只能修正候选顺序，不能补回被陈旧 quant code 漏掉的近邻。
-
-### 中等：启动成本、WAL 编码与功能差距
-
-10. dense 没有带 LSN 的 snapshot：open 时扫描全部槽位重建 id map、filter bitmap、payload index，再重放全部 WAL。
-11. WAL 的 id 与 payload 以字符串/JSON 形式存进 postcard，双重序列化；单批整体编码进内存；没有 mmap 段、随机 CRC seed、预建段队列和 closed 段保留。
-12. payload index 只有 Map/Numeric 且只在内存，未加速 `must_not` / `should` / `min_should`，没有 full-text、geo、facet、nested、on-disk immutable 索引和选择性估计。
-13. HNSW 新点只进 `pending`，查询补扫成本随积压增长；索引是集合级全局文件，压实靠 remap，图有空洞时只能丢弃重建。
-14. `AGENTS.md` 的 dense 布局描述遗漏 `tombstones.bin`、`payloads_store/`、`payload_indexes.json`、量化与索引产物，文档与实现已漂移。
+13. **文档漂移**：审计文档曾把已经修复的问题继续列在“问题清单”中；`AGENTS.md` 也需要同步新增的锁文件、fsync 契约和 poison 语义。
+14. **重复生命周期代码**：`NamedStore::open` 曾连续两次调用 `Generation::open`，属于无意义的重复逻辑。
+15. **空闲 worker 持有 store 强引用**：commit queue worker 曾在等待批次前 upgrade `Weak<CollectionStore>`，使 store 的 `Drop` 永远无法触发，从而无法关闭 worker、也无法释放目录锁。worker 现在先取批次再 upgrade。
 
 ## 本轮已落地的修改
 
-1. **WAL ACK 水位**：`wal/acked-lsn` 以带 CRC 的文件持久化；`truncate_through` 和 `truncate` 在 unlink 前先写入并 fsync 水位，段删除后 fsync WAL 目录。dense 恢复曾以 ACK 为下界，现已统一改用 generation 清单 lsn（ACK 仅作同代一致性校验）；compaction 走 `truncate_through`，不再使用无水位保护的 `truncate()`。
-2. **payload bitmask 原子落盘**：`bitmask.bin` 改为 tmp → fsync → rename → fsync 父目录；`tracker.bin` 的 rename 补上父目录 fsync；打开时校验每个 tracker 指针落在对应 page 内，缺失页面或越界指针直接报损坏，不再静默返回空 payload。
-3. **量化失败失效**：quant code 写入失败时持久化地把 `quant_meta.bin` 的 `ready` 置为 false，重新打开仍走 exact/重建路径，避免陈旧 code 造成 recall 下降。
-4. **generation 原子提交**：新增统一 `generation.bin` 清单与 staging/publish 协议；dense 以 `DataFiles` 整体切换文件句柄，kind/named 在写锁内切换 blob/postings；压实先写完整新代再发布清单，WAL 只在清单之后截断。
-5. **WAL 回放绑定清单**：dense 以 `generation.lsn` 为回放下界并在同代 ack 超前时报损坏；kind/named 直接以 `generation.lsn` 回放，snapshot 与清单不一致报 `CorruptData`。
-6. **文档**：新增本文；`AGENTS.md` 更新实际目录布局、generation 规则与 WAL 水位规则。
-7. **dense 带 LSN 的 snapshot**：`dense_snapshot.bin` 保存 id→slot 目录、逐点已应用 lsn、tombstone 槽位、`next_slot`/`slot_capacity` 计数和 payload tracker 版本。只有 generation id、lsn、几何计数与 tracker 版本全部匹配清单和文件时才用于打开；否则退回全槽扫描，按清单 lsn 回放。
-8. **逐点版本**：id tracker 保存每个 id（含已删除 id）的最后应用 lsn；回放先丢弃 `lsn <= 全局水位` 的整批记录，再逐条丢弃 `lsn <= 该 id 版本` 的记录。同一批内的重复 id 在批末统一推进版本，保证批内语义不变。
-9. **ACK 绑定 generation**：`wal/acked-lsn` 的 CRC 覆盖 `{generation, lsn}`，所有 store 在打开和压实发布后绑定当前 generation；别的 generation 的水位读作 0，避免跨代水位污染回放。
+### fsync 契约
 
-## 细化的落地方案
+`Vectors::sync`、`BlobDirectory::sync`、`PointBlobs::sync` 和 `Pages::sync` 全部返回 `Result`：fsync 成功后才清 dirty 标记，失败时保持 dirty 并把错误上抛。dense `checkpoint_inner`、`PayloadStore::checkpoint`、kind/named checkpoint 与 staging compaction 都改为 `?` 传播。因此 checkpoint 任一步失败都会停在 generation 清单之前，WAL 仍然完整。
 
-### 已实现：generation 原子提交
+### WAL torn tail
 
-#### 目录与清单
+`WalState` 记录 active segment 的有效前缀长度。`replay_after` 返回最后一段的合法末尾；`append_batch` 在追加前把物理文件截回该前缀并 fsync。坏记录不再挡住之后写入的事务。`wal.rs` 增加“torn tail 后重开、写入、再重开”的回归测试。
 
-```
-<collection>/
-  generation.bin                    # postcard + CRC，记录 generation id / lsn
-  wal/                              # 集合级日志，跨 generation 共享
-  meta.bin | kind.bin | named.bin   # 类型标记（meta.bin 随 serving generation 移动）
-  generations/
-    g00000000000000000001/          # 当前发布代
-      ...                            # 该代的全部数据文件
-    .g00000000000000000002-staging/ # 未发布构建目录，open 时忽略
-```
+### 单写者与发布 poison
 
-`generation.bin` 用已有快照信封写入（magic + version + CRC + postcard），字段为 `version: u32 = 1`、`generation: u64`、`lsn: u64`。它是唯一的提交点：只有它的 rename 完成，新目录才对 open 可见。目录内容整体 fsync 后先 rename 到最终 `g<id>`，再原子替换清单；崩溃时只会出现“旧清单 + 未发布临时目录”或“新清单 + 完整新目录”，不会出现半代文件。
+生命周期模块提供 `CollectionLock`：Unix 上对集合根目录的 `.lock` 文件做 `LOCK_EX | LOCK_NB`，按规范化路径引用计数；同进程内第二个句柄共享同一把锁，其他进程打开同一目录会被拒绝。最后一个句柄释放时解锁。dense、kind、named 的 create/open 都持有该锁。
 
-各代文件清单：
+三类 store 增加 `generation_poisoned`：generation 清单发布成功即置位，只有完成内存切换、WAL 标记和截断后才清除。中间任何失败都让集合保持可读但拒绝写入/checkpoint/压实，必须重新打开。这避免了磁盘清单与内存句柄分叉后继续写错文件。
 
-- dense：`meta.bin`、`dense_snapshot.bin`、`vectors.bin`、`keys.bin`、`tombstones.bin`、`payloads_store/`、`payload_indexes.json`、可选 `quant.bin`/`quant_meta.bin` 与 `index.bin`/`hnsw.bin`；
-- kind：`kind_snapshot.bin`、`points.bin`、`payloads.bin`、`postings/`；
-- named：`named_snapshot.bin`、`points.bin`、`payloads.bin`、`postings/<space>/`。
+### dense snapshot 与 payload 解耦
 
-#### 读路径与句柄切换
+`dense_snapshot.bin` 不再携带 payload tracker 版本。快照负责 id→slot 目录与逐点版本，payload 字节从当前 `PayloadStore` 读取；generation lsn 之后的 payload 记录由 WAL 回放重新应用。payload-only 写入不再让整个快照失效。`Tracker` 中的变更计数保留为文件内部状态，不再参与快照匹配。
 
-- dense 把所有文件句柄收进 `DataFiles`，通过一层 `ArcSwap<DataFiles>` 整体发布。查询在开始时取一次 guard，保证 vectors/keys/tombstones/payload/index 来自同一代；已有 mmap 由 guard 持有，切换后仍有效。
-- kind/named 的查询本来就持有 `inner` 锁，因此 blob/postings 句柄的 `ArcSwap` 切换与该锁配合即可：写锁下先发布清单，再换句柄，最后截断 WAL。
-- 被替代的 dense generation 由后台线程等待最后一个 `Arc<DataFiles>` 引用释放后删除；kind/named 在 `inner` 锁内完成切换后直接删除旧目录。
+### 清理
 
-#### 操作顺序（失败即停止，不补偿）
+删除 `NamedStore::open` 中重复的 `Generation::open` 调用；commit worker 不再在空闲等待时持有 store 的强引用；测试用例在重开同一目录前显式释放旧句柄，promote 成功后立即释放旧 live 句柄。
 
-1. 创建：建临时代 → 写全部文件并 fsync → rename 目录 → 发布 `generation.bin`（lsn=0）。
-2. checkpoint（原地写当前代）：数据文件 → `meta.bin` → 类型专属 snapshot → `generation.bin.lsn=lsn` → `wal/acked-lsn` → `truncate_through(lsn)`。清单先于 WAL 水位，恢复永远不会越过清单声称已落地的数据。
-3. 压实：`stage()` → 在 staging 目录写完整一代（含索引重映射、snapshot、payload 重写）并 fsync → 预打开校验 → rename 目录 → 发布 `generation.bin(new_id, lsn)` → 切换进程内句柄 → `truncate_through(lsn)` → 清理旧代。
-4. 恢复：dense 以 `generation.lsn` 为回放下界（同代 ack 大于清单视为损坏；dense snapshot 未发布时丢弃并全槽扫描）；kind/named 直接以 `generation.lsn` 为下界，snapshot 缺失或与清单 lsn 不一致报 `CorruptData`。这样 checkpoint 后重新出现的旧 WAL 段不会污染新代。
+## 剩余修改方案
 
-#### 失败矩阵
+### 派生文件自愈
 
-| 崩溃点 | 磁盘状态 | open 结果 |
-| --- | --- | --- |
-| staging 写入中 | 旧 `generation.bin` + 残留 `.g*-staging` | 忽略临时目录，继续旧代 |
-| 代目录 rename 后、清单替换前 | 旧清单 + 完整但未发布的 `g<N>` | 继续旧代，临时新一代被忽略 |
-| 清单替换后、WAL 截断前 | 新清单 + 完整新代 + 旧 WAL 段 | 按清单 lsn 回放尾部，旧段被跳过 |
-| 清单替换后、进程内句柄未切换 | 新磁盘代 + 本进程旧句柄 | 本进程继续服务一致的老文件；重启使用新代 |
-| meta/snapshot 与清单 lsn 不一致 | 数据自相矛盾 | kind/named 报 `CorruptData`；dense 快照丢弃并回退全槽扫描 + 清单 lsn 回放 |
+当 generation lsn 尚未推进、WAL 仍完整时，payload tracker/pages 的一致性问题应当触发派生重建而不是直接隔离集合。方案是把 `PayloadStore::open` 的一致性校验分成“可重建窗口”和“已提交损坏”两类：前者清空 allocator 状态并从 generation lsn 回放；后者保持 `CorruptData`。payload value 增加 CRC，避免长度合法但内容被覆盖的静默错误。
 
-### 已实现：版本化恢复
+### segment 化与有界压实
 
-#### 快照内容与发布顺序
+把 dense 的文件集合拆成 appendable 与 immutable 段，清单记录段描述；写入只进 appendable 段，optimizer 在 staging 构建 immutable 段，提交时一次切换 `SegmentSet` guard，用有界写入队列替代写锁下全量重写。kind/named 先把 blob/postings 的切换完全移出大锁，再逐步采用同样的段协议。
 
-- `dense_snapshot.bin` 与 `meta.bin` 同处 serving generation 目录，使用统一的 checksummed envelope。字段为 generation id、lsn、`next_slot`、`slot_capacity`、`live_count`、`tombstone_count`、payload tracker 版本、点目录和 tombstone 槽位列表。点目录中的已删除 id 只保留版本，不参与 id→slot 恢复。
-- checkpoint 在原代内按 `meta.bin → dense_snapshot.bin → generation.bin.lsn → wal/acked-lsn → truncate_through` 落盘。快照先于清单写入，因此崩溃只会留下超前的快照；open 发现 lsn 不匹配时丢弃它，从文件扫描并按清单 lsn 回放，此时 WAL 尚未截断，不会丢已提交数据。
-- 压实把点目录在 staging 内按 old→new 槽位重映射后写入快照，payload tracker 版本取自新建的 payload store；清单发布后绑定 WAL 到新 generation，再截断旧日志。
-- open 先用快照恢复 `reverse`、`versions`、过滤位图和 payload index；校验失败则走原有的全槽扫描，并把该批 id 的版本初始化为清单 lsn。`meta.last_applied_txn` 在回放前钳到清单 lsn，避免崩溃时超前的 meta 水位跳过需要重放的记录。
+### 按段 ANN
 
-#### 逐点版本与 ACK
+图文件按 immutable 段发布，appendable 段继续精确扫描。`pending` 有界 drain，超限触发该段重建；查询先合并各段候选再统一打分和过滤。段冻结时修复图空洞，避免跨代 remap。
 
-- `apply_records_locked` 接收记录的 lsn：整批旧记录直接跳过；单条 upsert/delete 若 `lsn <= versions[id]` 也跳过。删除会留下版本标记，阻止旧 upsert 用新槽位复活已删除 id。版本在批处理结束时统一推进，批内多次操作同一 id 仍按日志顺序生效。
-- `wal/acked-lsn` 从仅保护 lsn 改为保护 `{generation, lsn}`；bind 操作同时发生在 store 打开和 compaction publish 之后。dense 的回放下界仍是清单 lsn，ACK 只作为同代一致性校验；kind/named 完全以清单为准。
+### WAL mmap 化
 
-### 剩余修改方案（细化）
+段文件改为预分配 mmap：头部包含 magic、format version、随机 CRC seed、first-lsn 和 closed 标记；记录 8 字节对齐，CRC 使用段内 seed。批量提交流式写入，不再整体编码进 `Vec`；后台补足空段队列，closed 段按 ACK 水位保留后回收。事务语义、逐点版本、generation 水位和 group commit 顺序保持不变。
 
-#### 段化：appendable / immutable segment
+### 字段索引能力
 
-1. 扩展 `generation.bin` 的清单，加入段描述列表 `{id, kind, first_slot, next_slot, lsn}`；清单仍是唯一提交点。段内的 `vectors.bin` / `keys.bin` / `tombstones.bin` 使用现有格式，payload store 与写槽位继续按全局 slot 编址，避免索引和 WAL 记录格式同时改动。
-2. 新写入只落到 appendable 段：容量增长、槽位分配和 WAL 顺序保持现状；immutable 段由 optimizer 在 staging 目录内构建，冻结后的段文件只读。
-3. 提交时用一份 `Arc<SegmentSet>` guard 替换当前 `DataFiles` guard；查询开始时取一次 guard 并跨所有段 fan-out。提交窗口用有界队列吸收新事务（复用 commit queue 的 gate，但把等待限制在时间/条数上限内），取代整体写锁下的全量重写。
-4. 失败矩阵沿用 generation 协议：staging 未完成、段目录已 rename 而清单未替换、清单已替换而句柄未切换，三种崩溃点都只产生旧代或完整新代。验收以混合写入下的压实、重启和 WAL 重放一致性为准。
+抽象 `FieldIndex` 的声明、注册、删除、查询、选择性和 checkpoint 接口；用位图集合运算实现 `must_not` / `should` / `min_should`；补 full-text、geo、facet、nested、null 索引；保存基数与直方图，按选择性选择位图或索引探测；immutable 段发布只读磁盘索引。
 
-#### ANN 按段建图
+### 快照 pin
 
-1. 图文件按 immutable 段保存，并在清单中记录所属 generation 与段 id；appendable 段继续精确扫描，其 `pending` 用有界 drain 分批并入图，超限时触发该段重建而不是无限积压。
-2. 查询把每个段的 top-k 候选合并后统一打分；段冻结时修复图空洞，immutable 图不再原地改动，避免跨代 remap 的全局代价。
-3. 索引构建与段提交的互斥仍走 `compact_mutex` / `build_mutex`，发布新图前必须校验段 id 与 generation id 一致。
-
-#### field index 能力
-
-1. 抽出 `FieldIndex` 抽象：`declare / register / remove / query / selectivity / checkpoint`；appendable 段用可变内存索引，immutable 段用随代发布的只读磁盘索引。
-2. 在现有 Map/Numeric 之外补 full-text（BM25）、geo、facet、nested、prefix、null；`must_not` / `should` / `min_should` 走位图集合运算，避免退化为逐点后置过滤。
-3. 为每个字段保存基数与直方图统计，规划器在选择性低时走位图、选择性高时走索引探测；统计随快照发布，内容作为派生数据可从段/WAL 重建。
-
-#### WAL mmap 化
-
-1. 段文件改为预分配的 mmap 文件，头部包含 magic、format version、随机 CRC seed、first-lsn 和 closed 标记；记录 8 字节对齐，CRC 使用段内 seed。随机 seed 与 closed 标记持久化，保留现有的“中间段损坏即 `CorruptData`、末段可容忍撕裂”的规则。
-2. 批量提交改为流式写入 mmap，不再把整批记录先编码进一个 `Vec`；预建段队列在后台补足，closed 段按 first-index ACK 水位保留后再回收。
-3. 迁移时保持事务语义不变：per-id 版本、generation 水位、检查点顺序和 group commit 的“先持久化再应用”契约都不随编码改变；新旧布局不共存，开发期的 format version 仍为 1。
+集合快照先固定 WAL ACK 水位，再复制 serving generation 文件，最后把水位写进快照清单；复制期间的写入必须留在被归档的 WAL 中。这样目录复制不再依赖“恰好没有并发写”。
 
 ## 验证重点
 
-已实现部分的自动化覆盖：`test_unpublished_generation_is_ignored`、`test_generation_advances_with_checkpoint_and_compaction`、`kind_compaction_publishes_a_generation`，以及 `test_dense_snapshot_restores_id_directory`、`test_unpublished_dense_snapshot_is_ignored`、`test_point_versions_drop_stale_replay_records`、`test_ack_belongs_to_one_generation` 和既有 checkpoint/WAL/量化/压实测试。
+本轮回归覆盖：
 
-- checkpoint 后杀进程：重放只覆盖 ACK 之后的记录；人工放回旧 WAL 段不会污染数据。
-- checkpoint 中途杀进程：bitmask/tracker 文件要么完整、要么保留上一版，集合可以打开。
-- tracker 指向不存在或过短的 page 时 open 报 `CorruptData` 而不是吞掉 payload。
-- quant code 写入失败后，`is_ready()` 为 false，搜索走 exact，rebuild 后恢复 quantized。
-- 压实中途杀进程：generation manifest 仍指向旧一代，未发布临时目录被忽略，WAL 未被提前截断。
+- fsync 失败时 checkpoint 不推进 generation、不截断 WAL；
+- WAL torn tail 后继续写入，重开仍能读到新事务；
+- 同进程多个句柄共享目录锁，最后一个句柄释放后可重开；
+- generation 发布失败路径把 store 置为 poisoned，拒绝后续写；
+- payload-only 写入后 dense snapshot 仍可用于打开；
+- 既有 checkpoint、WAL、压实、量化和恢复测试保持通过。
+
+后续结构性修改需要补充：混合写入下的段压实重启一致性、字段索引选择性规划、按段 ANN 的召回对比，以及带并发写的快照复制恢复。目录锁的跨进程互斥需要在独立进程测试中验证；当前单元测试覆盖同进程共享与释放。

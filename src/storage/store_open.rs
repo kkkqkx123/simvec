@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -118,6 +119,7 @@ impl CollectionStore {
             ));
         }
         std::fs::create_dir_all(dir)?;
+        let dir_lock = CollectionLock::acquire(dir)?;
 
         let mut meta = Meta::new_with_segment_slots(
             collection,
@@ -183,6 +185,8 @@ impl CollectionStore {
         }));
         Ok(Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             generation: RwLock::new(generation),
             files,
             storage: storage.clone(),
@@ -226,6 +230,7 @@ impl CollectionStore {
     pub fn open_with_storage(dir: impl AsRef<Path>, storage: &StorageConfig) -> Result<Arc<Self>> {
         storage.validate()?;
         let dir = dir.as_ref();
+        let dir_lock = CollectionLock::acquire(dir)?;
         let generation = Generation::open(dir)?;
         let data_dir = generation.path();
         for name in &["meta.bin", "vectors.bin", "keys.bin"] {
@@ -257,16 +262,13 @@ impl CollectionStore {
             }
         }
         let tombstone_count = files.tombstones.load().count_ones();
-        let tracker_version = files
-            .payload_store
-            .load()
-            .as_ref()
-            .as_ref()
-            .map_or(0, |store| store.tracker_version());
-        let snapshot = DenseSnapshot::read(&data_dir)?.filter(|snapshot| {
-            snapshot.matches(&generation, &meta, tombstone_count)
-                && snapshot.tracker_version == tracker_version
-        });
+        // The snapshot owns the id directory, not the payload bytes: a payload
+        // written after the checkpoint advances the tracker but leaves the
+        // directory intact, and WAL replay from the generation lsn re-applies
+        // that write. Requiring equal tracker versions would discard the
+        // directory after any payload-only mutation and force a full scan.
+        let snapshot = DenseSnapshot::read(&data_dir)?
+            .filter(|snapshot| snapshot.matches(&generation, &meta, tombstone_count));
         {
             let ps_guard = files.payload_store.load();
             let payload_store = ps_guard.as_ref().as_ref().expect("payload store is present");
@@ -314,6 +316,8 @@ impl CollectionStore {
 
         let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
+            _dir_lock: dir_lock,
+            generation_poisoned: AtomicBool::new(false),
             generation: RwLock::new(generation),
             files: ArcSwap::from(files),
             storage: storage.clone(),

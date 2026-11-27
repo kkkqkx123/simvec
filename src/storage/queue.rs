@@ -470,10 +470,13 @@ fn worker_main(queue: Arc<CommitQueue>, store: Weak<CollectionStore>) {
     };
     set_commit_worker(true);
     loop {
-        let Some(store) = store.upgrade() else {
+        // Take the batch before upgrading the weak reference: an idle worker
+        // must not keep its store alive, or the store's Drop could never run
+        // to shut the worker down.
+        let Some(batch) = queue.take_batch() else {
             break;
         };
-        let Some(batch) = queue.take_batch() else {
+        let Some(store) = store.upgrade() else {
             break;
         };
         #[cfg(test)]

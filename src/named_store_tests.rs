@@ -549,6 +549,7 @@ fn named_patch_reallocates_the_point_and_its_postings() {
     let point = store.get(&PointId::from("p1")).unwrap().unwrap();
     assert_eq!(point.vectors.len(), 2);
 
+    drop(store);
     let reopened = NamedStore::open(&dir, &storage).unwrap();
     assert_eq!(reopened.count(), 1);
     assert!(reopened
@@ -582,6 +583,7 @@ fn named_compaction_reclaims_blob_bytes() {
     assert_eq!(store.compact().unwrap(), 5);
     assert!(store.storage_bytes().0 <= before / 2);
 
+    drop(store);
     let reopened = NamedStore::open(&dir, &storage).unwrap();
     assert_eq!(reopened.count(), 5);
     assert!(reopened.postings_restored());

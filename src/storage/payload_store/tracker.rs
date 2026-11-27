@@ -16,7 +16,7 @@ use super::{StoreConfig, TRACKER_MAGIC};
 const TRACKER_VERSION: u32 = 1;
 
 /// Header: magic(4) + version(4) + slot_count(4) + block_size(4) + page_size(4)
-/// + tracker_version(8) = 28 bytes.
+/// + change counter (8) = 28 bytes.
 const TRACKER_HEADER_LEN: usize = 28;
 
 /// A pointer to a contiguous range of blocks within a data page.
@@ -90,9 +90,9 @@ impl Tracker {
         self.pointers.get(slot as usize).copied()
     }
 
-    /// Monotonic count of pointer changes, persisted with the file so a
-    /// generation snapshot can tell whether it describes this tracker.
-    pub(crate) fn version(&self) -> u64 {
+    /// Monotonic count of pointer changes, observed by the persistence tests.
+    #[cfg(test)]
+    fn version(&self) -> u64 {
         self.version
     }
 

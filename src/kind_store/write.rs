@@ -110,6 +110,7 @@ impl KindStore {
         records: Vec<WalRecord>,
         started: Instant,
     ) -> Result<()> {
+        self.ensure_not_poisoned()?;
         // Validate everything that can reject a request (shape, kind,
         // capacity, payload JSON) before the WAL append. Once appended,
         // apply is a pure state transition that cannot fail on bad input.

@@ -514,6 +514,7 @@ fn kind_compaction_rewrites_blobs_and_postings() {
     );
     assert_eq!(store.search(&query).unwrap().len(), 10);
 
+    drop(store);
     let reopened = KindStore::open(&dir, &storage).unwrap();
     assert_eq!(reopened.count(), 10);
     assert!(reopened.postings_restored());

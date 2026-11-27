@@ -169,14 +169,16 @@ impl PointBlobs {
     }
 
     /// Flush appends since the last `sync`. Returns whether anything was
-    /// flushed.
-    pub fn sync(&self) -> bool {
-        if !self.dirty.swap(false, Ordering::Relaxed) {
-            return false;
+    /// flushed. A failed fsync keeps the file dirty so a later checkpoint
+    /// retries it instead of publishing a snapshot over missing bytes.
+    pub fn sync(&self) -> Result<bool> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok(false);
         }
         let state = self.state.read();
-        state.file.sync_all().ok();
-        true
+        state.file.sync_all()?;
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Bytes currently mapped. Used by the resident-memory estimate.
@@ -532,7 +534,7 @@ mod tests {
         let kept = blobs.append(&encode_vector(&dense())).unwrap();
         let durable = blobs.len();
         let dropped = blobs.append(&encode_vector(&sparse())).unwrap();
-        blobs.sync();
+        blobs.sync().unwrap();
         drop(blobs);
 
         // Reopen as if the snapshot only covered the first append.
@@ -552,7 +554,7 @@ mod tests {
         let path = dir.path().join("points.bin");
         let blobs = PointBlobs::create(&path).unwrap();
         blobs.append(&encode_vector(&dense())).unwrap();
-        blobs.sync();
+        blobs.sync().unwrap();
         let len = blobs.len();
         drop(blobs);
         // Cut the file below what the snapshot references.

@@ -55,6 +55,7 @@ impl CollectionStore {
     /// and to any published index, so a rehydrated index immediately honors
     /// the runtime config.
     pub fn set_ivf_config(&self, config: IvfConfig) -> Result<()> {
+        self.ensure_not_poisoned()?;
         let files = self.data_arc();
         config.validate()?;
         let mut inner = self.inner.write();
@@ -82,6 +83,7 @@ impl CollectionStore {
     /// parameters in at build time, so changes only affect the next rebuild
     /// and memory must stay consistent with disk.
     pub fn set_hnsw_config(&self, config: HnswConfig) -> Result<()> {
+        self.ensure_not_poisoned()?;
         config.validate()?;
         let mut inner = self.inner.write();
         match &mut inner.meta.index {
@@ -261,6 +263,7 @@ impl CollectionStore {
     /// ensures `quant.bin` is trained before the index is built, under the
     /// same `build_mutex` so slot numbers stay stable.
     pub fn build_index(&self) -> Result<bool> {
+        self.ensure_not_poisoned()?;
         // Train quantization first if needed (especially Product which needs a
         // codebook before HNSW/IVF can be usefully built). Scalar/Binary are
         // idempotent after incremental writes; rebuilding still refreshes the

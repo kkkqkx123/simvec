@@ -132,6 +132,7 @@ impl NamedStore {
         records: Vec<WalRecord>,
         started: Instant,
     ) -> Result<()> {
+        self.ensure_not_poisoned()?;
         // Validate the entire batch before the WAL append so an illegal
         // upsert/patch can never be persisted (and then fail on replay).
         self.validate_records(inner, &records)?;

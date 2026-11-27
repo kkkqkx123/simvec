@@ -162,14 +162,17 @@ impl Vectors {
     }
 
     /// Flush slot writes since the last `sync`. Returns whether anything was
-    /// flushed. Called at checkpoint time; WAL replay covers the same data.
-    pub fn sync(&self) -> bool {
-        if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return false;
+    /// flushed. The dirty flag is cleared only after fsync succeeds, so a
+    /// failed checkpoint leaves the file marked dirty and keeps the WAL
+    /// authoritative.
+    pub fn sync(&self) -> Result<bool> {
+        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
         }
         let file = self.file.lock();
-        file.sync_all().ok();
-        true
+        file.sync_all()?;
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Read the vector for a slot from a snapshot. Borrowed from the mmap.

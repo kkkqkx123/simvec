@@ -263,12 +263,6 @@ impl PayloadStore {
         Ok(())
     }
 
-    /// Version of the in-memory slot→pointer table. Included in the dense
-    /// generation snapshot so a stale snapshot can be recognized on open.
-    pub(crate) fn tracker_version(&self) -> u64 {
-        self.tracker.read().version()
-    }
-
     /// Persist all derived state: the block bitmask, the slot→pointer tracker
     /// and every page written since the last checkpoint. Runs at WAL
     /// checkpoint time, collection close and compaction commit — never inside
@@ -276,7 +270,7 @@ impl PayloadStore {
     pub fn checkpoint(&self) -> Result<()> {
         let pages_dirty = {
             let pages = self.pages.read();
-            pages.sync()
+            pages.sync()?
         };
         {
             let bitmask = self.bitmask.read();

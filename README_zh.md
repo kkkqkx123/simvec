@@ -143,6 +143,22 @@ const hits = engine.searchVector("docs", [1, 0], 10);
 engine.close();
 ```
 
+## 命令行工具
+
+`cli/` 是独立的 Rust shell，作为单独的 Cargo 包构建。它直接调用公开的
+`LocalVectorEngine` API，不需要 C 工具链，也不改变 C ABI 或任何绑定。
+
+```sh
+sh scripts/build-cli.sh             # target/release/simvec
+target/release/simvec ./data         # 交互模式
+target/release/simvec ./data "count docs"
+target/release/simvec --batch ./data < commands.txt
+```
+
+点命令控制 shell 自身（`.open`、`.tables`、`.schema`、`.mode`、`.bail`、
+`.read`、`.quit`），其余命令一一映射到引擎 API 并以 JSON 传参。完整命令表见
+`cli/README.md`。
+
 ## 测试与基准
 
 ```sh
