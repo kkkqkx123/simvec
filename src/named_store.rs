@@ -25,8 +25,10 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::point_blobs::{BlobRef, PointBlobs};
+use crate::storage::point_blobs::BlobRef;
 use crate::storage::postings::Postings;
+use crate::storage::segmented_blobs::SegmentedBlobs;
+use crate::storage::space_ann::SpaceAnn;
 use crate::storage::{CollectionLock, Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
@@ -143,13 +145,29 @@ pub struct NamedStore {
     metrics: Metrics,
     /// Published data generation. Its lsn bounds WAL replay.
     generation: RwLock<Generation>,
-    /// Append-only vector bytes (`points.bin`).
-    blobs: ArcSwap<PointBlobs>,
-    /// Append-only JSON payload bytes (`payloads.bin`).
-    payloads: ArcSwap<PointBlobs>,
+    /// Segmented append-only vector bytes.
+    blobs: ArcSwap<SegmentedBlobs>,
+    /// Segmented append-only JSON payload bytes.
+    payloads: ArcSwap<SegmentedBlobs>,
     /// Sparse postings per space, keyed by space name. Dense and multi spaces
     /// have no entry.
     postings: ArcSwap<HashMap<String, Arc<Postings>>>,
+    /// Per-space ANN indexes for dense spaces that declare an ANN tier. Spaces
+    /// on Flat or non-dense kinds have no entry and use exact scan. Swapped as
+    /// a whole on compaction so readers never see a half-rebuilt set.
+    ann: ArcSwap<BTreeMap<String, Arc<SpaceAnn>>>,
+    /// Collection-level index tier applied to dense spaces (named layouts
+    /// share one tier across their dense spaces; sparse/multi stay exact).
+    index: crate::types::IndexConfig,
+    /// Per-space element storage type and its affine parameters. Dense spaces
+    /// may use f16/uint8/binary; sparse/multi stay f32.
+    dtype_map: BTreeMap<
+        String,
+        (
+            crate::types::VectorDataType,
+            crate::storage::spaces_meta::DtypeParams,
+        ),
+    >,
 }
 
 impl NamedStore {

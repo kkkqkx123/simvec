@@ -1067,6 +1067,26 @@ func (e *Engine) CollectionMetrics(collection string) (map[string]any, error) {
 	return metrics, nil
 }
 
+// MaintenanceStatus returns the per-segment durability state of a collection.
+func (e *Engine) MaintenanceStatus(collection string) (map[string]any, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return nil, newError(CodeMisuse, "engine is closed")
+	}
+	cCollection := cString(collection)
+	defer C.free(unsafe.Pointer(cCollection))
+	var out *C.char
+	if err := e.fail(C.simvec_maintenance_status(e.handle, cCollection, &out)); err != nil {
+		return nil, err
+	}
+	var status map[string]any
+	if err := decodeText(out, &status); err != nil {
+		return nil, err
+	}
+	return status, nil
+}
+
 // RunMaintenanceSweep runs a global maintenance sweep.
 func (e *Engine) RunMaintenanceSweep() error {
 	e.mu.RLock()

@@ -70,6 +70,7 @@ export declare class Engine {
   compact(collection: string): number;
   drainPending(collection: string): void;
   collectionMetrics(collection: string): JsonObject;
+  maintenanceStatus(collection: string): JsonObject;
   runMaintenanceSweep(): void;
   promoteTempCollection(live: string, temp: string, backupSuffix: string): void;
   restorePromoteBackup(live: string): string;
@@ -81,4 +82,8 @@ export declare class Engine {
   getDefaultIvfConfig(): JsonObject | null;
   setDefaultQuantizationConfig(config: JsonObject): void;
   getDefaultQuantizationConfig(): JsonObject | null;
+  snapshotCollection(collection: string, dest: string): JsonObject;
+  snapshotCollectionIncremental(collection: string, base: string, dest: string): JsonObject;
+  verifySnapshot(src: string): JsonObject;
+  restoreSnapshot(src: string, dest: string): void;
 }

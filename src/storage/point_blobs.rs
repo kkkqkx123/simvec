@@ -1,232 +1,23 @@
-//! `points.bin` — append-only blob file for exact-scan point payloads.
+//! Vector blob encoding primitives shared by the physical segment stores.
 //!
-//! Dense collections address their vectors by slot into a fixed-stride
-//! `vectors.bin`. Sparse and multi points are variable length, so they are
-//! appended here instead and addressed by `(offset, len)` — the pair the
-//! snapshot stores per slot. Nothing is overwritten in place: an updated point
-//! gets a new blob and the old bytes become unreachable until compaction
-//! rewrites the file.
+//! This module no longer owns an append-only file container: point payloads
+//! live in `SegmentedBlobs` (`spaces/<space>/segments/<start>/`). What remains
+//! here is the on-disk encoding of one vector (`BlobRef` handles plus the
+//! dtype-aware encode/decode functions) shared by kind/named stores, WAL
+//! replay and snapshots.
 //!
-//! The file is mapped read-only once and remapped when it has to grow, in
-//! [`GROW_CHUNK_BYTES`] steps so a burst of small upserts costs one `mmap`
-//! per chunk rather than one per point. Readers hold the map read lock and get
-//! `&[u8]`/`VectorView` borrows straight out of the mapping; writers hold the
-//! write lock to append. Blob starts are 4-byte aligned so a decoded view can
-//! borrow `&[f32]`/`&[u32]` without copying.
-//!
-//! Durability: appends are plain `pwrite`s, `sync()` is the checkpoint's
-//! fsync. The file may therefore be longer than the snapshot that describes it
-//! (crash between append and checkpoint), which [`PointBlobs::open`] resolves
-//! by truncating back to the snapshot's length: every reachable blob is one
-//! the snapshot pointed at, so the tail is by definition uncommitted.
+//! Layout of one vector: a 12-byte header keeps the arrays 4-byte aligned.
+//! Byte `[1]` carries the element dtype tag (`0` = f32 keeps the historical
+//! layout); bytes `[2..4)` are reserved.
 
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use memmap2::{Mmap, MmapOptions};
-use parking_lot::{RwLock, RwLockReadGuard};
-
-use crate::error::{Result, VectorSearchError};
+use crate::error::Result;
 use crate::types::{VectorData, VectorView};
-
-/// How much the file grows by when an append does not fit in the mapping.
-const GROW_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Handle to one point's bytes inside [`PointBlobs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobRef {
     pub off: u64,
     pub len: u32,
-}
-
-impl BlobRef {
-    pub fn end(&self) -> u64 {
-        self.off + self.len as u64
-    }
-}
-
-struct BlobState {
-    file: File,
-    map: Option<Arc<Mmap>>,
-    /// Logical end of the appended data (the file may be longer: it is
-    /// pre-allocated in whole chunks).
-    len: u64,
-}
-
-/// Append-only, memory-mapped blob file.
-pub struct PointBlobs {
-    path: PathBuf,
-    state: RwLock<BlobState>,
-    dirty: AtomicBool,
-}
-
-impl PointBlobs {
-    /// Create an empty blob file. Fails if it already exists.
-    pub fn create(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        file.sync_all()?;
-        open_dir(path)?.sync_all()?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            state: RwLock::new(BlobState {
-                file,
-                map: None,
-                len: 0,
-            }),
-            dirty: AtomicBool::new(false),
-        })
-    }
-
-    /// Open an existing file, reconciling its length with the snapshot.
-    ///
-    /// `durable_len` is the length the snapshot recorded. A longer file is a
-    /// crash tail (appends that never reached a checkpoint) and is cut back; a
-    /// shorter one means the snapshot points at bytes that are gone, which is
-    /// real corruption.
-    pub fn open(path: &Path, durable_len: Option<u64>) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let actual = file.metadata()?.len();
-        if let Some(expected) = durable_len {
-            if actual > expected {
-                tracing::warn!(
-                    actual,
-                    expected,
-                    "points.bin longer than the snapshot; dropping the uncommitted tail"
-                );
-                file.set_len(expected)?;
-                file.sync_all()?;
-            } else if actual < expected {
-                return Err(VectorSearchError::CorruptData(format!(
-                    "points.bin holds {actual} bytes but the snapshot references {expected}"
-                )));
-            }
-        }
-        let len = file.metadata()?.len();
-        let map = map_all(&file, len)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            state: RwLock::new(BlobState { file, map, len }),
-            dirty: AtomicBool::new(false),
-        })
-    }
-
-    /// Append `bytes` and return the handle addressing them. `bytes` must not
-    /// be empty (a zero-length blob would be indistinguishable from a tombstone
-    /// reference).
-    pub fn append(&self, bytes: &[u8]) -> Result<BlobRef> {
-        if bytes.is_empty() {
-            return Err(VectorSearchError::Internal(
-                "refusing to append an empty point blob".to_string(),
-            ));
-        }
-        let mut state = self.state.write();
-        // Keep every blob start 4-byte aligned so decoded f32/u32 slices need
-        // no copy.
-        let pad = (4 - state.len % 4) % 4;
-        if pad > 0 {
-            write_at(&state.file, &[0u8; 4][..pad as usize], state.len)?;
-        }
-        let off = state.len + pad;
-        let end = off + bytes.len() as u64;
-        let mapped = state.map.as_ref().map_or(0, |map| map.len() as u64);
-        if end > mapped {
-            let new_len = end.div_ceil(GROW_CHUNK_BYTES) * GROW_CHUNK_BYTES;
-            state.file.set_len(new_len)?;
-            state.map = map_all(&state.file, new_len)?;
-        }
-        write_at(&state.file, bytes, off)?;
-        state.len = end;
-        drop(state);
-        self.dirty.store(true, Ordering::Relaxed);
-        Ok(BlobRef {
-            off,
-            len: bytes.len() as u32,
-        })
-    }
-
-    /// Borrow the mapping for a read pass. One reader per operation: holding
-    /// it keeps the map (and therefore every returned slice) stable.
-    pub fn reader(&self) -> PointBlobsReader<'_> {
-        PointBlobsReader {
-            guard: self.state.read(),
-        }
-    }
-
-    /// Logical end of the appended data.
-    pub fn len(&self) -> u64 {
-        self.state.read().len
-    }
-
-    /// Flush appends since the last `sync`. Returns whether anything was
-    /// flushed. A failed fsync keeps the file dirty so a later checkpoint
-    /// retries it instead of publishing a snapshot over missing bytes.
-    pub fn sync(&self) -> Result<bool> {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        let state = self.state.read();
-        state.file.sync_all()?;
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(true)
-    }
-
-    /// Bytes currently mapped. Used by the resident-memory estimate.
-    pub fn mapped_bytes(&self) -> u64 {
-        self.state.read().len
-    }
-}
-
-impl std::fmt::Debug for PointBlobs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PointBlobs")
-            .field("path", &self.path)
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-/// Read handle over a mapped blob file.
-pub struct PointBlobsReader<'a> {
-    guard: RwLockReadGuard<'a, BlobState>,
-}
-
-impl PointBlobsReader<'_> {
-    /// Raw bytes of one blob. `None` when the reference is out of the map,
-    /// which the open-time reconciliation is supposed to make impossible.
-    pub fn bytes(&self, blob: BlobRef) -> Option<&[u8]> {
-        let map = self.guard.map.as_ref()?;
-        let end = blob.end() as usize;
-        if end > map.len() {
-            return None;
-        }
-        Some(&map[blob.off as usize..end])
-    }
-
-    /// Decode the vector of one blob without copying.
-    pub fn view(&self, blob: BlobRef) -> Option<VectorView<'_>> {
-        decode_vector(self.bytes(blob)?)
-    }
-
-    /// Decode the vector of one blob into an owned payload (fetch paths).
-    pub fn to_data(&self, blob: BlobRef) -> Option<VectorData> {
-        self.view(blob).map(|view| view.to_data())
-    }
-
-    /// Decode one named space of a multi-space blob, without copying.
-    pub fn space_view(&self, blob: BlobRef, space: u16) -> Option<VectorView<'_>> {
-        named_view(self.bytes(blob)?, space)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +73,11 @@ pub fn decode_vector(bytes: &[u8]) -> Option<VectorView<'_>> {
         return None;
     }
     let kind = bytes[0];
+    // Zero-copy decoding only handles the historical f32 encoding. A typed
+    // body must go through `decode_vector_typed` instead.
+    if bytes[1] != crate::types::VectorDataType::F32.tag() {
+        return None;
+    }
     let a = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
     let b = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
     let body = &bytes[VECTOR_HEADER_BYTES..];
@@ -319,18 +115,9 @@ pub fn decode_vector(bytes: &[u8]) -> Option<VectorView<'_>> {
 /// 4-aligned vector encoding.
 const NAMED_ENTRY_HEADER_BYTES: usize = 8;
 
-/// Encode a whole named-space map. `order` maps a space name to its stable
-/// index (the position in the collection's space map), so a decode can address
-/// a space without storing its name per point.
-pub fn encode_named(
-    vectors: &std::collections::BTreeMap<String, VectorData>,
-    order: &std::collections::BTreeMap<String, u16>,
-) -> Vec<u8> {
-    let mut entries: Vec<(u16, Vec<u8>)> = Vec::with_capacity(vectors.len());
-    for (space, data) in vectors {
-        let index = order.get(space).copied().unwrap_or(u16::MAX);
-        entries.push((index, encode_vector(data)));
-    }
+/// Pack already-encoded per-space vectors into one named point blob. Used by
+/// stores that apply a per-space element dtype before packing.
+pub fn pack_named(mut entries: Vec<(u16, Vec<u8>)>) -> Vec<u8> {
     entries.sort_unstable_by_key(|(index, _)| *index);
     let mut out = Vec::with_capacity(4 + entries.len() * NAMED_ENTRY_HEADER_BYTES);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -393,19 +180,148 @@ pub fn named_entries(bytes: &[u8]) -> Option<Vec<(u16, &[u8])>> {
     Some(raw)
 }
 
-/// Borrow one space's vector out of an encoded point blob.
-pub fn named_view(bytes: &[u8], space: u16) -> Option<VectorView<'_>> {
-    let (_, entry) = named_entries(bytes)?
-        .into_iter()
-        .find(|(index, _)| *index == space)?;
-    decode_vector(entry)
+fn push_header(out: &mut Vec<u8>, kind: u8, a: u32, b: u32) {
+    push_header_dtype(out, kind, crate::types::VectorDataType::F32, a, b);
 }
 
-fn push_header(out: &mut Vec<u8>, kind: u8, a: u32, b: u32) {
+/// Header with an explicit element dtype tag in byte `[1]`. Bytes `[2..4]`
+/// stay zero (reserved). `F32` (tag 0) keeps the historical layout byte-for-byte.
+fn push_header_dtype(
+    out: &mut Vec<u8>,
+    kind: u8,
+    dtype: crate::types::VectorDataType,
+    a: u32,
+    b: u32,
+) {
     out.push(kind);
-    out.extend_from_slice(&[0u8, 0u8, 0u8]);
+    out.push(dtype.tag());
+    out.extend_from_slice(&[0u8, 0u8]);
     out.extend_from_slice(&a.to_le_bytes());
     out.extend_from_slice(&b.to_le_bytes());
+}
+
+/// Read the dtype tag of one encoded vector. An unknown tag is `None` so the
+/// caller can surface `CorruptData` rather than silently decoding as f32.
+#[cfg(test)]
+pub fn vector_dtype(bytes: &[u8]) -> Option<crate::types::VectorDataType> {
+    if bytes.len() < VECTOR_HEADER_BYTES {
+        return None;
+    }
+    crate::types::VectorDataType::from_tag(bytes[1]).ok()
+}
+
+/// Encode a dense vector using an explicit element dtype. The body holds the
+/// dtype's native bytes (f32 / f16 / uint8 quantized / packed binary) and the
+/// affine parameters for uint8 live in the header's `b`/reserved words so a
+/// decode needs no external config.
+///
+/// Returns the encoded bytes plus the `QuantParams` actually used, so callers
+/// that care can persist them alongside the blob.
+pub fn encode_vector_typed(
+    data: &VectorData,
+    dtype: crate::types::VectorDataType,
+    params: crate::distance::dtype::QuantParams,
+) -> Result<(Vec<u8>, crate::distance::dtype::QuantParams)> {
+    use crate::distance::dtype::encode_typed;
+    use crate::error::VectorSearchError;
+    match data {
+        VectorData::Dense(values) => {
+            let body = encode_typed(values, dtype, params)?;
+            let mut out = Vec::with_capacity(VECTOR_HEADER_BYTES + body.len());
+            // `a` is the element count (dim), matching `decode_vector`'s dense
+            // convention; the decoder derives byte length from dtype.
+            push_header_dtype(&mut out, KIND_DENSE, dtype, values.len() as u32, 0);
+            out.extend_from_slice(&body);
+            Ok((out, params))
+        }
+        // Sparse and multi payloads carry no element dtype in this format;
+        // fall back to the f32 encoding but still stamp the requested tag only
+        // when it is F32 (otherwise reject: a typed non-dense body is invalid).
+        VectorData::Sparse { .. } | VectorData::Multi(_) => {
+            if dtype != crate::types::VectorDataType::F32 {
+                return Err(VectorSearchError::InvalidConfig(
+                    "element dtype is only supported for dense vectors".to_string(),
+                ));
+            }
+            Ok((encode_vector(data), params))
+        }
+    }
+}
+
+/// Produce a borrowable view for scoring. For the default f32 dtype the slice
+/// is borrowed straight out of `bytes` (zero copy). For typed encodings the
+/// decoded f32 values are placed into `scratch` and the view borrows that.
+/// `scratch` lives for one scoring iteration, so no per-candidate allocation
+/// beyond a reused buffer.
+pub fn view_for_score<'a>(
+    bytes: &'a [u8],
+    dtype: crate::types::VectorDataType,
+    params: crate::distance::dtype::QuantParams,
+    scratch: &'a mut Vec<f32>,
+) -> Option<VectorView<'a>> {
+    use crate::types::VectorDataType;
+    if dtype == VectorDataType::F32 {
+        return decode_vector(bytes);
+    }
+    let data = decode_vector_typed(bytes, params).ok()?;
+    match data {
+        VectorData::Dense(values) => {
+            *scratch = values;
+            Some(VectorView::Dense(scratch))
+        }
+        _ => None,
+    }
+}
+
+/// Decode any supported element dtype into an owned `VectorData`. Unlike
+/// `decode_vector` (zero-copy f32 only), this materializes non-f32 encodings.
+/// A malformed or unknown dtype tag is `CorruptData`.
+pub fn decode_vector_typed(
+    bytes: &[u8],
+    params: crate::distance::dtype::QuantParams,
+) -> Result<VectorData> {
+    use crate::distance::dtype::decode_typed;
+    use crate::error::VectorSearchError;
+    if bytes.len() < VECTOR_HEADER_BYTES {
+        return Err(VectorSearchError::CorruptData(
+            "vector blob shorter than header".to_string(),
+        ));
+    }
+    let dtype = crate::types::VectorDataType::from_tag(bytes[1])?;
+    let kind = bytes[0];
+    let a = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
+    let b = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
+    let body = &bytes[VECTOR_HEADER_BYTES..];
+    match kind {
+        KIND_DENSE => {
+            let values = decode_typed(dtype, a, body, params)?;
+            Ok(VectorData::Dense(values))
+        }
+        KIND_SPARSE => {
+            if dtype != crate::types::VectorDataType::F32 {
+                return Err(VectorSearchError::CorruptData(
+                    "sparse vector has a non-f32 dtype tag".to_string(),
+                ));
+            }
+            decode_vector(bytes)
+                .map(|view| view.to_data())
+                .ok_or_else(|| VectorSearchError::CorruptData("bad sparse vector".to_string()))
+        }
+        KIND_MULTI => {
+            if dtype != crate::types::VectorDataType::F32 {
+                return Err(VectorSearchError::CorruptData(
+                    "multi vector has a non-f32 dtype tag".to_string(),
+                ));
+            }
+            let _ = b;
+            decode_vector(bytes)
+                .map(|view| view.to_data())
+                .ok_or_else(|| VectorSearchError::CorruptData("bad multi vector".to_string()))
+        }
+        _ => Err(VectorSearchError::CorruptData(format!(
+            "unknown vector kind tag {kind}"
+        ))),
+    }
 }
 
 fn push_f32s(out: &mut Vec<u8>, values: &[f32]) {
@@ -430,35 +346,6 @@ fn as_u32s(bytes: &[u8]) -> Option<&[u32]> {
     let ptr = bytes.as_ptr();
     debug_assert_eq!(ptr as usize % 4, 0, "blob arrays must be 4-byte aligned");
     Some(unsafe { std::slice::from_raw_parts(ptr as *const u32, bytes.len() / 4) })
-}
-
-fn map_all(file: &File, len: u64) -> Result<Option<Arc<Mmap>>> {
-    if len == 0 {
-        return Ok(None);
-    }
-    let map = unsafe { MmapOptions::new().len(len as usize).map(file)? };
-    Ok(Some(Arc::new(map)))
-}
-
-fn open_dir(path: &Path) -> Result<File> {
-    let dir = path.parent().ok_or_else(|| {
-        VectorSearchError::Internal(format!("no parent dir for {}", path.display()))
-    })?;
-    Ok(File::open(dir)?)
-}
-
-#[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(buf, offset)
-}
-
-#[cfg(not(unix))]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
-    let mut handle = file;
-    handle.seek(SeekFrom::Start(offset))?;
-    handle.write_all(buf)
 }
 
 #[cfg(test)]
@@ -500,77 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn appends_are_addressable_and_aligned() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("points.bin");
-        let blobs = PointBlobs::create(&path).unwrap();
-        let dense_ref = blobs.append(&encode_vector(&dense())).unwrap();
-        // A 1-byte blob forces the next append to be realigned.
-        let odd = blobs.append(&[0xAB]).unwrap();
-        let sparse_ref = blobs.append(&encode_vector(&sparse())).unwrap();
-        assert_eq!(odd.len, 1);
-        assert_eq!(sparse_ref.off % 4, 0, "blob starts stay 4-byte aligned");
-
-        let reader = blobs.reader();
-        assert_eq!(reader.view(dense_ref).unwrap().to_data(), dense());
-        assert_eq!(reader.view(sparse_ref).unwrap().to_data(), sparse());
-        assert_eq!(reader.bytes(odd).unwrap(), &[0xAB]);
-    }
-
-    #[test]
-    fn a_long_file_is_truncated_to_the_snapshot_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("points.bin");
-        let blobs = PointBlobs::create(&path).unwrap();
-        let kept = blobs.append(&encode_vector(&dense())).unwrap();
-        let durable = blobs.len();
-        let dropped = blobs.append(&encode_vector(&sparse())).unwrap();
-        blobs.sync().unwrap();
-        drop(blobs);
-
-        // Reopen as if the snapshot only covered the first append.
-        let reopened = PointBlobs::open(&path, Some(durable)).unwrap();
-        assert_eq!(reopened.len(), durable);
-        let reader = reopened.reader();
-        assert!(reader.view(kept).is_some());
-        assert!(
-            reader.bytes(dropped).is_none(),
-            "the uncommitted tail must be unreachable"
-        );
-    }
-
-    #[test]
-    fn a_short_file_is_reported_as_corruption() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("points.bin");
-        let blobs = PointBlobs::create(&path).unwrap();
-        blobs.append(&encode_vector(&dense())).unwrap();
-        blobs.sync().unwrap();
-        let len = blobs.len();
-        drop(blobs);
-        // Cut the file below what the snapshot references.
-        std::fs::write(&path, vec![0u8; len as usize - 4]).unwrap();
-        let error = PointBlobs::open(&path, Some(len)).unwrap_err();
-        assert!(matches!(error, VectorSearchError::CorruptData(_)));
-    }
-
-    #[test]
-    fn growth_is_transparent_across_chunks() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("points.bin");
-        let blobs = PointBlobs::create(&path).unwrap();
-        // Pushing past GROW_CHUNK_BYTES forces at least one remap; every
-        // earlier reference must still resolve.
-        let big = VectorData::Dense(vec![7.0; 2 * 1024 * 1024]);
-        let first = blobs.append(&encode_vector(&dense())).unwrap();
-        let large = blobs.append(&encode_vector(&big)).unwrap();
-        assert!(large.end() > GROW_CHUNK_BYTES);
-        let reader = blobs.reader();
-        assert_eq!(reader.view(first).unwrap().to_data(), dense());
-        assert_eq!(reader.view(large).unwrap().to_data(), big);
-    }
-
-    #[test]
     fn named_entries_round_trip_and_patch() {
         let mut order = std::collections::BTreeMap::new();
         order.insert("a".to_string(), 0u16);
@@ -578,18 +394,98 @@ mod tests {
         let mut vectors = std::collections::BTreeMap::new();
         vectors.insert("a".to_string(), dense());
         vectors.insert("b".to_string(), sparse());
-        let bytes = encode_named(&vectors, &order);
-        assert_eq!(named_view(&bytes, 0).unwrap().to_data(), dense());
-        assert_eq!(named_view(&bytes, 1).unwrap().to_data(), sparse());
-        assert!(named_view(&bytes, 2).is_none());
+        let entries = vectors
+            .iter()
+            .map(|(name, data)| (order.get(name).copied().unwrap_or(u16::MAX), encode_vector(data)))
+            .collect();
+        let bytes = pack_named(entries);
+        let view_at = |blob: &[u8], space: u16| {
+            named_entries(blob)
+                .and_then(|entries| entries.into_iter().find(|(idx, _)| *idx == space).map(|(_, b)| b))
+                .and_then(decode_vector)
+                .map(|v| v.to_data())
+        };
+        assert_eq!(view_at(&bytes, 0), Some(dense()));
+        assert_eq!(view_at(&bytes, 1), Some(sparse()));
+        assert!(view_at(&bytes, 2).is_none());
         assert_eq!(named_entries(&bytes).unwrap().len(), 2);
 
         // Replace space 1 only: space 0 must survive byte for byte.
         let mut replacements = std::collections::BTreeMap::new();
         replacements.insert(1u16, encode_vector(&multi()));
         let patched = rewrite_named(&bytes, &replacements).unwrap();
-        assert_eq!(named_view(&patched, 0).unwrap().to_data(), dense());
-        assert_eq!(named_view(&patched, 1).unwrap().to_data(), multi());
+        assert_eq!(view_at(&patched, 0), Some(dense()));
+        assert_eq!(view_at(&patched, 1), Some(multi()));
         assert_eq!(named_entries(&patched).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dtype_tag_is_persisted_and_f32_layout_is_unchanged() {
+        use crate::types::VectorDataType;
+        let values = vec![1.0f32, 2.0, 3.0, 4.0];
+        let data = VectorData::Dense(values.clone());
+        // Default f32 encoding is byte-for-byte the historical layout.
+        let legacy = encode_vector(&data);
+        let (typed_f32, _) = encode_vector_typed(
+            &data,
+            VectorDataType::F32,
+            crate::distance::dtype::QuantParams::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy, typed_f32);
+        assert_eq!(vector_dtype(&legacy), Some(VectorDataType::F32));
+        assert_eq!(
+            decode_vector_typed(&typed_f32, crate::distance::dtype::QuantParams::default()).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn non_f32_dtype_roundtrips_through_blob() {
+        use crate::distance::dtype::QuantParams;
+        use crate::types::VectorDataType;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+        let data = VectorData::Dense(values.clone());
+        let params = QuantParams {
+            scale: 0.05,
+            zero_point: 128.0,
+        };
+        for dtype in [
+            VectorDataType::F16,
+            VectorDataType::Uint8,
+            VectorDataType::Binary,
+        ] {
+            let (bytes, used_params) = encode_vector_typed(&data, dtype, params).unwrap();
+            assert_eq!(vector_dtype(&bytes), Some(dtype));
+            // Zero-copy decoder must refuse typed bodies.
+            assert!(decode_vector(&bytes).is_none());
+            let decoded =
+                decode_vector_typed(&bytes, used_params).unwrap();
+            let VectorData::Dense(decoded_values) = decoded else {
+                panic!("expected dense");
+            };
+            assert_eq!(decoded_values.len(), values.len());
+            // Quantized values stay within one quantization step of source.
+            for (a, b) in values.iter().zip(decoded_values.iter()) {
+                let tol = match dtype {
+                    VectorDataType::F16 => 1e-3,
+                    VectorDataType::Uint8 => params.scale,
+                    VectorDataType::Binary => 1.1,
+                    _ => 0.0,
+                };
+                assert!((a - b).abs() <= tol, "{dtype:?}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_dtype_tag_is_rejected() {
+        use crate::distance::dtype::QuantParams;
+        let bytes = encode_vector(&VectorData::Dense(vec![1.0, 2.0, 3.0]));
+        let mut bad = bytes.clone();
+        bad[1] = 99; // unknown dtype tag
+        assert_eq!(vector_dtype(&bad), None);
+        assert!(decode_vector_typed(&bad, QuantParams::default()).is_err());
+        assert!(decode_vector(&bad).is_none());
     }
 }

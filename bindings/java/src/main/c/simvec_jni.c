@@ -623,6 +623,19 @@ JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nCollectionMetrics(JNIEnv *env, 
     return rc;
 }
 
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nMaintenanceStatus(JNIEnv *env, jclass cls,
+                                                                   jlong handle,
+                                                                   jbyteArray collection,
+                                                                   jobjectArray out) {
+    (void)cls;
+    ACQUIRE(c_collection, collection);
+    char *s = NULL;
+    int rc = simvec_maintenance_status(to_engine(handle), c_collection, &s);
+    RELEASE(c_collection);
+    emit_bytes(env, out, s);
+    return rc;
+}
+
 JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nRunMaintenanceSweep(JNIEnv *env, jclass cls,
                                                                       jlong handle) {
     (void)env;

@@ -437,6 +437,13 @@ public final class Engine implements AutoCloseable {
         return readMap(out[0]);
     }
 
+    public synchronized Map<String, Object> maintenanceStatus(String collection) {
+        long h = requireOpen();
+        byte[][] out = new byte[1][];
+        check(NativeLib.nMaintenanceStatus(h, utf8(collection), out), h);
+        return readMap(out[0]);
+    }
+
     public synchronized void runMaintenanceSweep() {
         long h = requireOpen();
         check(NativeLib.nRunMaintenanceSweep(h), h);

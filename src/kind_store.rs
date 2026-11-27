@@ -39,8 +39,9 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::point_blobs::{BlobRef, PointBlobs};
+use crate::storage::point_blobs::BlobRef;
 use crate::storage::postings::Postings;
+use crate::storage::segmented_blobs::SegmentedBlobs;
 use crate::storage::{CollectionLock, Generation, IdMap, Wal};
 use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
@@ -106,6 +107,9 @@ pub struct KindStore {
     /// Per-point sub-vector cap for Multi collections; `0` for Sparse.
     max_vectors_per_point: usize,
     distance: crate::types::DistanceMetric,
+    /// Element storage type of dense vectors and its affine parameters.
+    dtype: crate::types::VectorDataType,
+    dtype_params: crate::storage::spaces_meta::DtypeParams,
     inner: Mutex<Inner>,
     wal: Wal,
     /// Engine-level storage tuning this collection was opened with.
@@ -118,10 +122,10 @@ pub struct KindStore {
     metrics: Metrics,
     /// Published data generation. Its lsn bounds WAL replay.
     generation: RwLock<Generation>,
-    /// Append-only vector bytes (`points.bin`).
-    blobs: ArcSwap<PointBlobs>,
-    /// Append-only JSON payload bytes (`payloads.bin`).
-    payloads: ArcSwap<PointBlobs>,
+    /// Segmented append-only vector bytes (`spaces/<space>/segments/<start>/points.bin`).
+    blobs: ArcSwap<SegmentedBlobs>,
+    /// Segmented append-only JSON payload bytes.
+    payloads: ArcSwap<SegmentedBlobs>,
     /// Persisted sparse postings (`postings/`).
     postings: ArcSwap<Postings>,
 }

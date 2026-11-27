@@ -1,4 +1,3 @@
-use super::dense_snapshot::DenseSnapshot;
 use super::*;
 use crate::error::{Result, VectorSearchError};
 use crate::types::{CollectionConfig, DistanceMetric, VectorPoint};
@@ -1185,8 +1184,9 @@ fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
     super::Generation::open(root).unwrap().path()
 }
 
-/// A checkpointed collection restores its directory from the dense snapshot;
-/// tampering with `keys.bin` must not change the ids the reopened store sees.
+/// A checkpointed collection restores its directory from per-segment id
+/// trackers; tampering with `keys.bin` must not change the ids the reopened
+/// store sees.
 #[test]
 fn test_dense_snapshot_restores_id_directory() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1205,17 +1205,17 @@ fn test_dense_snapshot_restores_id_directory() {
     store.checkpoint().unwrap();
 
     let data = data_dir(&store_dir);
-    let snapshot = DenseSnapshot::read(&data).unwrap().unwrap();
-    assert_eq!(
-        snapshot.generation,
-        super::Generation::open(&store_dir).unwrap().id()
-    );
-    assert_eq!(snapshot.lsn, store.meta().last_applied_txn);
-    assert_eq!(snapshot.points.len(), 2);
-    assert_eq!(
-        snapshot.points.iter().filter(|point| point.deleted).count(),
-        1
-    );
+    let generation = super::Generation::open(&store_dir).unwrap();
+    let (tracked, versions) = super::segments::read_id_trackers(
+        &data,
+        generation.id(),
+        4,
+        store.meta().slot_capacity,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(versions.len(), 2);
 
     let keys = data.join("segments/0000000000/keys.bin");
     let mut bytes = std::fs::read(&keys).unwrap();
@@ -1237,25 +1237,27 @@ fn test_dense_snapshot_restores_id_directory() {
     assert!(reopened.get(&PointId::from("9999")).unwrap().is_none());
 }
 
-/// A snapshot ahead of the manifest belongs to a checkpoint that never
-/// committed. Open must ignore it and rebuild from files plus WAL.
+/// A tracker bound to a different generation is rejected by open: it belongs
+/// to an aborted or stale generation and cannot describe the published one.
 #[test]
-fn test_unpublished_dense_snapshot_is_ignored() {
+fn test_mismatched_id_tracker_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let store_dir = tmp.path().join("col_snapshot_ahead");
-    let store = CollectionStore::create(&store_dir, "col_snapshot_ahead", &config(4)).unwrap();
+    let store_dir = tmp.path().join("col_tracker_ahead");
+    let store = CollectionStore::create(&store_dir, "col_tracker_ahead", &config(4)).unwrap();
     upsert_logged(&store, &point(7, 4));
     store.checkpoint().unwrap();
     drop(store);
 
     let data = data_dir(&store_dir);
-    let mut snapshot = DenseSnapshot::read(&data).unwrap().unwrap();
-    snapshot.lsn += 1;
-    DenseSnapshot::write(&data, &snapshot).unwrap();
+    let tracker_path = data.join("segments/0000000000/id_tracker.bin");
+    let mut bytes = std::fs::read(&tracker_path).unwrap();
+    // The generation id is the first post-card field inside the CRC envelope;
+    // corrupt a byte in the payload body so the CRC fails -> rejected.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&tracker_path, bytes).unwrap();
 
-    let reopened = CollectionStore::open(&store_dir).unwrap();
-    assert_eq!(reopened.count(), 1);
-    assert!(reopened.get(&PointId::from(7u64)).unwrap().is_some());
+    assert!(CollectionStore::open(&store_dir).is_err());
 }
 
 /// Out-of-order segments are treated as stale per id: a resurrected old
@@ -1327,11 +1329,16 @@ fn test_generation_advances_with_checkpoint_and_compaction() {
     assert_ne!(before, after);
     let generation = super::Generation::open(&store_dir).unwrap();
     assert_eq!(generation.lsn(), store.meta().last_applied_txn);
-    let snapshot = DenseSnapshot::read(&after).unwrap().unwrap();
-    assert_eq!(snapshot.generation, generation.id());
-    assert_eq!(snapshot.lsn, generation.lsn());
-    assert_eq!(snapshot.points.len(), 4);
-    assert_eq!(snapshot.tombstones.len(), 0);
+    let (tracked, versions) = super::segments::read_id_trackers(
+        &after,
+        generation.id(),
+        store.meta().segment_slots,
+        store.meta().slot_capacity,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(tracked.len(), 3);
+    assert_eq!(versions.len(), 4);
     assert!(store.get(&PointId::from(2u64)).unwrap().is_none());
     drop(store);
 
@@ -1612,5 +1619,87 @@ fn test_segment_wal_ack_stops_at_a_live_pin() {
     assert!(
         store.durable_wal_floor() > held,
         "ack resumes after release"
+    );
+}
+
+/// A dense collection declared with F16 stores vectors at half precision:
+/// the dtype tag is persisted in the segment header, quantization is applied
+/// on write, and the original precision is not recoverable after reopen.
+#[test]
+fn test_f16_dtype_is_applied_and_persisted() {
+    use crate::types::{VectorDataType, VectorSpaceConfig, DEFAULT_VECTOR_NAME};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_f16");
+    let mut cfg = config(3);
+    cfg.vectors.insert(
+        DEFAULT_VECTOR_NAME.to_string(),
+        VectorSpaceConfig::dense_typed(3, DistanceMetric::Cosine, VectorDataType::F16),
+    );
+    cfg.normalize();
+    let store = CollectionStore::create(&store_dir, "col_f16", &cfg).unwrap();
+
+    // A value f16 cannot represent exactly (0.1 -> 0.0999755859...).
+    let original = [0.1f32, 0.2, 0.3];
+    upsert_logged(
+        &store,
+        &VectorPoint::new(1u64, original.to_vec()),
+    );
+    store.checkpoint().unwrap();
+
+    // The dtype header is present in the segment directory.
+    let data = data_dir(&store_dir);
+    let header = super::segments::segment_dir(&data, 0).join(super::vectors::VECTOR_DTYPE_FILE);
+    assert!(header.exists(), "segment dtype header must be persisted");
+    let meta: super::vectors::VectorDtypeMeta = super::snapshot::read_strict(&header).unwrap().unwrap();
+    assert_eq!(meta.dtype, VectorDataType::F16);
+    assert_eq!(store.data_arc().vectors.dtype_meta().dtype, VectorDataType::F16);
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.data_arc().vectors.dtype_meta().dtype, VectorDataType::F16);
+    let got = reopened.get(&PointId::from(1u64)).unwrap().unwrap();
+    let stored = got.vector();
+    // The stored value differs from the f32 original (quantized) but matches
+    // the exact f16 round-trip of it.
+    assert!(
+        (stored[0] - original[0]).abs() > 1e-8,
+        "f16 write must lose f32 precision; got {}",
+        stored[0]
+    );
+    let expected = crate::distance::dtype::f16_to_f32(crate::distance::dtype::f32_to_f16(original[0]));
+    assert!((stored[0] - expected).abs() < 1e-7, "stored {} != f16 {}", stored[0], expected);
+}
+
+/// A corrupt dtype header on a published generation is CorruptData, never a
+/// silent downgrade to f32.
+#[test]
+fn test_corrupt_dtype_header_is_rejected() {
+    use crate::types::{VectorDataType, VectorSpaceConfig, DEFAULT_VECTOR_NAME};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_f16_bad");
+    let mut cfg = config(2);
+    cfg.vectors.insert(
+        DEFAULT_VECTOR_NAME.to_string(),
+        VectorSpaceConfig::dense_typed(2, DistanceMetric::Cosine, VectorDataType::F16),
+    );
+    cfg.normalize();
+    let store = CollectionStore::create(&store_dir, "col_f16_bad", &cfg).unwrap();
+    upsert_logged(&store, &point(1, 2));
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let data = data_dir(&store_dir);
+    let header = super::segments::segment_dir(&data, 0).join(super::vectors::VECTOR_DTYPE_FILE);
+    let mut bytes = std::fs::read(&header).unwrap();
+    // Flip a byte in the serialized postcard body (after the 10-byte envelope).
+    let idx = 10 + (bytes.len() - 10) - 1;
+    bytes[idx] ^= 0xff;
+    std::fs::write(&header, bytes).unwrap();
+
+    assert!(
+        CollectionStore::open(&store_dir).is_err(),
+        "corrupt dtype header must be rejected"
     );
 }

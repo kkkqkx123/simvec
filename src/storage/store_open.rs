@@ -6,7 +6,6 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
-use super::dense_snapshot::DenseSnapshot;
 use super::filter_bitmap::FilterBitmap;
 use super::generation::Generation;
 use super::keys::Keys;
@@ -143,7 +142,20 @@ impl CollectionStore {
         meta.save(&data_dir)?;
         super::segments::write(&data_dir, meta.segment_slots, 0)?;
 
-        let vectors = Vectors::create(&data_dir, config.vector_size, meta.segment_slots)?;
+        let dtype = config
+            .default_space()
+            .map_or(crate::types::VectorDataType::F32, |space| space.dtype());
+        let dtype_meta = super::vectors::VectorDtypeMeta {
+            dtype,
+            scale: 1.0,
+            zero_point: 0.0,
+        };
+        let vectors = Vectors::create_with_dtype(
+            &data_dir,
+            config.vector_size,
+            meta.segment_slots,
+            dtype_meta,
+        )?;
         let keys = Keys::create(&data_dir, meta.slot_capacity, meta.segment_slots)?;
         // Create quantized storage if requested. Scalar/Binary are ready immediately;
         // Product needs a codebook build before it becomes usable.
@@ -282,34 +294,46 @@ impl CollectionStore {
             payload_indexes = PayloadIndexManager::new();
             declare_all(&mut payload_indexes);
         }
-        let tombstone_count = files.tombstones.load().count_ones();
-        // The snapshot owns the id directory, not the payload bytes: a payload
-        // written after the checkpoint advances the tracker but leaves the
-        // directory intact, and WAL replay from the generation lsn re-applies
-        // that write. Requiring equal tracker versions would discard the
-        // directory after any payload-only mutation and force a full scan.
-        let snapshot = DenseSnapshot::read(&data_dir)?
-            .filter(|snapshot| snapshot.matches(&generation, &meta, tombstone_count));
+        // Per-segment id trackers are the authoritative id directory of a
+        // published generation; the old whole-generation `dense_snapshot.bin`
+        // is gone. A tracker records id -> offset plus point/delete water marks,
+        // so a payload written after the checkpoint (which only touches the
+        // live payload store) still leaves the directory intact, and WAL replay
+        // from the generation lsn re-applies that write. `None` is returned only
+        // for a generation that has never checkpointed; those slots are rebuilt
+        // from keys.bin + a full WAL replay below.
+        let restored = super::segments::read_id_trackers(
+            &data_dir,
+            generation.id(),
+            meta.segment_slots,
+            meta.slot_capacity,
+        )?;
+        // A generation that has committed a checkpoint (lsn > 0) must carry
+        // an id directory. Missing trackers here mean a committed generation
+        // lost its directory, which cannot be silently rebuilt from WAL alone.
+        if restored.is_none() && generation.lsn() > 0 {
+            return Err(VectorSearchError::CorruptData(format!(
+                "generation {} at lsn {} has no segment id trackers",
+                generation.id(),
+                generation.lsn()
+            )));
+        }
         {
             let ps_guard = files.payload_store.load();
             let payload_store = ps_guard
                 .as_ref()
                 .as_ref()
                 .expect("payload store is present");
-            if let Some(snapshot) = &snapshot {
-                for point in &snapshot.points {
-                    let id = DenseSnapshot::point_id(point);
-                    versions.insert_value(&id, point.lsn);
-                    if point.deleted {
-                        continue;
-                    }
-                    reverse.insert(&id, point.slot);
-                    if let Ok(Some(p)) = payload_store.get(point.slot) {
-                        filter_bitmap.register_slot(point.slot, Some(&p));
-                        payload_indexes.register_slot(point.slot, Some(&p));
+            if let Some((tracked_reverse, tracked_versions)) = restored {
+                reverse = tracked_reverse;
+                versions = tracked_versions;
+                for (_id, slot) in reverse.iter() {
+                    if let Ok(Some(p)) = payload_store.get(slot) {
+                        filter_bitmap.register_slot(slot, Some(&p));
+                        payload_indexes.register_slot(slot, Some(&p));
                     }
                 }
-                meta.last_applied_txn = meta.last_applied_txn.max(snapshot.lsn);
+                meta.last_applied_txn = meta.last_applied_txn.max(generation.lsn());
             } else {
                 let keys_view = files.keys.snapshot();
                 let tombstone_view = files.tombstones.load();

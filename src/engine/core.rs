@@ -154,6 +154,7 @@ impl LocalVectorEngine {
                 name,
                 &spaces,
                 config.max_points,
+                &config.index,
                 &self.storage,
             )?;
             self.stores

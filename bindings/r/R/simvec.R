@@ -392,6 +392,14 @@ simvec_collection_metrics <- function(engine, collection) {
 }
 
 #' @export
+simvec_maintenance_status <- function(engine, collection) {
+  check_engine(engine)
+  res <- .Call(C_simvec_maintenance_status, engine$ptr,
+    tostring(collection, "collection"))
+  from_json(payload_or_raise(res))
+}
+
+#' @export
 simvec_run_maintenance_sweep <- function(engine) {
   check_engine(engine)
   res <- .Call(C_simvec_run_maintenance_sweep, engine$ptr)

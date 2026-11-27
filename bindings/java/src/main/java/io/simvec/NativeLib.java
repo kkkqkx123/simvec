@@ -171,6 +171,8 @@ final class NativeLib {
 
     static native int nCollectionMetrics(long handle, byte[] collection, byte[][] out);
 
+    static native int nMaintenanceStatus(long handle, byte[] collection, byte[][] out);
+
     static native int nRunMaintenanceSweep(long handle);
 
     static native int nSetPayloadField(long handle, byte[] collection, byte[] id, byte[] key,

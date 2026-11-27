@@ -64,14 +64,28 @@ pub struct CollectionInfo {
     pub memory_bytes: u64,
 }
 
+/// Durability state of one dense segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentDurability {
+    /// First global slot of the segment.
+    pub start: u32,
+    /// Highest LSN applied to this segment.
+    pub applied_lsn: u64,
+    /// Highest LSN fsynced to this segment's files.
+    pub persisted_lsn: u64,
+}
+
 /// Durability state of the per-segment flush worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceStatus {
     pub healthy: bool,
-    /// Lowest LSN durable in every segment.
+    /// Lowest LSN durable in every segment (the WAL ACK floor before pins).
     pub persisted_lsn: u64,
     /// Last flush failure, cleared by the next successful checkpoint.
     pub error: Option<String>,
+    /// Per-segment applied/persisted water marks. Empty for non-dense stores.
+    #[serde(default)]
+    pub segments: Vec<SegmentDurability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

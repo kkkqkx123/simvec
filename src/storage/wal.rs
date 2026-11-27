@@ -66,6 +66,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, VectorSearchError};
 use crate::types::VectorPoint;
 
+use super::wal_blobs::{BlobInput, BlobRefSpec, WalBlobs};
+
 /// Maximum accepted single-record size (guards against corrupt length fields).
 const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
 
@@ -107,16 +109,6 @@ const RECORD_HEADER_LEN: u64 = 8;
 pub struct WalTxn {
     pub txn_id: u64,
     pub ops: Vec<WalRecord>,
-}
-
-/// Borrowed view of [`WalTxn`] for encoding a batch without cloning ops.
-///
-/// Field-for-field identical to the owned form, and postcard is a
-/// non-self-describing format, so both produce the same bytes.
-#[derive(Serialize)]
-struct WalTxnRef<'a> {
-    txn_id: u64,
-    ops: &'a [WalRecord],
 }
 
 /// A point as persisted in the WAL. The id is a string and the payload is
@@ -230,6 +222,68 @@ pub enum WalRecord {
     },
 }
 
+/// Reference-form of a WAL record: data-bearing variants store a blob
+/// reference instead of inline vectors/JSON, so the log carries only the
+/// identity, the version and a pointer to an already-fsynced blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WalRecordOnDisk {
+    /// Dense upsert. The blob is a postcard-encoded `WalPoint`.
+    UpsertRef {
+        id: String,
+        blob: super::wal_blobs::BlobRefSpec,
+    },
+    Delete {
+        point_id: String,
+    },
+    DeleteBatch {
+        point_ids: Vec<String>,
+    },
+    Compact,
+    Quantize,
+    /// Payload set. The blob is a postcard-encoded `Option<String>`.
+    SetPayloadRef {
+        point_id: String,
+        blob: super::wal_blobs::BlobRefSpec,
+    },
+    DeletePayloadKeys {
+        point_id: String,
+        keys: Vec<String>,
+    },
+    SetPayloadField {
+        point_id: String,
+        key: String,
+        value: String,
+    },
+    /// Named upsert. Blob is postcard `(BTreeMap<String, VectorData>, Option<String>)`.
+    UpsertVectorsRef {
+        id: String,
+        blob: super::wal_blobs::BlobRefSpec,
+    },
+    /// Named patch. Blob is postcard `BTreeMap<String, VectorData>`.
+    PatchNamedVectorsRef {
+        id: String,
+        blob: super::wal_blobs::BlobRefSpec,
+    },
+}
+
+/// On-disk transaction: reference-form records whose data fields point at
+/// fsynced blobs rather than inlining vectors and JSON.
+#[derive(Serialize, Deserialize)]
+struct WalTxnOnDisk {
+    txn_id: u64,
+    ops: Vec<WalRecordOnDisk>,
+}
+
+/// Placeholder reference installed while staging records, replaced by the
+/// real offset once the batch's blobs have been appended.
+const PLACEHOLDER_REF: BlobRefSpec = BlobRefSpec {
+    offset: 0,
+    length: 0,
+    crc32c: 0,
+    version: 0,
+    kind: 0,
+};
+
 /// Open handle of the segment currently being appended to.
 struct ActiveSegment {
     mmap: MmapMut,
@@ -270,6 +324,9 @@ struct WalState {
 pub struct Wal {
     dir: PathBuf,
     segment_bytes: u64,
+    /// Append-only blob file holding the vector/payload bytes referenced by
+    /// the reference-form records in the log.
+    blobs: WalBlobs,
     state: parking_lot::Mutex<WalState>,
     /// Valid data bytes held by the log. Drives the size-based checkpoint
     /// schedule: a pure-insert workload never crosses a tombstone ratio, so
@@ -338,9 +395,11 @@ impl Wal {
             None => None,
         };
         let (ack_generation, ack_lsn) = read_ack(dir);
+        let blobs = WalBlobs::open_or_create(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_bytes: capacity,
+            blobs,
             ack_generation: AtomicU64::new(ack_generation),
             generation: AtomicU64::new(0),
             state: parking_lot::Mutex::new(WalState {
@@ -436,17 +495,110 @@ impl Wal {
         if batch.is_empty() {
             return Ok(());
         }
-        // Encode per transaction (small buffers, no whole-batch Vec) and
-        // measure the framed footprint up front: the batch is never split, so
-        // the rollover decision needs the total before writing anything.
+        // Serialize all data-bearing records into blobs first, fsync them,
+        // then encode a reference-form transaction. A WAL record therefore
+        // never reaches disk before the blob it points at is durable.
+        // Each staged blob remembers the (txn index, op index) of the disk
+        // record whose reference field must be filled after the append.
+        let mut pending_blobs: Vec<BlobInput> = Vec::new();
+        let mut blob_targets: Vec<(usize, usize)> = Vec::new();
+        let mut staged: Vec<Vec<WalRecordOnDisk>> = Vec::with_capacity(batch.len());
+        for (txn_idx, (txn_id, ops)) in batch.iter().enumerate() {
+            let mut disk_ops = Vec::with_capacity(ops.len());
+            for (op_idx, op) in ops.iter().enumerate() {
+                let mut stage = |kind: u8, payload: Vec<u8>| -> Result<BlobRefSpec> {
+                    blob_targets.push((txn_idx, op_idx));
+                    pending_blobs.push(BlobInput {
+                        kind,
+                        version: *txn_id,
+                        payload,
+                    });
+                    Ok(PLACEHOLDER_REF)
+                };
+                let disk = match op {
+                    WalRecord::Upsert { point } => WalRecordOnDisk::UpsertRef {
+                        id: point.id.clone(),
+                        blob: stage(
+                            super::wal_blobs::kind::DENSE_UPSERT,
+                            postcard::to_stdvec(point)?,
+                        )?,
+                    },
+                    WalRecord::SetPayload { point_id, payload } => {
+                        WalRecordOnDisk::SetPayloadRef {
+                            point_id: point_id.clone(),
+                            blob: stage(
+                                super::wal_blobs::kind::PAYLOAD_SET,
+                                postcard::to_stdvec(payload)?,
+                            )?,
+                        }
+                    }
+                    WalRecord::UpsertVectors { id, vectors, payload } => {
+                        WalRecordOnDisk::UpsertVectorsRef {
+                            id: id.clone(),
+                            blob: stage(
+                                super::wal_blobs::kind::VECTORS_UPSERT,
+                                postcard::to_stdvec(&(vectors, payload))?,
+                            )?,
+                        }
+                    }
+                    WalRecord::PatchNamedVectors { id, vectors } => {
+                        WalRecordOnDisk::PatchNamedVectorsRef {
+                            id: id.clone(),
+                            blob: stage(
+                                super::wal_blobs::kind::NAMED_PATCH,
+                                postcard::to_stdvec(vectors)?,
+                            )?,
+                        }
+                    }
+                    WalRecord::Delete { point_id } => WalRecordOnDisk::Delete {
+                        point_id: point_id.clone(),
+                    },
+                    WalRecord::DeleteBatch { point_ids } => WalRecordOnDisk::DeleteBatch {
+                        point_ids: point_ids.clone(),
+                    },
+                    WalRecord::Compact => WalRecordOnDisk::Compact,
+                    WalRecord::Quantize => WalRecordOnDisk::Quantize,
+                    WalRecord::DeletePayloadKeys { point_id, keys } => {
+                        WalRecordOnDisk::DeletePayloadKeys {
+                            point_id: point_id.clone(),
+                            keys: keys.clone(),
+                        }
+                    }
+                    WalRecord::SetPayloadField { point_id, key, value } => {
+                        WalRecordOnDisk::SetPayloadField {
+                            point_id: point_id.clone(),
+                            key: key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                };
+                disk_ops.push(disk);
+            }
+            staged.push(disk_ops);
+        }
+        // One fsync for all blobs in the batch, before any WAL byte is written.
+        let refs = self.blobs.append_many(&pending_blobs)?;
+        // Fill each placeholder ref from the blob target mapping.
+        for (blob_ref, (txn_idx, op_idx)) in refs.into_iter().zip(blob_targets) {
+            let disk_op = &mut staged[txn_idx][op_idx];
+            let slot = match disk_op {
+                WalRecordOnDisk::UpsertRef { blob, .. }
+                | WalRecordOnDisk::SetPayloadRef { blob, .. }
+                | WalRecordOnDisk::UpsertVectorsRef { blob, .. }
+                | WalRecordOnDisk::PatchNamedVectorsRef { blob, .. } => blob,
+                _ => unreachable!("blob target points to a non-reference record"),
+            };
+            *slot = blob_ref;
+        }
+
         let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch.len());
         let mut first_txn = u64::MAX;
         let mut last_txn = 0u64;
         let mut total = 0u64;
-        for (txn_id, ops) in batch {
-            let bytes = postcard::to_stdvec(&WalTxnRef {
+        for ((txn_id, _), ops) in batch.iter().zip(staged.iter()) {
+            let bytes = postcard::to_stdvec(&WalTxnOnDisk {
                 txn_id: *txn_id,
-                ops,
+                ops: ops.clone(),
             })?;
             if bytes.len() > MAX_RECORD_LEN as usize {
                 return Err(VectorSearchError::Internal(format!(
@@ -624,13 +776,21 @@ impl Wal {
         let mut last_txn = 0u64;
         let mut valid_len = SEG_HEADER_LEN;
         let mut tail_crc = None;
+        // Decode reference-form records and restore inline values from their
+        // fsynced blobs before handing them to the caller. A missing/corrupt
+        // blob is CorruptData, never a silent fallback.
+        let blobs = &self.blobs;
+        let mut restore = |disk: &WalTxnOnDisk| -> Result<()> {
+            let txn = restore_txn(blobs, disk)?;
+            f(&txn)
+        };
         for (index, name) in segments.iter().enumerate() {
             let last_segment = index + 1 == segments.len();
             let path = segment_path(&self.dir, *name);
             let mapped = map_segment(&path)?;
             let bytes: &[u8] = mapped.as_deref().unwrap_or(&[]);
             let (segment_last_txn, segment_valid_len, segment_crc) =
-                read_segment_bytes(bytes, last_segment, after, &path, *name, &mut f, last_txn)?;
+                read_segment_bytes(bytes, last_segment, after, &path, *name, &mut restore, last_txn)?;
             // Segment names are lower bounds on their first transaction. A
             // closed segment must end exactly before the next one starts:
             // a gap means a segment was lost, an overlap means a name was
@@ -693,6 +853,10 @@ impl Wal {
         for name in state.segments.drain(..) {
             remove_segment(&self.dir, name)?;
         }
+        // A full wipe discards every outstanding reference, so reset the
+        // append-only blob file too. Partial truncation (checkpoint) leaves it
+        // intact — those blobs still back surviving log records.
+        self.blobs.reset()?;
         state.sealed_valid.clear();
         sync_dir(&self.dir)?;
         state.active = None;
@@ -861,13 +1025,116 @@ fn chain_crc(prev: u32, len_le: &[u8; 4], data: &[u8], pad: usize) -> u32 {
 /// lsn seen so far and the end of its valid prefix. Records are framed, so a
 /// sequential walk over the mapping is enough to resume at any floor without
 /// buffering decoded transactions.
+/// Restore a reference-form transaction into the inline `WalTxn` that the
+/// apply paths consume. Each reference is read from its blob, length/header/
+/// CRC verified, then decoded back into the original record. Any mismatch is
+/// `CorruptData` — replay must never substitute an old or empty value.
+fn restore_txn(blobs: &WalBlobs, disk: &WalTxnOnDisk) -> Result<WalTxn> {
+    use super::wal_blobs::kind as blob_kind;
+    let mut ops = Vec::with_capacity(disk.ops.len());
+    for record in &disk.ops {
+        let op = match record {
+            WalRecordOnDisk::UpsertRef { id, blob } => {
+                if blob.kind != blob_kind::DENSE_UPSERT {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "blob kind {} for upsert of {id}",
+                        blob.kind
+                    )));
+                }
+                let bytes = blobs.read(blob)?;
+                let point: WalPoint = postcard::from_bytes(&bytes)?;
+                if point.id != *id {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "blob id {} does not match WAL id {id}",
+                        point.id
+                    )));
+                }
+                WalRecord::Upsert { point }
+            }
+            WalRecordOnDisk::SetPayloadRef { point_id, blob } => {
+                if blob.kind != blob_kind::PAYLOAD_SET {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "blob kind {} for payload of {point_id}",
+                        blob.kind
+                    )));
+                }
+                let bytes = blobs.read(blob)?;
+                let payload: Option<String> = postcard::from_bytes(&bytes)?;
+                WalRecord::SetPayload {
+                    point_id: point_id.clone(),
+                    payload,
+                }
+            }
+            WalRecordOnDisk::UpsertVectorsRef { id, blob } => {
+                if blob.kind != blob_kind::VECTORS_UPSERT {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "blob kind {} for vectors of {id}",
+                        blob.kind
+                    )));
+                }
+                let bytes = blobs.read(blob)?;
+                let (vectors, payload): (
+                    BTreeMap<String, crate::types::VectorData>,
+                    Option<String>,
+                ) = postcard::from_bytes(&bytes)?;
+                WalRecord::UpsertVectors {
+                    id: id.clone(),
+                    vectors,
+                    payload,
+                }
+            }
+            WalRecordOnDisk::PatchNamedVectorsRef { id, blob } => {
+                if blob.kind != blob_kind::NAMED_PATCH {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "blob kind {} for named patch of {id}",
+                        blob.kind
+                    )));
+                }
+                let bytes = blobs.read(blob)?;
+                let vectors: BTreeMap<String, crate::types::VectorData> =
+                    postcard::from_bytes(&bytes)?;
+                WalRecord::PatchNamedVectors {
+                    id: id.clone(),
+                    vectors,
+                }
+            }
+            WalRecordOnDisk::Delete { point_id } => WalRecord::Delete {
+                point_id: point_id.clone(),
+            },
+            WalRecordOnDisk::DeleteBatch { point_ids } => WalRecord::DeleteBatch {
+                point_ids: point_ids.clone(),
+            },
+            WalRecordOnDisk::Compact => WalRecord::Compact,
+            WalRecordOnDisk::Quantize => WalRecord::Quantize,
+            WalRecordOnDisk::DeletePayloadKeys { point_id, keys } => {
+                WalRecord::DeletePayloadKeys {
+                    point_id: point_id.clone(),
+                    keys: keys.clone(),
+                }
+            }
+            WalRecordOnDisk::SetPayloadField { point_id, key, value } => {
+                WalRecord::SetPayloadField {
+                    point_id: point_id.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                }
+            }
+        };
+        ops.push(op);
+    }
+    Ok(WalTxn {
+        txn_id: disk.txn_id,
+        ops,
+    })
+}
+
 fn read_segment_bytes(
     bytes: &[u8],
     last_segment: bool,
     after: Option<u64>,
     path: &Path,
     name: u64,
-    f: &mut impl FnMut(&WalTxn) -> Result<()>,
+    f: &mut impl FnMut(&WalTxnOnDisk) -> Result<()>,
     mut last_txn: u64,
 ) -> Result<(u64, u64, u32)> {
     if bytes.len() < SEG_HEADER_LEN as usize {
@@ -960,7 +1227,7 @@ fn read_segment_bytes(
             )));
         }
         crc = stored;
-        let txn: WalTxn = postcard::from_bytes(&bytes[data_start..data_end])?;
+        let txn: WalTxnOnDisk = postcard::from_bytes(&bytes[data_start..data_end])?;
         if after.is_none_or(|lsn| txn.txn_id > lsn) {
             f(&txn)?;
         }
@@ -1811,7 +2078,7 @@ mod tests {
                     break;
                 }
                 let framed = record_total_len(record_len as usize) as usize;
-                let txn: WalTxn = postcard::from_bytes(
+                let txn: WalTxnOnDisk = postcard::from_bytes(
                     &mmap[offset + RECORD_HEADER_LEN as usize
                         ..offset + RECORD_HEADER_LEN as usize + record_len as usize],
                 )
@@ -1822,5 +2089,55 @@ mod tests {
             }
         }
         assert_eq!(expected, ids.len() as u64 + 1);
+    }
+
+    /// A WAL record carries only a blob reference, not the inline vector. The
+    /// blob file is durable and replay restores the full point from it.
+    #[test]
+    fn test_reference_form_wal_restores_inline_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        // `txn` upserts point 7 with vector [1.0, 2.0, 3.0].
+        wal.append(&txn(1, 7)).unwrap();
+        // The blob file exists and holds the vector bytes.
+        assert!(path.join("blobs.bin").exists());
+
+        let mut restored = Vec::new();
+        wal.replay(|t| {
+            for op in &t.ops {
+                if let WalRecord::Upsert { point } = op {
+                    restored.push(point.vector.clone());
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(restored, vec![vec![1.0, 2.0, 3.0]]);
+    }
+
+    /// Corrupting the blob a WAL record references must be CorruptData:
+    /// replay never silently substitutes an empty or stale vector.
+    #[test]
+    fn test_corrupt_blob_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        wal.append(&txn(1, 7)).unwrap();
+        drop(wal);
+
+        let blob_path = path.join("blobs.bin");
+        let mut bytes = std::fs::read(&blob_path).unwrap();
+        // Flip a byte in the payload area (past the 17-byte header).
+        let target = 17.min(bytes.len() - 1);
+        bytes[target] ^= 0xFF;
+        std::fs::write(&blob_path, bytes).unwrap();
+
+        let wal = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        let error = wal.replay(|_| Ok(())).unwrap_err();
+        assert!(
+            matches!(error, VectorSearchError::CorruptData(_)),
+            "a corrupt referenced blob must be CorruptData, got {error:?}"
+        );
     }
 }

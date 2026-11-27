@@ -66,6 +66,23 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         .map_err(|e| VectorSearchError::CorruptData(e.to_string()))
 }
 
+/// Strict variant of [`read`] for commit metadata: a missing file yields
+/// `Ok(None)`, but a present file with a bad magic/version/CRC is
+/// `CorruptData` instead of being silently ignored. Used by dtype headers,
+/// which are authoritative layout metadata rather than derived snapshots.
+pub fn read_strict<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Some(value) = read(path)? else {
+        return Err(VectorSearchError::CorruptData(format!(
+            "corrupt metadata file {}",
+            path.display()
+        )));
+    };
+    Ok(Some(value))
+}
+
 /// Manifest file name of a copied collection snapshot.
 pub const SNAPSHOT_MANIFEST_FILE: &str = "snapshot.json";
 
@@ -133,7 +150,18 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotInfo> {
         )));
     }
     for file in &info.files {
-        if file.version != info.generation {
+        // WAL segments carry their first-lsn as the version, so they remain
+        // reusable across generation advances. Every other file is bound to
+        // the generation that published it.
+        let wal_segment_lsn = wal_segment_version(&file.path);
+        if let Some(lsn) = wal_segment_lsn {
+            if file.version != lsn {
+                return Err(VectorSearchError::CorruptData(format!(
+                    "snapshot WAL segment {} is bound to lsn {}, expected {}",
+                    file.path, file.version, lsn
+                )));
+            }
+        } else if file.version != info.generation {
             return Err(VectorSearchError::CorruptData(format!(
                 "snapshot file {} is bound to generation {}, expected {}",
                 file.path, file.version, info.generation
@@ -163,6 +191,16 @@ pub(crate) fn checked_path(base: &Path, rel: &str) -> Result<PathBuf> {
         )));
     }
     Ok(base.join(path))
+}
+
+/// If `rel` names a WAL segment directly under `wal/`, return its first-lsn
+/// (the zero-padded numeric file name). Other paths return `None`.
+fn wal_segment_version(rel: &str) -> Option<u64> {
+    let name = rel.strip_prefix("wal/")?;
+    if name.contains('/') {
+        return None;
+    }
+    name.strip_suffix(".bin")?.parse::<u64>().ok()
 }
 
 /// Stream a file's length and CRC without holding the whole file in memory.

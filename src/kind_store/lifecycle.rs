@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -7,19 +7,25 @@ use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::point_blobs::{encode_vector, BlobRef, PointBlobs};
+use crate::storage::point_blobs::BlobRef;
 use crate::storage::postings::Postings;
+use crate::storage::segmented_blobs::{SegmentedBlobs, DEFAULT_SEGMENT_BYTES};
+use crate::storage::spaces_meta::{
+    self, DtypeParams, SpaceMeta, SpacesManifest, DEFAULT_SEGMENT_SLOTS,
+};
 use crate::storage::{snapshot, CollectionLock, Generation, IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData};
 
 use super::{Inner, KindMeta, KindPoint, KindSnapshot, KindSnapshotPoint, KindStore};
 
-/// File holding the append-only point vectors.
+/// File holding the append-only point vectors inside each segment directory.
 const BLOBS_FILE: &str = "points.bin";
-/// File holding the append-only JSON payloads.
+/// File holding the append-only JSON payloads inside each segment directory.
 const PAYLOADS_FILE: &str = "payloads.bin";
-/// Directory holding the persisted sparse postings.
+/// Directory holding the persisted sparse postings (space-scoped).
 const POSTINGS_DIR: &str = "postings";
+/// Space name used by single-space kind collections.
+const KIND_SPACE: &str = "";
 
 /// State staged for a compacted generation, kept out of the serving store
 /// until the manifest is published.
@@ -42,6 +48,10 @@ impl KindStore {
         config.validate_kind()?;
         std::fs::create_dir_all(dir)?;
         let dir_lock = CollectionLock::acquire(dir)?;
+        let dtype = config
+            .default_space()
+            .map_or(crate::types::VectorDataType::F32, |space| space.dtype());
+        let dtype_params = DtypeParams::default();
         let meta = KindMeta {
             collection: name.to_string(),
             kind: config.kind,
@@ -56,9 +66,34 @@ impl KindStore {
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
         let data_dir = generation.path();
-        let blobs = PointBlobs::create(&data_dir.join(BLOBS_FILE))?;
-        let payloads = PointBlobs::create(&data_dir.join(PAYLOADS_FILE))?;
-        let postings = Postings::open(&data_dir.join(POSTINGS_DIR), None)?;
+        // `spaces.json` is the authoritative layout: every immutable space
+        // parameter and the segment width live here, not in the root marker.
+        let mut spaces = BTreeMap::new();
+        spaces.insert(
+            KIND_SPACE.to_string(),
+            SpaceMeta {
+                kind: config.kind,
+                distance: config.distance,
+                dim: config.vector_size,
+                multi_config: config.multi_config,
+                index: config.index.clone(),
+                quantization: config.quantization_config.clone(),
+                dtype,
+                dtype_params,
+                segment_slots: DEFAULT_SEGMENT_SLOTS,
+            },
+        );
+        spaces_meta::write(
+            &data_dir,
+            &SpacesManifest::new(name, generation.id(), generation.lsn(), spaces, config.max_points),
+        )?;
+        let seg_root = spaces_meta::segment_dir(&data_dir, KIND_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let blobs = SegmentedBlobs::create(&seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let payloads = SegmentedBlobs::create(&seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let postings = Postings::open(&data_dir.join("spaces").join(KIND_SPACE).join(POSTINGS_DIR), None)?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
             _dir_lock: dir_lock,
@@ -68,6 +103,8 @@ impl KindStore {
             dim: config.vector_size,
             max_vectors_per_point: meta.max_vectors_per_point,
             distance: config.distance,
+            dtype,
+            dtype_params,
             max_points: meta.max_points,
             inner: Mutex::new(Inner::default()),
             wal,
@@ -85,12 +122,20 @@ impl KindStore {
     /// dictionary, then replay whatever the snapshot does not cover.
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
         let dir_lock = CollectionLock::acquire(dir)?;
-        let bytes = std::fs::read(dir.join("kind.bin"))?;
-        let meta: KindMeta = postcard::from_bytes(&bytes)?;
         let generation = Generation::open(dir)?;
+        let data_dir = generation.path();
+        // The space manifest is authoritative: configuration and segment width
+        // are read from it, never from the root type marker. A generation
+        // without one is an unrecognized layout and is rejected.
+        let manifest = spaces_meta::read(&data_dir, generation.id(), generation.lsn())?;
+        let space = manifest.spaces.get(KIND_SPACE).ok_or_else(|| {
+            VectorSearchError::CorruptData(format!(
+                "spaces.json for {} has no default kind space",
+                dir.display()
+            ))
+        })?;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
-        let data_dir = generation.path();
         let snapshot_path = data_dir.join("kind_snapshot.bin");
         let snapshot = snapshot::read::<KindSnapshot>(&snapshot_path)?;
         if generation.lsn() == 0 && snapshot.is_none() {
@@ -113,21 +158,31 @@ impl KindStore {
             }
         }
         let snapshot_lsn = snapshot.as_ref().map(|snapshot| snapshot.lsn);
-        let blobs = PointBlobs::open(
-            &data_dir.join(BLOBS_FILE),
-            snapshot.as_ref().map(|snapshot| snapshot.blobs_len),
+        let seg_root = spaces_meta::segment_dir(&data_dir, KIND_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let segment_bytes = DEFAULT_SEGMENT_BYTES;
+        let blobs = SegmentedBlobs::open(
+            &seg_root,
+            BLOBS_FILE,
+            segment_bytes,
+            snapshot.as_ref().map_or(0, |snapshot| snapshot.blobs_len),
         )?;
         // Without a published snapshot no payload reference is reachable, so
         // the whole file is an uncommitted tail and can be discarded.
-        let payloads = PointBlobs::open(
-            &data_dir.join(PAYLOADS_FILE),
-            Some(
-                snapshot
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.payloads_len),
-            ),
+        let payloads = SegmentedBlobs::open(
+            &seg_root,
+            PAYLOADS_FILE,
+            segment_bytes,
+            snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.payloads_len),
         )?;
-        let postings = Postings::open(&data_dir.join(POSTINGS_DIR), snapshot_lsn)?;
+        let postings = Postings::open(
+            &data_dir.join("spaces").join(KIND_SPACE).join(POSTINGS_DIR),
+            snapshot_lsn,
+        )?;
         // The dictionary is only usable when the same checkpoint wrote the
         // snapshot; otherwise every live point has to be re-inverted from its
         // blob (a crash between the two files, or a first-ever open).
@@ -136,12 +191,14 @@ impl KindStore {
             dir: dir.to_path_buf(),
             _dir_lock: dir_lock,
             generation_poisoned: AtomicBool::new(false),
-            name: meta.collection.clone(),
-            kind: meta.kind,
-            dim: meta.vector_size,
-            max_vectors_per_point: meta.max_vectors_per_point,
-            distance: meta.distance,
-            max_points: meta.max_points,
+            name: manifest.collection.clone(),
+            kind: space.kind,
+            dim: space.dim,
+            max_vectors_per_point: space.multi_config.map_or(0, |c| c.max_vectors_per_point),
+            distance: space.distance,
+            dtype: space.dtype,
+            dtype_params: space.dtype_params,
+            max_points: manifest.max_points,
             inner: Mutex::new(Inner::default()),
             wal,
             storage: storage.clone(),
@@ -249,8 +306,36 @@ impl KindStore {
                 })
                 .collect(),
         };
-        let snapshot_path = self.generation.read().path().join("kind_snapshot.bin");
-        snapshot::write(&snapshot_path, &snapshot)?;
+        let gen_dir = self.generation.read().path();
+        snapshot::write(&gen_dir.join("kind_snapshot.bin"), &snapshot)?;
+        // Write the authoritative space manifest with the new lsn before the
+        // generation commit point advances, so a published generation always
+        // has a manifest whose lsn matches generation.bin.
+        let mut spaces = BTreeMap::new();
+        spaces.insert(
+            KIND_SPACE.to_string(),
+            SpaceMeta {
+                kind: self.kind,
+                distance: self.distance,
+                dim: self.dim,
+                multi_config: if self.kind == crate::types::VectorKind::Multi {
+                    Some(crate::types::MultiConfig::new(
+                        self.max_vectors_per_point.max(1),
+                    ))
+                } else {
+                    None
+                },
+                index: crate::types::IndexConfig::Flat,
+                quantization: None,
+                dtype: self.dtype,
+                dtype_params: self.dtype_params,
+                segment_slots: DEFAULT_SEGMENT_SLOTS,
+            },
+        );
+        spaces_meta::write(
+            &gen_dir,
+            &SpacesManifest::new(&self.name, self.generation.read().id(), lsn, spaces, self.max_points),
+        )?;
         // Bind the WAL watermark to this generation before it can be advanced.
         self.generation.write().set_lsn(lsn)?;
         // Everything up to `lsn` is durable in the snapshot, so whole segments
@@ -282,15 +367,20 @@ impl KindStore {
 
         // Open the staged files before publication: a failure here must not
         // leave a manifest pointing at a generation the process cannot serve.
-        let blobs = PointBlobs::open(
-            &staged.path().join(BLOBS_FILE),
-            Some(staged_state.blobs_len),
+        let staged_seg_root = spaces_meta::segment_dir(&staged.path(), KIND_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let blobs = SegmentedBlobs::open(
+            &staged_seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.blobs_len,
         )?;
-        let payloads = PointBlobs::open(
-            &staged.path().join(PAYLOADS_FILE),
-            Some(staged_state.payloads_len),
+        let payloads = SegmentedBlobs::open(
+            &staged_seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.payloads_len,
         )?;
-        let postings = Postings::open(&staged.path().join(POSTINGS_DIR), Some(lsn))?;
+        let postings = Postings::open(
+            &staged.path().join("spaces").join(KIND_SPACE).join(POSTINGS_DIR),
+            Some(lsn),
+        )?;
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
@@ -299,16 +389,18 @@ impl KindStore {
         self.wal.bind_generation(next_generation.id());
 
         let data_dir = next_generation.path();
-        self.blobs.store(Arc::new(PointBlobs::open(
-            &data_dir.join(BLOBS_FILE),
-            Some(staged_state.blobs_len),
+        let seg_root = spaces_meta::segment_dir(&data_dir, KIND_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        self.blobs.store(Arc::new(SegmentedBlobs::open(
+            &seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.blobs_len,
         )?));
-        self.payloads.store(Arc::new(PointBlobs::open(
-            &data_dir.join(PAYLOADS_FILE),
-            Some(staged_state.payloads_len),
+        self.payloads.store(Arc::new(SegmentedBlobs::open(
+            &seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.payloads_len,
         )?));
         self.postings.store(Arc::new(Postings::open(
-            &data_dir.join(POSTINGS_DIR),
+            &data_dir.join("spaces").join(KIND_SPACE).join(POSTINGS_DIR),
             Some(lsn),
         )?));
         *self.generation.write() = next_generation;
@@ -334,9 +426,13 @@ impl KindStore {
         lsn: u64,
     ) -> Result<StagedKindState> {
         let dir = staged.path();
-        let staging_blobs = PointBlobs::create(&dir.join(BLOBS_FILE))?;
-        let staging_payloads = PointBlobs::create(&dir.join(PAYLOADS_FILE))?;
-        let postings = Postings::open(&dir.join(POSTINGS_DIR), None)?;
+        let staging_seg_root = spaces_meta::segment_dir(&dir, KIND_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let staging_blobs = SegmentedBlobs::create(&staging_seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let staging_payloads = SegmentedBlobs::create(&staging_seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let postings = Postings::open(&dir.join("spaces").join(KIND_SPACE).join(POSTINGS_DIR), None)?;
         let mut points = Vec::with_capacity(inner.live_count as usize);
         let mut reverse = IdMap::with_capacity(inner.live_count as usize);
         let mut norms = HashMap::with_capacity(inner.norms.len());
@@ -401,6 +497,29 @@ impl KindStore {
                 .collect(),
         };
         snapshot::write(&dir.join("kind_snapshot.bin"), &snapshot)?;
+        let mut spaces = BTreeMap::new();
+        spaces.insert(
+            KIND_SPACE.to_string(),
+            SpaceMeta {
+                kind: self.kind,
+                distance: self.distance,
+                dim: self.dim,
+                multi_config: if self.kind == crate::types::VectorKind::Multi {
+                    Some(crate::types::MultiConfig::new(self.max_vectors_per_point.max(1)))
+                } else {
+                    None
+                },
+                index: crate::types::IndexConfig::Flat,
+                quantization: None,
+                dtype: self.dtype,
+                dtype_params: self.dtype_params,
+                segment_slots: DEFAULT_SEGMENT_SLOTS,
+            },
+        );
+        spaces_meta::write(
+            &dir,
+            &SpacesManifest::new(&self.name, staged.id(), lsn, spaces, self.max_points),
+        )?;
         Ok(StagedKindState {
             points,
             reverse,
@@ -539,7 +658,14 @@ impl KindStore {
             inner.tombstone_slot(slot);
         }
         let slot = inner.points.len() as u32;
-        let blob = self.blobs.load().append(&encode_vector(&data))?;
+        let params = crate::distance::dtype::QuantParams {
+            scale: self.dtype_params.scale,
+            zero_point: self.dtype_params.zero_point,
+        };
+        let (encoded, _) = crate::storage::point_blobs::encode_vector_typed(
+            &data, self.dtype, params,
+        )?;
+        let blob = self.blobs.load().append(&encoded)?;
         if let VectorData::Sparse { indices, values } = &data {
             inner.index_sparse(&self.postings.load(), slot, indices, values)?;
         }

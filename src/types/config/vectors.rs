@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{CollectionConfig, DistanceMetric, IndexConfig};
+use super::{CollectionConfig, DistanceMetric, IndexConfig, VectorDataType};
 
 /// Name of the single vector space in a non-named collection. Named layouts
 /// use their own explicit names; the default name keeps the dense storage and
@@ -67,6 +67,9 @@ pub enum VectorSpaceConfig {
         distance: DistanceMetric,
         #[serde(default)]
         multi_config: Option<MultiConfig>,
+        /// Element encoding. Defaults to f32 for backwards compatibility.
+        #[serde(default)]
+        dtype: VectorDataType,
     },
     Sparse {
         distance: DistanceMetric,
@@ -79,6 +82,17 @@ impl VectorSpaceConfig {
             vector_size,
             distance,
             multi_config: None,
+            dtype: VectorDataType::F32,
+        }
+    }
+
+    /// Dense space with an explicit element dtype.
+    pub fn dense_typed(vector_size: usize, distance: DistanceMetric, dtype: VectorDataType) -> Self {
+        Self::Dense {
+            vector_size,
+            distance,
+            multi_config: None,
+            dtype,
         }
     }
 
@@ -87,6 +101,7 @@ impl VectorSpaceConfig {
             vector_size,
             distance,
             multi_config: Some(config),
+            dtype: VectorDataType::F32,
         }
     }
 
@@ -126,6 +141,14 @@ impl VectorSpaceConfig {
         match self {
             Self::Dense { vector_size, .. } => *vector_size,
             Self::Sparse { .. } => SPARSE_DIM_BOUND,
+        }
+    }
+
+    /// Element dtype of a dense space; sparse spaces carry no dtype.
+    pub fn dtype(&self) -> VectorDataType {
+        match self {
+            Self::Dense { dtype, .. } => *dtype,
+            Self::Sparse { .. } => VectorDataType::F32,
         }
     }
 

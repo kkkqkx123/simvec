@@ -1,15 +1,18 @@
 //! Per-collection storage assembly.
 //!
 //! A collection root contains `generation.bin`, the shared `wal/`, and a
-//! type marker. The published `generations/g<id>/` directory holds:
-//! - `meta.bin`     postcard `Meta`
-//! - `vectors.bin`  dense row-major f32, segmented mmap
-//! - `keys.bin`     slot -> point id directory
-//! - `tombstones.bin` slot -> deleted flag (survives WAL truncation)
-//! - `dense_snapshot.bin` id directory + per-id lsn at the generation's lsn
-//! - `payloads_store/` block-based payload storage (tracker + pages)
+//! type marker. The published `generations/g<id>/` directory holds `meta.bin`
+//! plus one physical segment directory per slot range:
+//! - `segments/<start>/vectors.bin`   dense row-major f32 for this segment
+//! - `segments/<start>/keys.bin`      local offset -> point id directory
+//! - `segments/<start>/tombstones.bin` deleted flags (survive WAL truncation)
+//! - `segments/<start>/id_tracker.bin` authoritative id -> offset directory + versions
+//! - `segments/<start>/payloads_store/` block-based payload storage (tracker + pages)
+//! - `segments.json`                  segment boundaries, counts and persisted lsns
 //!
-//! The generation manifest is the commit point; compaction stages a whole
+//! The id directory lives in the per-segment trackers; there is no
+//! whole-generation snapshot file. The generation manifest is the commit
+//! point; compaction stages a whole
 //! new generation and publishes it by replacing that manifest.
 //!
 //! Readers snapshot the mmap-backed `ArcSwap` views and scan without the
@@ -49,13 +52,16 @@ mod segment_hnsw;
 mod segment_ivf;
 pub(crate) mod segment_payloads;
 pub(crate) mod segments;
+pub(crate) mod segmented_blobs;
 pub(crate) mod snapshot;
+pub(crate) mod spaces_meta;
+pub(crate) mod space_ann;
 mod tombstones;
 pub(crate) mod vectors;
 mod wal;
 mod wal_ack;
+mod wal_blobs;
 
-mod dense_snapshot;
 mod store_maintenance;
 mod store_open;
 mod store_payload;
@@ -544,13 +550,27 @@ impl CollectionStore {
                 base.as_ref(),
                 &mut files,
                 &mut reused_files,
+                None,
             )
         };
         copy(&self.dir.join("generation.bin"), "generation.bin")?;
         let generation_rel = format!("{}/g{:020}", generation::GENERATIONS_DIR, generation.id());
         copy(&generation.path(), &generation_rel)?;
-        copy(&self.dir.join("wal"), "wal")?;
         drop(copy);
+        // WAL segments are bound to their first lsn, not to the current
+        // generation id: recording the name as `version` lets an incremental
+        // snapshot reuse an unchanged segment across generation advances.
+        let wal_dir = self.dir.join("wal");
+        copy_snapshot_file(
+            &wal_dir,
+            dest,
+            "wal",
+            generation.id(),
+            base.as_ref(),
+            &mut files,
+            &mut reused_files,
+            Some(&wal_dir),
+        )?;
 
         let info = SnapshotInfo {
             version: snapshot::SNAPSHOT_FORMAT_VERSION,
@@ -599,10 +619,27 @@ impl CollectionStore {
     pub fn maintenance_status(&self) -> crate::types::MaintenanceStatus {
         let inner = self.inner.read();
         let error = self.maintenance_error();
+        let segment_slots = inner.meta.segment_slots;
+        let segments = if segment_slots == 0 {
+            Vec::new()
+        } else {
+            (0..inner.segment_persisted.len())
+                .map(|index| crate::types::SegmentDurability {
+                    start: index as u32 * segment_slots,
+                    applied_lsn: inner
+                        .segment_applied
+                        .get(index)
+                        .copied()
+                        .unwrap_or(inner.meta.last_applied_txn),
+                    persisted_lsn: inner.segment_persisted[index],
+                })
+                .collect()
+        };
         crate::types::MaintenanceStatus {
             healthy: error.is_none(),
             persisted_lsn: inner.min_persisted(inner.meta.last_applied_txn),
             error,
+            segments,
         }
     }
 
@@ -629,22 +666,6 @@ impl CollectionStore {
             return Ok(());
         }
         self.wal.truncate_through(effective)
-    }
-
-    /// Mark every tracked segment durable through `watermark` after a
-    /// successful flush. Failures leave the marks untouched so the ack
-    /// cannot advance past unwritten bytes.
-    fn note_segments_persisted(&self, inner: &mut StoreInner, watermark: u64) {
-        let segment_slots = inner.meta.segment_slots;
-        let count = if segment_slots == 0 || inner.meta.next_slot == 0 {
-            0
-        } else {
-            inner.meta.next_slot.div_ceil(segment_slots as u64) as usize
-        };
-        inner.ensure_segment_len(count);
-        for cell in inner.segment_persisted.iter_mut() {
-            *cell = (*cell).max(watermark);
-        }
     }
 
     /// Snapshot-facing view of the flush water mark: the minimum durable
@@ -732,6 +753,7 @@ fn copy_snapshot_file(
     base: Option<&(&Path, SnapshotInfo)>,
     files: &mut Vec<snapshot::SnapshotFile>,
     reused: &mut usize,
+    wal_dir: Option<&Path>,
 ) -> Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dest_root.join(rel))?;
@@ -751,10 +773,26 @@ fn copy_snapshot_file(
                 base,
                 files,
                 reused,
+                wal_dir,
             )?;
         }
         return Ok(());
     }
+    // A WAL segment directly under `wal/` is named by its first lsn. Bind its
+    // manifest version to that lsn instead of the generation id so unchanged
+    // segments stay reusable across generation advances. Other wal files
+    // (`acked-lsn`, `.spare`, `blobs.bin`) stay bound to the generation.
+    let file_version = wal_dir
+        .filter(|root| src.parent() == Some(*root))
+        .and_then(|_| {
+            src.file_name()?
+                .to_str()?
+                .strip_suffix(".bin")?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(version);
+    let version = file_version;
     let target = dest_root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;

@@ -73,6 +73,22 @@ impl LocalVectorEngine {
         Ok(())
     }
 
+    /// Per-segment durability state of a dense collection. Named and sparse
+    /// stores have no segment flush worker and report a single healthy segment.
+    pub fn maintenance_status(&self, collection: &str) -> Result<crate::types::MaintenanceStatus> {
+        let has_named = self.named_store(collection)?.is_some();
+        let has_kind = self.kind_store(collection)?.is_some();
+        if has_named || has_kind {
+            return Ok(crate::types::MaintenanceStatus {
+                healthy: true,
+                persisted_lsn: 0,
+                error: None,
+                segments: Vec::new(),
+            });
+        }
+        Ok(self.store(collection)?.maintenance_status())
+    }
+
     /// Operational metrics snapshot for a collection.
     pub fn collection_metrics(&self, collection: &str) -> Result<MetricsSnapshot> {
         if let Some(named) = self.named_store(collection)? {

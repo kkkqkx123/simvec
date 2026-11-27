@@ -95,6 +95,7 @@ WASM 侧看 `bindings/wasm/src/index.js` 的 `Engine` 方法与 `src/wasm_api.rs
 | 压缩回收 | `simvec_compact` | `compact`，返回回收后存活数 | `compact`，返回回收后存活数 | `Compact`，返回回收后存活数 | `compact`，返回回收后存活数 | `simvec_compact`，返回回收后存活数 |
 | 排空待处理队列 | `simvec_drain_pending` | `drain_pending` | `drainPending` | `DrainPending` | `drainPending` | `simvec_drain_pending` |
 | 集合指标快照 | `simvec_collection_metrics` | `collection_metrics` | `collectionMetrics` | `CollectionMetrics` | `collectionMetrics` | `simvec_collection_metrics` |
+| 维护状态（段级水位） | `simvec_maintenance_status` | `maintenance_status` | `maintenanceStatus` | `MaintenanceStatus` | `maintenanceStatus` | `simvec_maintenance_status` |
 | 全局维护扫描 | `simvec_run_maintenance_sweep` | `run_maintenance_sweep` | `runMaintenanceSweep` | `RunMaintenanceSweep` | `runMaintenanceSweep` | `simvec_run_maintenance_sweep` |
 
 该分组五端完全对齐，无缺口。
@@ -254,6 +255,7 @@ WASM 为浏览器内存形态，与五端本机形态并存。`Rust` 侧是 `Mem
 | 压缩回收 | 有，返回存活数 | 点位即时删除 |
 | 排空待处理队列 | 空操作 | 无后台队列 |
 | 集合指标快照 | 有，空快照 | 同形 |
+| 维护状态（段级水位） | 无（wasm 无文件段） | 不暴露 |
 | 全局维护扫描 | 空操作 | 无后台线程 |
 
 ### 文件快照

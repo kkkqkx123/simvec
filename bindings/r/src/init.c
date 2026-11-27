@@ -48,6 +48,7 @@ SEXP C_simvec_drop_published_index(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_compact(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_drain_pending(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_collection_metrics(SEXP r_handle, SEXP r_collection);
+SEXP C_simvec_maintenance_status(SEXP r_handle, SEXP r_collection);
 SEXP C_simvec_run_maintenance_sweep(SEXP r_handle);
 SEXP C_simvec_set_payload_field(SEXP r_handle, SEXP r_collection, SEXP r_id,
                                 SEXP r_key, SEXP r_value);
@@ -103,6 +104,7 @@ static const R_CallMethodDef call_defs[] = {
     {"C_simvec_compact", (DL_FUNC)&C_simvec_compact, 2},
     {"C_simvec_drain_pending", (DL_FUNC)&C_simvec_drain_pending, 2},
     {"C_simvec_collection_metrics", (DL_FUNC)&C_simvec_collection_metrics, 2},
+    {"C_simvec_maintenance_status", (DL_FUNC)&C_simvec_maintenance_status, 2},
     {"C_simvec_run_maintenance_sweep", (DL_FUNC)&C_simvec_run_maintenance_sweep, 1},
     {"C_simvec_set_payload_field", (DL_FUNC)&C_simvec_set_payload_field, 5},
     {"C_simvec_apply_txn", (DL_FUNC)&C_simvec_apply_txn, 2},

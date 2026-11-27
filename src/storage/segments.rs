@@ -6,13 +6,14 @@
 //! frozen. The manifest is derived from `meta.bin`; a stale or missing copy
 //! is rewritten instead of being treated as authoritative.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::snapshot;
-use super::{DataFiles, StoreInner};
-use crate::error::Result;
+use super::{DataFiles, IdMap, StoreInner};
+use crate::error::{Result, VectorSearchError};
 use crate::types::PointId;
 
 const SEGMENTS_FILE: &str = "segments.json";
@@ -93,11 +94,17 @@ impl SegmentSet {
 /// newly appended segment own all of its files without a generation-wide
 /// rename.
 pub(crate) fn segment_dir(generation: &Path, start: u32) -> PathBuf {
-    let dir = generation.join("segments").join(format!("{start:010}"));
+    let dir = segment_path(generation, start);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         tracing::warn!(error = %err, path = %dir.display(), "cannot create segment directory");
     }
     dir
+}
+
+/// Path of one physical segment without creating it. Read paths use this so
+/// opening a store never mutates the directory it is inspecting.
+pub(crate) fn segment_path(generation: &Path, start: u32) -> PathBuf {
+    generation.join("segments").join(format!("{start:010}"))
 }
 
 /// Every published physical segment directory of a generation.
@@ -206,11 +213,16 @@ struct IdTracker {
 }
 
 /// Persist one segment's id tracker after its data files are durable.
+///
+/// `generation` is the id of the generation the tracker belongs to; binding it
+/// (rather than a slot water mark) lets open reject a tracker that was left
+/// behind by an aborted staging attempt.
 pub(super) fn write_id_tracker(
     data: &DataFiles,
     start: u32,
     end: u32,
     inner: &StoreInner,
+    generation: u64,
 ) -> Result<()> {
     let keys = data.keys.snapshot();
     let tombstones = data.tombstones.load();
@@ -233,12 +245,120 @@ pub(super) fn write_id_tracker(
         });
     }
     snapshot::write(
-        &segment_dir(data.dir(), start).join("id_tracker.bin"),
+        &segment_dir(data.dir(), start).join(ID_TRACKER_FILE),
         &IdTracker {
-            generation: inner.meta.next_slot,
+            generation,
             entries,
         },
     )
+}
+
+/// File name of a segment's authoritative id directory.
+pub(crate) const ID_TRACKER_FILE: &str = "id_tracker.bin";
+
+/// One point's directory entry handed to a tracker writer (id, global slot,
+/// point lsn, delete lsn, free).
+pub(crate) type TrackerPoint = (String, u32, u64, u64, bool);
+
+/// Write id trackers for a freshly built generation from an explicit list of
+/// points, grouped by their segment. Used by compaction, which knows the final
+/// slot of every live point but has no live `StoreInner` to read from.
+pub(crate) fn write_trackers_from_points(
+    dir: &Path,
+    generation: u64,
+    segment_slots: u32,
+    points: &[TrackerPoint],
+) -> Result<()> {
+    if segment_slots == 0 {
+        return Ok(());
+    }
+    let mut grouped: BTreeMap<u32, Vec<IdTrackerEntry>> = BTreeMap::new();
+    for (id, slot, point_lsn, delete_lsn, free) in points {
+        let start = (*slot / segment_slots) * segment_slots;
+        grouped.entry(start).or_default().push(IdTrackerEntry {
+            id: id.clone(),
+            offset: *slot - start,
+            point_lsn: *point_lsn,
+            delete_lsn: *delete_lsn,
+            free: *free,
+        });
+    }
+    for (start, entries) in grouped {
+        snapshot::write(
+            &segment_dir(dir, start).join(ID_TRACKER_FILE),
+            &IdTracker {
+                generation,
+                entries,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Reconstruct the id->slot directory and per-id water marks from the
+/// per-segment id trackers.
+///
+/// Trackers are the authoritative directory of a published generation, replacing
+/// the old whole-generation snapshot. Every physical segment must carry one:
+/// a missing or mismatched tracker is `CorruptData` because the id directory
+/// cannot be safely reconstructed from slot files alone (tombstoned slots keep
+/// their key, so a scan cannot tell which id currently owns a live slot).
+/// Returns `None` only for a brand-new generation that has never checkpointed
+/// (no segment tracker exists yet); the caller then rebuilds from WAL replay.
+pub(crate) fn read_id_trackers(
+    dir: &Path,
+    generation: u64,
+    segment_slots: u32,
+    slot_capacity: u64,
+) -> Result<Option<(IdMap, IdMap<u64>)>> {
+    if segment_slots == 0 {
+        return Ok(None);
+    }
+    let count = slot_capacity.div_ceil(segment_slots as u64) as usize;
+    let mut reverse = IdMap::with_capacity(slot_capacity as usize);
+    let mut versions = IdMap::<u64>::default();
+    let mut found = false;
+    for index in 0..count {
+        let start = index as u32 * segment_slots;
+        let path = segment_path(dir, start).join(ID_TRACKER_FILE);
+        if !path.exists() {
+            // A segment that never received a checkpoint has no tracker;
+            // its slots are rebuilt from the WAL.
+            continue;
+        }
+        // The file exists but failed the CRC/format envelope: a committed
+        // id directory is not reconstructable from slot files, so this is
+        // corruption, not a silent fallback to WAL replay.
+        let tracker = snapshot::read::<IdTracker>(&path)?.ok_or_else(|| {
+            VectorSearchError::CorruptData(format!(
+                "id tracker in segment {start} failed its checksum"
+            ))
+        })?;
+        if tracker.generation != generation {
+            return Err(VectorSearchError::CorruptData(format!(
+                "id tracker in segment {start} belongs to generation {}, expected {generation}",
+                tracker.generation
+            )));
+        }
+        found = true;
+        for entry in tracker.entries {
+            let id = PointId::from(entry.id.as_str());
+            let version = entry.point_lsn.max(entry.delete_lsn);
+            versions.insert_value(&id, version);
+            if entry.free {
+                if entry.delete_lsn > 0 {
+                    versions.insert_value(&id, entry.delete_lsn);
+                }
+                continue;
+            }
+            reverse.insert(&id, start + entry.offset);
+        }
+    }
+    Ok(if found {
+        Some((reverse, versions))
+    } else {
+        None
+    })
 }
 
 /// Publish the derived segment manifest for a generation.

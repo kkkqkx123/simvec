@@ -277,3 +277,44 @@ pub unsafe extern "C" fn simvec_run_maintenance_sweep(engine: *mut simvec_engine
         handle.ok()
     })
 }
+
+/// Per-segment durability state as JSON (health, ACK floor, per-segment
+/// applied/persisted water marks). `*out` is freed with `simvec_free_string`.
+///
+/// # Safety
+/// - `engine` must be a valid handle.
+/// - `collection` must be a valid null-terminated UTF-8 string.
+/// - `out` must be a valid out pointer.
+#[no_mangle]
+pub unsafe extern "C" fn simvec_maintenance_status(
+    engine: *mut simvec_engine_t,
+    collection: *const c_char,
+    out: *mut *mut c_char,
+) -> c_int {
+    guard(engine, |handle| {
+        let collection = match input_str(collection) {
+            Ok(collection) => collection,
+            Err(code) => return handle.fail_code(code, "invalid collection name".to_string()),
+        };
+        match handle.engine.maintenance_status(collection) {
+            Ok(status) => match serde_json::to_string(&status) {
+                Ok(body) => {
+                    let emit = emit_json(out, &body);
+                    if emit == simvec_error_code_t::SIMVEC_OK as c_int {
+                        handle.ok()
+                    } else {
+                        handle.fail_code(
+                            simvec_error_code_t::SIMVEC_ERROR,
+                            "failed to hand out maintenance status".to_string(),
+                        )
+                    }
+                }
+                Err(err) => handle.fail_code(
+                    simvec_error_code_t::SIMVEC_INTERNAL,
+                    format!("failed to serialize maintenance status: {err}"),
+                ),
+            },
+            Err(err) => handle.fail(&err),
+        }
+    })
+}

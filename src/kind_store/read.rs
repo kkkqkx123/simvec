@@ -26,6 +26,24 @@ impl KindStore {
         self.distance
     }
 
+    /// Decode a vector blob into an owned payload, honouring the space dtype.
+    fn decode_blob_data(&self, bytes: &[u8]) -> Result<crate::types::VectorData> {
+        if self.dtype == crate::types::VectorDataType::F32 {
+            return crate::storage::point_blobs::decode_vector(bytes)
+                .map(|view| view.to_data())
+                .ok_or_else(|| {
+                    crate::error::VectorSearchError::CorruptData(
+                        "bad f32 vector blob".to_string(),
+                    )
+                });
+        }
+        let params = crate::distance::dtype::QuantParams {
+            scale: self.dtype_params.scale,
+            zero_point: self.dtype_params.zero_point,
+        };
+        crate::storage::point_blobs::decode_vector_typed(bytes, params)
+    }
+
     /// Per-point sub-vector cap for Multi collections (`0` for Sparse).
     pub fn max_vectors_per_point(&self) -> usize {
         self.max_vectors_per_point
@@ -188,7 +206,17 @@ impl KindStore {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
-            let Some(view) = reader.view(point.blob) else {
+            let Some(bytes) = reader.bytes(point.blob) else {
+                continue;
+            };
+            let params = crate::distance::dtype::QuantParams {
+                scale: self.dtype_params.scale,
+                zero_point: self.dtype_params.zero_point,
+            };
+            let mut scratch = Vec::new();
+            let Some(view) = crate::storage::point_blobs::view_for_score(
+                bytes, self.dtype, params, &mut scratch,
+            ) else {
                 continue;
             };
             let score = match &owned {
@@ -227,7 +255,8 @@ impl KindStore {
                     }
                 }
                 if with_vector {
-                    let data = reader.to_data(point.blob)?;
+                    let bytes = reader.bytes(point.blob)?;
+                    let data = self.decode_blob_data(bytes).ok()?;
                     result = result.with_data(data);
                 }
                 Some(result)
@@ -315,12 +344,19 @@ impl KindStore {
                 }
             }
             let vectors = match reader.as_ref() {
-                Some(reader) => match reader.to_data(point.blob) {
-                    Some(data) => {
-                        BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), data)])
+                Some(reader) => {
+                    let bytes = reader.bytes(point.blob);
+                    let data = match bytes {
+                        Some(bytes) => self.decode_blob_data(bytes),
+                        None => continue,
+                    };
+                    match data {
+                        Ok(data) => {
+                            BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), data)])
+                        }
+                        Err(_) => continue,
                     }
-                    None => continue,
-                },
+                }
                 None => BTreeMap::new(),
             };
             points.push(VectorPoint {

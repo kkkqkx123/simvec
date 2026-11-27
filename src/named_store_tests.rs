@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::NamedStore;
 use crate::engine::LocalVectorEngine;
 use crate::types::{
-    CollectionConfig, DistanceMetric, PointId, SearchQuery, VectorData, VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, PointId, SearchQuery, VectorData, VectorPoint,
     VectorSpaceConfig,
 };
 
@@ -237,7 +237,7 @@ fn named_store_upsert_record_requires_named_payload() {
 fn named_store_full_replacement_drops_postings() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store =
-        NamedStore::create(dir.path(), "c", &spaces(), None, &Default::default()).expect("create");
+        NamedStore::create(dir.path(), "c", &spaces(), None, &IndexConfig::Flat, &Default::default()).expect("create");
     store
         .upsert_batch(&[point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(5, 2.0)])])
         .expect("upsert");
@@ -497,7 +497,7 @@ fn named_restart_loads_the_posting_dictionaries() {
     let storage = crate::types::StorageConfig::default();
     let (blob_bytes, posting_bytes);
     {
-        let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+        let store = NamedStore::create(&dir, "named", &spaces(), None, &IndexConfig::Flat, &storage).unwrap();
         let points: Vec<VectorPoint> = (0..20u32)
             .map(|i| {
                 point(
@@ -540,7 +540,7 @@ fn named_patch_reallocates_the_point_and_its_postings() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("named");
     let storage = crate::types::StorageConfig::default();
-    let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+    let store = NamedStore::create(&dir, "named", &spaces(), None, &IndexConfig::Flat, &storage).unwrap();
     store
         .upsert_batch(&[point(
             "p1",
@@ -609,7 +609,7 @@ fn named_compaction_reclaims_blob_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("named");
     let storage = crate::types::StorageConfig::default();
-    let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+    let store = NamedStore::create(&dir, "named", &spaces(), None, &IndexConfig::Flat, &storage).unwrap();
     let points: Vec<VectorPoint> = (0..10u32)
         .map(|i| point(&format!("p{i}"), vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]))
         .collect();
@@ -647,7 +647,7 @@ fn named_payloads_are_blobbed_outside_the_snapshot() {
     let big = marker.repeat(48);
     let id = PointId::from("p1");
     {
-        let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+        let store = NamedStore::create(&dir, "named", &spaces(), None, &IndexConfig::Flat, &storage).unwrap();
         let point = point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]).with_payload(
             [("note".to_string(), serde_json::json!(big))]
                 .into_iter()
@@ -675,4 +675,51 @@ fn named_payloads_are_blobbed_outside_the_snapshot() {
         serde_json::json!(big)
     );
     assert_eq!(point.vectors.len(), 2);
+}
+
+#[test]
+fn named_dense_space_builds_and_uses_ann_after_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("named_ann");
+    let storage = crate::types::StorageConfig::default();
+    let hnsw = IndexConfig::Hnsw(crate::types::HnswConfig::default());
+    // ANN applies only to all-dense collections (a mixed sparse space stays
+    // exact by design).
+    let dense_spaces = BTreeMap::from([
+        ("text".to_string(), VectorSpaceConfig::dense(4, DistanceMetric::Cosine)),
+        ("image".to_string(), VectorSpaceConfig::dense(4, DistanceMetric::Dot)),
+    ]);
+    let store = NamedStore::create(&dir, "named_ann", &dense_spaces, None, &hnsw, &storage).unwrap();
+    let points: Vec<VectorPoint> = (0..64u32)
+        .map(|i| {
+            VectorPoint::with_named(
+                format!("p{i}"),
+                "text",
+                VectorData::dense(vec![i as f32, (i % 7) as f32, 1.0, 0.0]),
+            )
+            .with_named_vector(
+                "image",
+                VectorData::dense(vec![i as f32, 0.0, 0.0, 1.0]),
+            )
+        })
+        .collect();
+    store.upsert_batch(&points).unwrap();
+    // Checkpoint publishes vectors + graph for the dense space.
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let reopened = NamedStore::open(&dir, &storage).unwrap();
+    let ann = reopened.ann.load();
+    let dense_ann = ann.get("text").expect("dense space has an ANN index");
+    assert!(dense_ann.is_trained(), "checkpoint must publish a trained graph");
+    assert!(ann.contains_key("image"), "second dense space also has an ANN");
+    drop(ann);
+
+    let hits = reopened
+        .search(&named_query("text", VectorData::dense(vec![3.0, 3.0 % 7.0, 1.0, 0.0])))
+        .unwrap();
+    assert!(!hits.is_empty());
+    // Top hit must be the exact nearest neighbour (ANN narrows candidates,
+    // scores are recomputed exactly).
+    assert_eq!(hits[0].id, PointId::from("p3"));
 }

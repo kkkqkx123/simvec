@@ -394,8 +394,8 @@ fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
         "several segments must be on disk before the checkpoint"
     );
     let files_before = std::fs::read_dir(&wal_dir).unwrap().count();
-    // Segments plus the prebuilt spare (and the ack file once published).
-    assert_eq!(files_before, segments.len() + 1);
+    // Segments plus the prebuilt spare and the reference-form blob file.
+    assert_eq!(files_before, segments.len() + 2);
 
     store.checkpoint().unwrap();
 
@@ -416,7 +416,9 @@ fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     remaining.sort();
-    assert_eq!(remaining.len(), 3, "unexpected files: {remaining:?}");
+    // Tail marker segment, durable ack, prebuilt spare and the append-only
+    // blob file (partial truncation keeps blobs for surviving references).
+    assert_eq!(remaining.len(), 4, "unexpected files: {remaining:?}");
 
     // Appending after the checkpoint reuses the marker tail segment and
     // replays cleanly.

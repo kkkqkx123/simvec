@@ -12,9 +12,52 @@ use std::sync::Arc;
 use memmap2::{Mmap, MmapOptions};
 use parking_lot::RwLock;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, VectorSearchError};
+use crate::types::VectorDataType;
 
 use super::segments::segment_dir;
+use super::snapshot;
+
+/// Per-segment element dtype header, written as a checksummed sidecar
+/// (`vector_dtype.bin`) inside each segment directory. It is authoritative
+/// layout metadata: a corrupt header is `CorruptData`, never silently
+/// downgraded to f32.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VectorDtypeMeta {
+    pub dtype: VectorDataType,
+    pub scale: f32,
+    pub zero_point: f32,
+}
+
+impl Default for VectorDtypeMeta {
+    fn default() -> Self {
+        Self {
+            dtype: VectorDataType::F32,
+            scale: 1.0,
+            zero_point: 0.0,
+        }
+    }
+}
+
+pub(crate) const VECTOR_DTYPE_FILE: &str = "vector_dtype.bin";
+
+/// Apply the space element dtype to a vector before it is written to the
+/// fixed-stride f32 segment file. The round-trip through the dtype's encoding
+/// makes the stored precision match the declared type (f16 keeps ~11 bits,
+/// uint8 quantizes to `scale`/`zero_point`, binary keeps only the sign).
+fn quantize_for_storage(values: &[f32], meta: VectorDtypeMeta) -> Result<Vec<f32>> {
+    if meta.dtype == VectorDataType::F32 {
+        return Ok(values.to_vec());
+    }
+    let params = crate::distance::dtype::QuantParams {
+        scale: meta.scale,
+        zero_point: meta.zero_point,
+    };
+    let encoded = crate::distance::dtype::encode_typed(values, meta.dtype, params)?;
+    crate::distance::dtype::decode_typed(meta.dtype, values.len(), &encoded, params)
+}
 
 /// One physical segment's vector file.
 struct VectorSegment {
@@ -94,24 +137,58 @@ pub struct Vectors {
     dir: PathBuf,
     dim: usize,
     segment_slots: u32,
+    /// Element dtype declared for this space, with affine params.
+    dtype_meta: VectorDtypeMeta,
     segments: RwLock<Vec<Arc<VectorSegment>>>,
 }
 
 impl Vectors {
-    /// Create the first physical segment of a new generation.
+    /// Create the first physical segment of a new generation (default f32).
     pub fn create(dir: &Path, dim: usize, segment_slots: u32) -> Result<Self> {
-        let path = segment_dir(dir, 0).join("vectors.bin");
+        Self::create_with_dtype(dir, dim, segment_slots, VectorDtypeMeta::default())
+    }
+
+    /// Create with an explicit element dtype, persisting a checksummed header
+    /// in each segment directory.
+    pub fn create_with_dtype(
+        dir: &Path,
+        dim: usize,
+        segment_slots: u32,
+        dtype_meta: VectorDtypeMeta,
+    ) -> Result<Self> {
+        let seg_dir = segment_dir(dir, 0);
+        let path = seg_dir.join("vectors.bin");
         let segment = VectorSegment::create(&path, dim, segment_slots)?;
+        snapshot::write(&seg_dir.join(VECTOR_DTYPE_FILE), &dtype_meta)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             dim,
             segment_slots,
+            dtype_meta,
             segments: RwLock::new(vec![Arc::new(segment)]),
         })
     }
 
-    /// Open every serving segment declared by the slot capacity.
+    /// Open every serving segment declared by the slot capacity (default f32).
     pub fn open(dir: &Path, dim: usize, segment_slots: u32, slot_capacity: u64) -> Result<Self> {
+        Self::open_with_dtype(
+            dir,
+            dim,
+            segment_slots,
+            slot_capacity,
+            VectorDtypeMeta::default(),
+        )
+    }
+
+    /// Open with an explicit expected dtype. A present-but-corrupt header is
+    /// `CorruptData`; a missing header on a newly created generation is fine.
+    pub fn open_with_dtype(
+        dir: &Path,
+        dim: usize,
+        segment_slots: u32,
+        slot_capacity: u64,
+        expected: VectorDtypeMeta,
+    ) -> Result<Self> {
         if segment_slots == 0 {
             return Err(VectorSearchError::InvalidConfig(
                 "segment_slots must be positive".to_string(),
@@ -119,16 +196,36 @@ impl Vectors {
         }
         let count = slot_capacity.div_ceil(segment_slots as u64).max(1) as usize;
         let mut segments = Vec::with_capacity(count);
+        let mut dtype_meta = expected;
         for index in 0..count {
-            let path = segment_dir(dir, index as u32 * segment_slots).join("vectors.bin");
+            let seg_dir = segment_dir(dir, index as u32 * segment_slots);
+            let header_path = seg_dir.join(VECTOR_DTYPE_FILE);
+            if let Some(meta) = snapshot::read_strict::<VectorDtypeMeta>(&header_path)? {
+                if index == 0 {
+                    dtype_meta = meta;
+                } else if meta != dtype_meta {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "segment {} dtype header disagrees with segment 0",
+                        index
+                    )));
+                }
+            }
+            let path = seg_dir.join("vectors.bin");
             segments.push(Arc::new(VectorSegment::open(&path, dim, segment_slots)?));
         }
         Ok(Self {
             dir: dir.to_path_buf(),
             dim,
             segment_slots,
+            dtype_meta,
             segments: RwLock::new(segments),
         })
+    }
+
+    /// Full dtype header (type + affine params), for carrying metadata across
+    /// compaction into a freshly staged generation.
+    pub fn dtype_meta(&self) -> VectorDtypeMeta {
+        self.dtype_meta
     }
 
     pub fn slot_capacity(&self) -> u64 {
@@ -147,8 +244,10 @@ impl Vectors {
     /// Append one physical segment.
     pub fn grow(&self) -> Result<()> {
         let index = self.segments.read().len() as u32;
-        let path = segment_dir(&self.dir, index * self.segment_slots).join("vectors.bin");
+        let seg_dir = segment_dir(&self.dir, index * self.segment_slots);
+        let path = seg_dir.join("vectors.bin");
         let segment = VectorSegment::create(&path, self.dim, self.segment_slots)?;
+        snapshot::write(&seg_dir.join(VECTOR_DTYPE_FILE), &self.dtype_meta)?;
         self.segments.write().push(Arc::new(segment));
         Ok(())
     }
@@ -170,7 +269,8 @@ impl Vectors {
                 segments.len()
             )));
         };
-        segment.write(local, data)
+        let stored = quantize_for_storage(data, self.dtype_meta)?;
+        segment.write(local, &stored)
     }
 
     /// Flush one physical segment.

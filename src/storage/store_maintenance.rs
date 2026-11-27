@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use super::dense_snapshot::DenseSnapshot;
+use rayon::prelude::*;
+
 use super::quant::QuantStore;
 use super::WalRecord;
 use super::{CollectionStore, StoreInner};
@@ -111,29 +112,19 @@ impl CollectionStore {
                 &entries,
             )?;
         }
-        // The snapshot and the manifest describe one generation. Writing the
-        // snapshot first means a crash can only leave it ahead of the
-        // manifest, which open detects and discards; the WAL is still intact
-        // at that point.
-        let generation = self.generation.read().clone();
-        let data = self.data_arc();
-        let tombstones = data.tombstones.load();
-        let snapshot = DenseSnapshot::capture(
-            generation.id(),
-            inner.meta.last_applied_txn,
-            &inner.meta,
-            &inner.reverse,
-            &inner.versions,
-            &tombstones,
-        );
-        DenseSnapshot::write(&data_dir, &snapshot)?;
+        // Per-segment id trackers were written by flush_segment above and are
+        // the authoritative directory for this generation. They are written
+        // before the manifest advances, so a crash can only leave them ahead
+        // of the manifest; open rejects a tracker bound to another generation
+        // and the WAL stays intact at that point.
         // The field posting file is derived too, but keeping it at the same
-        // generation/lsn as the snapshot avoids a full rebuild at open. A
+        // generation/lsn as the checkpoint avoids a full rebuild at open. A
         // crash before the manifest advance leaves it ahead of the manifest
         // and open discards it.
+        let generation_id = self.generation.read().id();
         inner
             .payload_indexes
-            .save(&data_dir, generation.id(), inner.meta.last_applied_txn)?;
+            .save(&data_dir, generation_id, inner.meta.last_applied_txn)?;
         // Publish the generation's lsn before the WAL watermark: recovery
         // never replays past what this generation's files contain.
         self.generation
@@ -152,7 +143,10 @@ impl CollectionStore {
         // stays at the watermark (the files contain exactly that); the marker
         // is a no-op whose segment survives the truncate below.
         let watermark = inner.meta.last_applied_txn;
-        self.note_segments_persisted(&mut inner, watermark);
+        // Each segment's persisted lsn was advanced independently by
+        // flush_segment to its own applied frontier. Do not flatten them to a
+        // single watermark: the ACK must be the minimum over real per-segment
+        // durable points so a segment that lagged cannot be cut out of the log.
         let marker_lsn = inner.next_lsn;
         inner.next_lsn = marker_lsn + 1;
         if let Err(e) = self.wal.append(&WalTxn {
@@ -198,11 +192,17 @@ impl CollectionStore {
             return Ok(());
         }
         let count = slot_capacity.div_ceil(segment_slots as u64) as usize;
-        for index in 0..count {
-            if let Err(err) = self.flush_segment(index, segment_slots, slot_capacity) {
-                self.record_maintenance_error(&err.to_string());
-                return Err(err);
-            }
+        // Flush independent physical segments in parallel. Each segment owns
+        // disjoint files and only takes short inner read/write locks, so no
+        // segment's fsync blocks another's. A failure in any segment is
+        // recorded once and aborts the pass; already-durable segments keep
+        // their advanced persisted marks.
+        let result: Result<()> = (0..count)
+            .into_par_iter()
+            .try_for_each(|index| self.flush_segment(index, segment_slots, slot_capacity));
+        if let Err(err) = result {
+            self.record_maintenance_error(&err.to_string());
+            return Err(err);
         }
         Ok(())
     }
@@ -236,7 +236,8 @@ impl CollectionStore {
         data.tombstones
             .load()
             .save_segment(data.dir(), start, segment_slots, slot_capacity)?;
-        segments::write_id_tracker(&data, start, end, &self.inner.read())?;
+        let generation = self.generation.read().id();
+        segments::write_id_tracker(&data, start, end, &self.inner.read(), generation)?;
         let mut inner = self.inner.write();
         inner.ensure_segment_len(index + 1);
         inner.segment_persisted[index] = inner.segment_persisted[index].max(frontier);

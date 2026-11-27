@@ -493,6 +493,13 @@ export class Engine {
     return takeJson(readPointer(out));
   }
 
+  maintenanceStatus(collection) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_maintenance_status(handle, String(collection), out), handle);
+    return takeJson(readPointer(out));
+  }
+
   runMaintenanceSweep() {
     const handle = this._requireOpen();
     check(functions.simvec_run_maintenance_sweep(handle), handle);

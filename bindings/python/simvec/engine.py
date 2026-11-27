@@ -476,6 +476,16 @@ class Engine:
         )
         return _take_json(out)
 
+    def maintenance_status(self, collection):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_maintenance_status(
+                self._handle, _encode_str(collection), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
     def run_maintenance_sweep(self):
         _check(_lib.simvec_run_maintenance_sweep(self._handle), self._handle)
 

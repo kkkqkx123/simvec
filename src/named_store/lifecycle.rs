@@ -7,10 +7,12 @@ use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::point_blobs::{
-    encode_named, encode_vector, rewrite_named, BlobRef, PointBlobs,
-};
+use crate::storage::point_blobs::{rewrite_named, BlobRef};
 use crate::storage::postings::Postings;
+use crate::storage::segmented_blobs::{SegmentedBlobs, DEFAULT_SEGMENT_BYTES};
+use crate::storage::spaces_meta::{
+    self, DtypeParams, SpaceMeta, SpacesManifest, DEFAULT_SEGMENT_SLOTS,
+};
 use crate::storage::{snapshot, CollectionLock, Generation, IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{CollectionConfig, Payload, PointId, VectorData, VectorKind, VectorSpaceConfig};
 
@@ -18,12 +20,15 @@ use super::{
     Inner, NamedMeta, NamedPoint, NamedSnapshot, NamedSnapshotPoint, NamedSpaceMeta, NamedStore,
 };
 
-/// File holding the append-only point vectors.
+/// File holding the append-only point vectors inside each segment directory.
 const BLOBS_FILE: &str = "points.bin";
-/// File holding the append-only JSON payloads.
+/// File holding the append-only JSON payloads inside each segment directory.
 const PAYLOADS_FILE: &str = "payloads.bin";
 /// Directory holding the per-space postings.
 const POSTINGS_DIR: &str = "postings";
+/// Space directory hosting the whole-point blob stream (named points encode
+/// every declared space in one blob, so vectors share one segmented stream).
+const VECTORS_SPACE: &str = "vectors";
 
 /// State staged for a compacted generation.
 struct StagedNamedState {
@@ -41,10 +46,12 @@ impl NamedStore {
         name: &str,
         spaces: &BTreeMap<String, VectorSpaceConfig>,
         max_points: Option<u64>,
+        index: &crate::types::IndexConfig,
         storage: &crate::types::StorageConfig,
     ) -> Result<Arc<Self>> {
         let mut config = CollectionConfig::with_named(spaces.clone());
         config.max_points = max_points;
+        config.index = index.clone();
         config.validate_kind()?;
         std::fs::create_dir_all(dir)?;
         let dir_lock = CollectionLock::acquire(dir)?;
@@ -72,10 +79,23 @@ impl NamedStore {
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
         let data_dir = generation.path();
-        let blobs = PointBlobs::create(&data_dir.join(BLOBS_FILE))?;
-        let payloads = PointBlobs::create(&data_dir.join(PAYLOADS_FILE))?;
+        // spaces.json is the authoritative layout: all declared spaces, their
+        // index/quantization selection and segment width are recorded here.
+        let dtype_map = build_dtype_map(spaces);
+        let spaces_meta_map = build_space_meta(spaces, index);
+        spaces_meta::write(
+            &data_dir,
+            &SpacesManifest::new(name, generation.id(), generation.lsn(), spaces_meta_map, max_points),
+        )?;
+        let seg_root = spaces_meta::segment_dir(&data_dir, VECTORS_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let blobs = SegmentedBlobs::create(&seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let payloads = SegmentedBlobs::create(&seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES)?;
         let space_order = space_order(&meta.spaces);
-        let postings = open_postings(&data_dir, &meta.spaces, &space_order, None)?;
+        let postings = open_postings(&data_dir, &meta.spaces, None)?;
+        let ann = build_ann_map(&data_dir, &meta.spaces, index, true)?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
             _dir_lock: dir_lock,
@@ -93,6 +113,9 @@ impl NamedStore {
             blobs: arc_swap::ArcSwap::from(Arc::new(blobs)),
             payloads: arc_swap::ArcSwap::from(Arc::new(payloads)),
             postings: arc_swap::ArcSwap::from(Arc::new(postings)),
+            ann: arc_swap::ArcSwap::from_pointee(ann),
+            index: index.clone(),
+            dtype_map,
         }))
     }
 
@@ -100,12 +123,56 @@ impl NamedStore {
     /// per-space dictionaries, then replay what the snapshot does not cover.
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
         let dir_lock = CollectionLock::acquire(dir)?;
-        let bytes = std::fs::read(dir.join("named.bin"))?;
-        let meta: NamedMeta = postcard::from_bytes(&bytes)?;
         let generation = Generation::open(dir)?;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
         let data_dir = generation.path();
+        // Rebuild the space declarations from the authoritative manifest.
+        let manifest = spaces_meta::read(&data_dir, generation.id(), generation.lsn())?;
+        let spaces: BTreeMap<String, NamedSpaceMeta> = manifest
+            .spaces
+            .iter()
+            .map(|(name, space)| {
+                (
+                    name.clone(),
+                    NamedSpaceMeta {
+                        kind: space.kind,
+                        vector_size: space.dim,
+                        distance: space.distance,
+                        multi_config: space.multi_config,
+                    },
+                )
+            })
+            .collect();
+        let meta = NamedMeta {
+            collection: manifest.collection.clone(),
+            spaces: spaces.clone(),
+            max_points: manifest.max_points,
+        };
+        // All spaces share the collection-level index tier; read it from the
+        // authoritative manifest (any declared space carries it).
+        let index = manifest
+            .spaces
+            .values()
+            .next()
+            .map(|space| space.index.clone())
+            .unwrap_or(crate::types::IndexConfig::Flat);
+        let dtype_map: BTreeMap<
+            String,
+            (
+                crate::types::VectorDataType,
+                DtypeParams,
+            ),
+        > = manifest
+            .spaces
+            .iter()
+            .map(|(name, space)| {
+                (
+                    name.clone(),
+                    (space.dtype, space.dtype_params),
+                )
+            })
+            .collect();
         let snapshot_path = data_dir.join("named_snapshot.bin");
         let snapshot = snapshot::read::<NamedSnapshot>(&snapshot_path)?;
         if generation.lsn() == 0 && snapshot.is_none() {
@@ -128,23 +195,39 @@ impl NamedStore {
             }
         }
         let snapshot_lsn = snapshot.as_ref().map(|snapshot| snapshot.lsn);
-        let blobs = PointBlobs::open(
-            &data_dir.join(BLOBS_FILE),
-            snapshot.as_ref().map(|snapshot| snapshot.blobs_len),
+        let slot_capacity = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .points
+                    .iter()
+                    .map(|point| point.slot as u64 + 1)
+                    .max()
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1);
+        let seg_root = spaces_meta::segment_dir(&data_dir, VECTORS_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let blobs = SegmentedBlobs::open(
+            &seg_root,
+            BLOBS_FILE,
+            DEFAULT_SEGMENT_BYTES,
+            snapshot.as_ref().map_or(0, |snapshot| snapshot.blobs_len),
         )?;
         // No published snapshot means no reachable payload handle; the file
         // is entirely an uncommitted tail.
-        let payloads = PointBlobs::open(
-            &data_dir.join(PAYLOADS_FILE),
-            Some(
-                snapshot
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.payloads_len),
-            ),
+        let payloads = SegmentedBlobs::open(
+            &seg_root,
+            PAYLOADS_FILE,
+            DEFAULT_SEGMENT_BYTES,
+            snapshot.as_ref().map_or(0, |snapshot| snapshot.payloads_len),
         )?;
         let space_order = space_order(&meta.spaces);
-        let postings = open_postings(&data_dir, &meta.spaces, &space_order, snapshot_lsn)?;
+        let postings = open_postings(&data_dir, &meta.spaces, snapshot_lsn)?;
         let rebuild_postings = postings.values().any(|space| !space.was_restored());
+        let ann = build_ann_map_open(&data_dir, &meta.spaces, &index, slot_capacity)?;
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
             _dir_lock: dir_lock,
@@ -162,6 +245,9 @@ impl NamedStore {
             blobs: arc_swap::ArcSwap::from(Arc::new(blobs)),
             payloads: arc_swap::ArcSwap::from(Arc::new(payloads)),
             postings: arc_swap::ArcSwap::from(Arc::new(postings)),
+            ann: arc_swap::ArcSwap::from_pointee(ann),
+            index,
+            dtype_map,
         });
         if let Some(snapshot) = snapshot {
             store.restore_snapshot(snapshot, rebuild_postings)?;
@@ -208,13 +294,13 @@ impl NamedStore {
                             point.slot
                         ))
                     })?;
-                    let view =
-                        crate::storage::point_blobs::decode_vector(entry).ok_or_else(|| {
-                            VectorSearchError::CorruptData(format!(
-                                "snapshot slot {} holds an undecodable {space} vector",
-                                point.slot
-                            ))
-                        })?;
+                    let mut scratch = Vec::new();
+                    let view = self.view_space(space, entry, &mut scratch).ok_or_else(|| {
+                        VectorSearchError::CorruptData(format!(
+                            "snapshot slot {} holds an undecodable {space} vector",
+                            point.slot
+                        ))
+                    })?;
                     self.check_view(space, &view)?;
                     if rebuild_postings {
                         if let Some(postings) = self.postings_of(space) {
@@ -256,9 +342,129 @@ impl NamedStore {
         self.checkpoint_from_locked(&mut inner)
     }
 
+    /// Rebuild each dense space's ANN from the live points. Reads vectors out
+    /// of the committed blob stream through one reader pass; a space whose
+    /// points never carry that space is simply left untrained.
+    fn rebuild_ann(&self, inner: &Inner) -> Result<()> {
+        if self.ann.load().is_empty() {
+            return Ok(());
+        }
+        let blobs = self.blobs.load();
+        let reader = blobs.reader();
+        let ann = self.ann.load();
+        for (name, index) in ann.iter() {
+            let Some(space_idx) = self.order_of(name) else { continue };
+            let (dtype, dtype_params) = self
+                .dtype_map
+                .get(name)
+                .copied()
+                .unwrap_or((crate::types::VectorDataType::F32, DtypeParams::default()));
+            let qparams = crate::distance::dtype::QuantParams {
+                scale: dtype_params.scale,
+                zero_point: dtype_params.zero_point,
+            };
+            let typed = dtype != crate::types::VectorDataType::F32;
+            // For typed spaces decode into an owned arena first (Box keeps each
+            // slice's address stable), then build borrow rows in a second pass
+            // so growing the arena never invalidates an outstanding borrow.
+            let mut arena: Vec<Box<[f32]>> = Vec::new();
+            let mut slots: Vec<u32> = Vec::with_capacity(inner.live_count as usize);
+            for (slot, point) in inner.points.iter().enumerate() {
+                let Some(point) = point else { continue };
+                let Some(bytes) = reader.bytes(point.blob) else { continue };
+                let entry = crate::storage::point_blobs::named_entries(bytes)
+                    .and_then(|entries| entries.into_iter().find(|(idx, _)| *idx == space_idx))
+                    .map(|(_, bytes)| bytes);
+                let Some(entry) = entry else { continue };
+                if typed {
+                    if let Ok(crate::types::VectorData::Dense(values)) =
+                        crate::storage::point_blobs::decode_vector_typed(entry, qparams)
+                    {
+                        arena.push(values.into_boxed_slice());
+                        slots.push(slot as u32);
+                    }
+                } else if matches!(
+                    crate::storage::point_blobs::decode_vector(entry),
+                    Some(crate::types::VectorView::Dense(_))
+                ) {
+                    slots.push(slot as u32);
+                }
+            }
+            if typed {
+                let rows: Vec<(u32, &[f32])> = slots
+                    .into_iter()
+                    .zip(arena.iter())
+                    .map(|(slot, values)| (slot, values.as_ref()))
+                    .collect();
+                index.rebuild(&rows)?;
+            } else {
+                // Zero-copy pass: borrow straight from the mmap.
+                let mut rows: Vec<(u32, &[f32])> = Vec::with_capacity(slots.len());
+                for slot in slots {
+                    let point = inner.points[slot as usize].as_ref().expect("live slot");
+                    let bytes = reader.bytes(point.blob).expect("blob present");
+                    let entry = crate::storage::point_blobs::named_entries(bytes)
+                        .and_then(|entries| entries.into_iter().find(|(idx, _)| *idx == space_idx))
+                        .map(|(_, bytes)| bytes)
+                        .expect("entry present");
+                    if let Some(crate::types::VectorView::Dense(values)) =
+                        crate::storage::point_blobs::decode_vector(entry)
+                    {
+                        rows.push((slot, values));
+                    }
+                }
+                index.rebuild(&rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish the authoritative space manifest for a generation/lsn pair.
+    fn write_spaces_manifest(&self, gen_dir: &Path, generation: u64, lsn: u64) -> Result<()> {
+        let spaces = self
+            .spaces
+            .iter()
+            .map(|(name, space)| {
+                (
+                    name.clone(),
+                    SpaceMeta {
+                        kind: space.kind,
+                        distance: space.distance,
+                        dim: space.vector_size,
+                        multi_config: space.multi_config,
+                        index: if space.kind == VectorKind::Dense {
+                            self.index.clone()
+                        } else {
+                            crate::types::IndexConfig::Flat
+                        },
+                        quantization: None,
+                        dtype: self
+                            .dtype_map
+                            .get(name)
+                            .map_or(crate::types::VectorDataType::F32, |(dtype, _)| *dtype),
+                        dtype_params: self
+                            .dtype_map
+                            .get(name)
+                            .map_or(DtypeParams::default(), |(_, params)| *params),
+                        segment_slots: DEFAULT_SEGMENT_SLOTS,
+                    },
+                )
+            })
+            .collect();
+        spaces_meta::write(
+            gen_dir,
+            &SpacesManifest::new(&self.name, generation, lsn, spaces, self.max_points),
+        )
+    }
+
     pub(super) fn checkpoint_from_locked(&self, inner: &mut Inner) -> Result<()> {
         let lsn = inner.next_lsn.saturating_sub(1);
         self.blobs.load().sync()?;
+        // Rebuild every dense space's ANN from the live points. Any failure
+        // here leaves the previous graph intact and aborts the checkpoint
+        // before the generation advances (the graph is derived but the
+        // checkpoint must not publish vectors a graph does not describe).
+        self.rebuild_ann(inner)?;
         for postings in self.postings.load().values() {
             postings.flush(Some(lsn))?;
         }
@@ -291,8 +497,12 @@ impl NamedStore {
                 })
                 .collect(),
         };
-        let snapshot_path = self.generation.read().path().join("named_snapshot.bin");
-        snapshot::write(&snapshot_path, &snapshot)?;
+        let gen_dir = self.generation.read().path();
+        snapshot::write(&gen_dir.join("named_snapshot.bin"), &snapshot)?;
+        // The authoritative manifest is written before the generation commit
+        // point advances so a published generation always has a matching one.
+        let generation_id = self.generation.read().id();
+        self.write_spaces_manifest(&gen_dir, generation_id, lsn)?;
         self.generation.write().set_lsn(lsn)?;
         self.wal.truncate_through(lsn)?;
         Ok(())
@@ -318,15 +528,17 @@ impl NamedStore {
             }
         };
 
-        let blobs = PointBlobs::open(
-            &staged.path().join(BLOBS_FILE),
-            Some(staged_state.blobs_len),
+        let staged_seg_root = spaces_meta::segment_dir(&staged.path(), VECTORS_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let blobs = SegmentedBlobs::open(
+            &staged_seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.blobs_len,
         )?;
-        let payloads = PointBlobs::open(
-            &staged.path().join(PAYLOADS_FILE),
-            Some(staged_state.payloads_len),
+        let payloads = SegmentedBlobs::open(
+            &staged_seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.payloads_len,
         )?;
-        let postings = open_postings(staged.path(), &self.spaces, &self.space_order, Some(lsn))?;
+        let postings = open_postings(staged.path(), &self.spaces, Some(lsn))?;
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
@@ -335,24 +547,28 @@ impl NamedStore {
         self.wal.bind_generation(next_generation.id());
 
         let data_dir = next_generation.path();
-        self.blobs.store(Arc::new(PointBlobs::open(
-            &data_dir.join(BLOBS_FILE),
-            Some(staged_state.blobs_len),
+        let seg_root = spaces_meta::segment_dir(&data_dir, VECTORS_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        self.blobs.store(Arc::new(SegmentedBlobs::open(
+            &seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.blobs_len,
         )?));
-        self.payloads.store(Arc::new(PointBlobs::open(
-            &data_dir.join(PAYLOADS_FILE),
-            Some(staged_state.payloads_len),
+        self.payloads.store(Arc::new(SegmentedBlobs::open(
+            &seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES, staged_state.payloads_len,
         )?));
         self.postings.store(Arc::new(open_postings(
-            &data_dir,
-            &self.spaces,
-            &self.space_order,
-            Some(lsn),
+            &data_dir, &self.spaces, Some(lsn),
         )?));
         *self.generation.write() = next_generation;
         inner.points = staged_state.points;
         inner.reverse = staged_state.reverse;
         inner.norms = staged_state.norms;
+        // Rebuild the per-space ANN against the new generation's vector files.
+        let ann_capacity = inner.points.len() as u64;
+        let new_ann = build_ann_map_open(&data_dir, &self.spaces, &self.index, ann_capacity)?;
+        self.ann.store(Arc::new(new_ann));
+        self.rebuild_ann(&inner)?;
 
         self.wal.truncate_through(lsn)?;
         old_generation.retire()?;
@@ -370,9 +586,13 @@ impl NamedStore {
         lsn: u64,
     ) -> Result<StagedNamedState> {
         let dir = staged.path();
-        let staging_blobs = PointBlobs::create(&dir.join(BLOBS_FILE))?;
-        let staging_payloads = PointBlobs::create(&dir.join(PAYLOADS_FILE))?;
-        let postings = open_postings(dir, &self.spaces, &self.space_order, None)?;
+        let staging_seg_root = spaces_meta::segment_dir(&dir, VECTORS_SPACE, 0)
+            .parent()
+            .expect("segment dir has a parent")
+            .to_path_buf();
+        let staging_blobs = SegmentedBlobs::create(&staging_seg_root, BLOBS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let staging_payloads = SegmentedBlobs::create(&staging_seg_root, PAYLOADS_FILE, DEFAULT_SEGMENT_BYTES)?;
+        let postings = open_postings(dir, &self.spaces, None)?;
         let mut points = Vec::with_capacity(inner.live_count as usize);
         let mut reverse = IdMap::with_capacity(inner.live_count as usize);
         let mut norms: HashMap<String, HashMap<u32, f32>> = HashMap::new();
@@ -461,6 +681,7 @@ impl NamedStore {
                 .collect(),
         };
         snapshot::write(&dir.join("named_snapshot.bin"), &snapshot)?;
+        self.write_spaces_manifest(&dir, staged.id(), lsn)?;
         Ok(StagedNamedState {
             points,
             reverse,
@@ -579,6 +800,58 @@ impl NamedStore {
     /// Space names, kinds, dimensions, capacity and payload JSON were checked
     /// in `write::validate_records` before the WAL append, so replay never
     /// re-validates a persisted transaction.
+    /// Decode one space's encoded vector into an owned payload (fetch paths).
+    pub(super) fn decode_space_data(&self, space: &str, bytes: &[u8]) -> Option<crate::types::VectorData> {
+        let (dtype, params) = self
+            .dtype_map
+            .get(space)
+            .copied()
+            .unwrap_or((crate::types::VectorDataType::F32, DtypeParams::default()));
+        if dtype == crate::types::VectorDataType::F32 {
+            return crate::storage::point_blobs::decode_vector(bytes).map(|v| v.to_data());
+        }
+        let qparams = crate::distance::dtype::QuantParams {
+            scale: params.scale,
+            zero_point: params.zero_point,
+        };
+        crate::storage::point_blobs::decode_vector_typed(bytes, qparams).ok()
+    }
+
+    /// Decode one space's encoded vector into a borrowable view. The default
+    /// f32 dtype is zero-copy (borrowed from `bytes`); typed encodings are
+    /// decoded into `scratch`.
+    fn view_space<'a>(
+        &self,
+        space: &str,
+        bytes: &'a [u8],
+        scratch: &'a mut Vec<f32>,
+    ) -> Option<crate::types::VectorView<'a>> {
+        let (dtype, params) = self
+            .dtype_map
+            .get(space)
+            .copied()
+            .unwrap_or((crate::types::VectorDataType::F32, DtypeParams::default()));
+        let qparams = crate::distance::dtype::QuantParams {
+            scale: params.scale,
+            zero_point: params.zero_point,
+        };
+        crate::storage::point_blobs::view_for_score(bytes, dtype, qparams, scratch)
+    }
+
+    /// Encode one space's vector with that space's element dtype.
+    fn encode_space(&self, space: &str, data: &VectorData) -> Result<Vec<u8>> {
+        let (dtype, params) = self
+            .dtype_map
+            .get(space)
+            .copied()
+            .unwrap_or((crate::types::VectorDataType::F32, DtypeParams::default()));
+        let qparams = crate::distance::dtype::QuantParams {
+            scale: params.scale,
+            zero_point: params.zero_point,
+        };
+        Ok(crate::storage::point_blobs::encode_vector_typed(data, dtype, qparams)?.0)
+    }
+
     pub(super) fn apply_upsert(
         &self,
         inner: &mut Inner,
@@ -597,10 +870,15 @@ impl NamedStore {
             inner.tombstone_slot(slot);
         }
         let slot = inner.points.len() as u32;
+        let mut entries = Vec::with_capacity(vectors.len());
+        for (space, data) in &vectors {
+            let index = self.order_of(space).unwrap_or(u16::MAX);
+            entries.push((index, self.encode_space(space, data)?));
+        }
         let blob = self
             .blobs
             .load()
-            .append(&encode_named(&vectors, &self.space_order))?;
+            .append(&crate::storage::point_blobs::pack_named(entries))?;
         for (space, data) in &vectors {
             if let (VectorData::Sparse { indices, values }, Some(postings)) =
                 (data, self.postings_of(space))
@@ -648,7 +926,7 @@ impl NamedStore {
             let index = self.order_of(space).ok_or_else(|| {
                 VectorSearchError::CorruptData(format!("patch targets unknown space {space}"))
             })?;
-            replacements.insert(index, encode_vector(data));
+            replacements.insert(index, self.encode_space(space, data)?);
         }
         let merged = {
             let blobs_guard = self.blobs.load();
@@ -797,6 +1075,108 @@ impl NamedStore {
     }
 }
 
+/// Build the authoritative per-space metadata recorded in `spaces.json`.
+fn build_space_meta(
+    spaces: &BTreeMap<String, crate::types::VectorSpaceConfig>,
+    index: &crate::types::IndexConfig,
+) -> BTreeMap<String, SpaceMeta> {
+    spaces
+        .iter()
+        .map(|(name, config)| {
+            (
+                name.clone(),
+                SpaceMeta {
+                    kind: config.kind(),
+                    distance: config.distance(),
+                    dim: config.vector_size(),
+                    multi_config: config.multi_config(),
+                    // The collection-level tier applies only to dense spaces;
+                    // sparse/multi metadata records Flat (validated at create).
+                    index: if config.kind() == VectorKind::Dense {
+                        index.clone()
+                    } else {
+                        crate::types::IndexConfig::Flat
+                    },
+                    quantization: None,
+                    dtype: config.dtype(),
+                    dtype_params: DtypeParams::default(),
+                    segment_slots: DEFAULT_SEGMENT_SLOTS,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Derive the per-space element dtype and affine params from the declared
+/// space configs. Sparse/multi spaces always report F32.
+fn build_dtype_map(
+    spaces: &BTreeMap<String, crate::types::VectorSpaceConfig>,
+) -> BTreeMap<String, (crate::types::VectorDataType, DtypeParams)> {
+    spaces
+        .iter()
+        .map(|(name, config)| (name.clone(), (config.dtype(), DtypeParams::default())))
+        .collect()
+}
+
+/// Build the ANN index map for dense spaces declaring an HNSW tier (create
+/// path: empty index, no persisted graph yet).
+fn build_ann_map(
+    gen_dir: &Path,
+    spaces: &BTreeMap<String, NamedSpaceMeta>,
+    index: &crate::types::IndexConfig,
+    _create: bool,
+) -> Result<BTreeMap<String, Arc<crate::storage::space_ann::SpaceAnn>>> {
+    let mut map = BTreeMap::new();
+    if let Some(config) = crate::storage::space_ann::SpaceAnn::hnsw_config(index) {
+        for (name, meta) in spaces {
+            if meta.kind != VectorKind::Dense {
+                continue;
+            }
+            map.insert(
+                name.clone(),
+                Arc::new(crate::storage::space_ann::SpaceAnn::create(
+                    gen_dir,
+                    name,
+                    meta.vector_size,
+                    meta.distance,
+                    config.clone(),
+                )?),
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Build the ANN index map on open, loading persisted graphs. Any bad graph
+/// degrades to exact scan (handled inside `SpaceAnn::open`).
+fn build_ann_map_open(
+    gen_dir: &Path,
+    spaces: &BTreeMap<String, NamedSpaceMeta>,
+    index: &crate::types::IndexConfig,
+    slot_capacity: u64,
+) -> Result<BTreeMap<String, Arc<crate::storage::space_ann::SpaceAnn>>> {
+    let mut map = BTreeMap::new();
+    if let Some(config) = crate::storage::space_ann::SpaceAnn::hnsw_config(index) {
+        for (name, meta) in spaces {
+            if meta.kind != VectorKind::Dense {
+                continue;
+            }
+            map.insert(
+                name.clone(),
+                Arc::new(crate::storage::space_ann::SpaceAnn::open(
+                    gen_dir,
+                    name,
+                    meta.vector_size,
+                    meta.distance,
+                    config.clone(),
+                    slot_capacity,
+                )?),
+            );
+        }
+    }
+    Ok(map)
+}
+
 /// Assign each declared space a stable index. `BTreeMap` iterates in name
 /// order, so the mapping survives a restart without being persisted.
 fn space_order(spaces: &BTreeMap<String, NamedSpaceMeta>) -> BTreeMap<String, u16> {
@@ -807,11 +1187,10 @@ fn space_order(spaces: &BTreeMap<String, NamedSpaceMeta>) -> BTreeMap<String, u1
         .collect()
 }
 
-/// Open one postings store per sparse space, under `postings/<index>`.
+/// Open one postings store per sparse space, under `spaces/<space>/postings/`.
 fn open_postings(
     dir: &Path,
     spaces: &BTreeMap<String, NamedSpaceMeta>,
-    order: &BTreeMap<String, u16>,
     snapshot_lsn: Option<u64>,
 ) -> Result<HashMap<String, Arc<Postings>>> {
     let mut postings = HashMap::new();
@@ -819,8 +1198,7 @@ fn open_postings(
         if meta.kind != VectorKind::Sparse {
             continue;
         }
-        let index = order.get(name).copied().unwrap_or(0);
-        let space_dir = dir.join(POSTINGS_DIR).join(format!("{index:03}"));
+        let space_dir = dir.join("spaces").join(name).join(POSTINGS_DIR);
         postings.insert(
             name.clone(),
             Arc::new(Postings::open(&space_dir, snapshot_lsn)?),

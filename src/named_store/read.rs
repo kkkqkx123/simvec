@@ -207,10 +207,34 @@ impl NamedStore {
             }
         }
         if full_scan || !matches!(owned, VectorData::Sparse { .. }) {
-            candidates = (0..inner.points.len() as u32)
-                .filter(|slot| inner.points[*slot as usize].is_some())
-                .map(|slot| (slot, 0.0))
-                .collect();
+            // Dense spaces with a trained ANN probe the graph for candidates;
+            // untrained/absent graphs fall back to a full exact scan. The
+            // probe only narrows candidates — final scores are recomputed from
+            // the authoritative blob encoding below, so recall loss from the
+            // approximation never changes a returned result's score.
+            let ann_hits = if let crate::types::VectorData::Dense(values) = &owned {
+                self.ann
+                    .load()
+                    .get(target)
+                    .filter(|index| index.is_trained())
+                    .and_then(|index| {
+                        let ef = (limit.saturating_mul(8)).clamp(32, 512);
+                        index.probe(values, ef, limit.saturating_mul(4).max(ef)).ok()
+                    })
+            } else {
+                None
+            };
+            if let Some(hits) = ann_hits {
+                candidates = hits
+                    .into_iter()
+                    .map(|(_score, slot)| (slot, 0.0))
+                    .collect();
+            } else {
+                candidates = (0..inner.points.len() as u32)
+                    .filter(|slot| inner.points[*slot as usize].is_some())
+                    .map(|slot| (slot, 0.0))
+                    .collect();
+            }
         }
 
         // One borrow of the blob mapping for the whole scoring pass.
@@ -229,7 +253,29 @@ impl NamedStore {
             let Some(index) = space_index else {
                 continue;
             };
-            let Some(stored) = reader.space_view(point.blob, index) else {
+            let Some(blob_bytes) = reader.bytes(point.blob) else {
+                continue;
+            };
+            let (dtype, dtype_params) = self
+                .dtype_map
+                .get(target)
+                .copied()
+                .unwrap_or((crate::types::VectorDataType::F32, Default::default()));
+            let params = crate::distance::dtype::QuantParams {
+                scale: dtype_params.scale,
+                zero_point: dtype_params.zero_point,
+            };
+            // Locate the target space's encoded vector inside the named blob.
+            let entry = crate::storage::point_blobs::named_entries(blob_bytes)
+                .and_then(|entries| entries.into_iter().find(|(idx, _)| *idx == index))
+                .map(|(_, bytes)| bytes);
+            let Some(entry) = entry else {
+                continue;
+            };
+            let mut scratch = Vec::new();
+            let Some(stored) = crate::storage::point_blobs::view_for_score(
+                entry, dtype, params, &mut scratch,
+            ) else {
                 continue;
             };
             let score = match &owned {
@@ -278,8 +324,8 @@ impl NamedStore {
                         {
                             continue;
                         }
-                        if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
-                            result = result.with_named_vector(space, view.to_data());
+                        if let Some(data) = self.decode_space_data(space, entry) {
+                            result = result.with_named_vector(space, data);
                         }
                     }
                 }
@@ -338,8 +384,8 @@ impl NamedStore {
             let Some(space) = self.space_at(index) else {
                 continue;
             };
-            if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
-                vectors.insert(space.to_string(), view.to_data());
+            if let Some(data) = self.decode_space_data(space, entry) {
+                vectors.insert(space.to_string(), data);
             }
         }
         drop(reader);
@@ -413,8 +459,8 @@ impl NamedStore {
                         let Some(space) = self.space_at(index) else {
                             continue;
                         };
-                        if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
-                            vectors.insert(space.to_string(), view.to_data());
+                        if let Some(data) = self.decode_space_data(space, entry) {
+                            vectors.insert(space.to_string(), data);
                         }
                     }
                 }

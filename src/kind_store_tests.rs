@@ -459,7 +459,7 @@ fn kind_stale_posting_manifest_is_rebuilt() {
     }
     // Simulate the crash window: the manifest is gone, so it can no longer
     // vouch for the buckets.
-    std::fs::remove_file(data_dir(&dir).join("postings").join("manifest.bin")).unwrap();
+    std::fs::remove_file(data_dir(&dir).join("spaces").join("").join("postings").join("manifest.bin")).unwrap();
 
     let reopened = KindStore::open(&dir, &storage).unwrap();
     assert!(!reopened.postings_restored());

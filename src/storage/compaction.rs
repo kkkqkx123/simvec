@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use memmap2::Mmap;
 
-use super::dense_snapshot::{DenseSnapshot, SnapshotPoint};
 use super::directory::KEY_REC_SIZE;
 use super::generation::StagedGeneration;
 use super::keys::Keys;
@@ -65,7 +64,8 @@ struct CompactionPlan {
     map: Vec<u32>,
     live_count: u64,
     /// Id directory and per-id water marks captured under the store lock.
-    points: Vec<SnapshotPoint>,
+    /// `(id, old_slot, point_lsn, delete_lsn, deleted)`.
+    points: Vec<segments::TrackerPoint>,
 }
 
 /// Compute the plan from a metadata snapshot and the current tombstone bits.
@@ -86,7 +86,14 @@ fn build_plan(
         new_capacity,
         map,
         live_count,
-        points: DenseSnapshot::capture_points(&inner.reverse, &inner.versions),
+        points: inner
+            .versions
+            .iter()
+            .map(|(id, version)| match inner.reverse.get(&id) {
+                Some(slot) => (id.to_string(), slot, version, 0, false),
+                None => (id.to_string(), 0, 0, version, true),
+            })
+            .collect(),
     }
 }
 
@@ -518,13 +525,22 @@ impl CollectionStore {
                     }
                 })
                 .collect();
+            let seg_dir = segments::segment_dir(dir, start as u32);
             write_vectors_file(
-                &segments::segment_dir(dir, start as u32).join("vectors.bin"),
+                &seg_dir.join("vectors.bin"),
                 plan.dim,
                 plan.segment_slots,
                 end - start,
                 &old_vectors,
                 &map,
+            )?;
+            // Carry the element dtype header into the staged generation:
+            // compacted vector bytes keep their quantized precision, so the
+            // manifest must describe the same dtype or open would treat them
+            // as f32.
+            super::snapshot::write(
+                &seg_dir.join(super::vectors::VECTOR_DTYPE_FILE),
+                &files.vectors.dtype_meta(),
             )?;
         }
 
@@ -609,28 +625,34 @@ impl CollectionStore {
         if defs.exists() {
             std::fs::copy(defs, dir.join("payload_indexes.json"))?;
         }
-        let points = plan
+        // Write the authoritative per-segment id trackers for the staged
+        // generation. Live points take their mapped slot; deleted ids keep
+        // only their delete water mark as free entries so an old WAL upsert
+        // cannot resurrect them. This replaces the old whole-generation
+        // `dense_snapshot.bin`.
+        let tracker_points: Vec<segments::TrackerPoint> = plan
             .points
             .iter()
-            .map(|point| {
-                let mut mapped = point.clone();
-                if !mapped.deleted {
-                    mapped.slot = plan.map[point.slot as usize];
+            .map(|(id, old_slot, point_lsn, delete_lsn, deleted)| {
+                if *deleted {
+                    (id.clone(), 0, 0, *delete_lsn, true)
+                } else {
+                    (
+                        id.clone(),
+                        plan.map[*old_slot as usize],
+                        *point_lsn,
+                        0,
+                        false,
+                    )
                 }
-                mapped
             })
             .collect();
-        let snapshot = DenseSnapshot {
-            generation: staged.id(),
-            lsn: meta.last_applied_txn,
-            next_slot: meta.next_slot,
-            slot_capacity: meta.slot_capacity,
-            live_count: meta.live_count,
-            tombstone_count: 0,
-            points,
-            tombstones: Vec::new(),
-        };
-        DenseSnapshot::write(dir, &snapshot)?;
+        segments::write_trackers_from_points(
+            dir,
+            staged.id(),
+            meta.segment_slots,
+            &tracker_points,
+        )?;
         // Freshly compacted generations carry no tombstones: every segment
         // is fully live, so the manifest can record zero garbage directly.
         {

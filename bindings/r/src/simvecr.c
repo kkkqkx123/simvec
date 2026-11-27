@@ -737,6 +737,23 @@ SEXP C_simvec_collection_metrics(SEXP r_handle, SEXP r_collection) {
     RETURN3(0, json_payload(text), NULL);
 }
 
+SEXP C_simvec_maintenance_status(SEXP r_handle, SEXP r_collection) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(collection, r_collection);
+    char *text = NULL;
+    int rc = simvec_maintenance_status(handle, collection, &text);
+    if (rc) {
+        if (text) {
+            simvec_free_string(text);
+        }
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, json_payload(text), NULL);
+}
+
 SEXP C_simvec_run_maintenance_sweep(SEXP r_handle) {
     engine_t *handle = engine_ptr(r_handle);
     if (!handle) {

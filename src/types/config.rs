@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
 
+mod dtype;
 mod index;
 mod quantization;
 mod remote_hints;
 mod storage;
 mod vectors;
 
+pub use self::dtype::*;
 pub use self::index::*;
 pub use self::quantization::*;
 pub use self::remote_hints::*;
@@ -123,13 +125,16 @@ impl CollectionConfig {
                     vector_size,
                     distance,
                     multi_config,
+                    dtype,
                 } => {
                     if *vector_size == 0 {
                         return Err(VectorSearchError::InvalidConfig(format!(
                             "space {name:?} vector_size must be >= 1"
                         )));
                     }
-                    let _ = distance;
+                    dtype.validate_metric(*distance).map_err(|e| {
+                        VectorSearchError::InvalidConfig(format!("space {name:?}: {e}"))
+                    })?;
                     if let Some(multi) = multi_config {
                         if multi.max_vectors_per_point == 0 {
                             return Err(VectorSearchError::InvalidConfig(format!(
@@ -145,39 +150,37 @@ impl CollectionConfig {
                 }
             }
         }
-        if self.is_named_layout() {
-            if !matches!(self.index, IndexConfig::Flat) {
-                return Err(VectorSearchError::InvalidConfig(
-                    "named-vectors collections do not support ANN indexes; use IndexConfig::Flat"
-                        .to_string(),
-                ));
-            }
-            if self.quantization_config.is_some() {
-                return Err(VectorSearchError::InvalidConfig(
-                    "named-vectors collections do not support quantization".to_string(),
-                ));
-            }
-        } else if let Some(space) = self.default_space() {
-            if self.vector_size != space.vector_size()
-                || self.distance != space.distance()
-                || self.kind != space.kind()
-                || self.multi_config != space.multi_config()
-            {
-                return Err(VectorSearchError::InvalidConfig(
-                    "single-space fields disagree with the declared default space".to_string(),
-                ));
-            }
-            if space.kind() != VectorKind::Dense && !matches!(self.index, IndexConfig::Flat) {
+        // Index and quantization tiers are legal only for dense spaces:
+        // sparse uses posting + exact and multi uses MaxSim, neither of which
+        // has an ANN graph or a quantization codebook. Validate per space so a
+        // named collection may mix an ANN dense space with an exact sparse one.
+        let ann = !matches!(self.index, IndexConfig::Flat);
+        let quantized = self.quantization_config.is_some();
+        for (name, space) in &self.vectors {
+            if space.kind() != VectorKind::Dense && ann {
                 return Err(VectorSearchError::InvalidConfig(format!(
-                    "{} collections do not support ANN indexes; use IndexConfig::Flat",
+                    "space {name:?} is {} and does not support ANN indexes; use IndexConfig::Flat",
                     space.kind().as_name()
                 )));
             }
-            if space.kind() != VectorKind::Dense && self.quantization_config.is_some() {
+            if space.kind() != VectorKind::Dense && quantized {
                 return Err(VectorSearchError::InvalidConfig(format!(
-                    "{} collections do not support quantization",
+                    "space {name:?} is {} and does not support quantization",
                     space.kind().as_name()
                 )));
+            }
+        }
+        if !self.is_named_layout() {
+            if let Some(space) = self.default_space() {
+                if self.vector_size != space.vector_size()
+                    || self.distance != space.distance()
+                    || self.kind != space.kind()
+                    || self.multi_config != space.multi_config()
+                {
+                    return Err(VectorSearchError::InvalidConfig(
+                        "single-space fields disagree with the declared default space".to_string(),
+                    ));
+                }
             }
         }
         Ok(())
