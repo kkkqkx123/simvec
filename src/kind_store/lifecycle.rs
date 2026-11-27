@@ -6,10 +6,17 @@ use parking_lot::Mutex;
 
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::Metrics;
-use crate::storage::{Wal, WalRecord, WalTxn};
+use crate::storage::point_blobs::{encode_vector, PointBlobs};
+use crate::storage::postings::Postings;
+use crate::storage::{IdMap, Wal, WalRecord, WalTxn};
 use crate::types::{Payload, PointId, VectorData};
 
 use super::{Inner, KindMeta, KindPoint, KindSnapshot, KindSnapshotPoint, KindStore};
+
+/// File holding the append-only point vectors.
+const BLOBS_FILE: &str = "points.bin";
+/// Directory holding the persisted sparse postings.
+const POSTINGS_DIR: &str = "postings";
 
 impl KindStore {
     /// Create a new kind collection directory (`kind.bin` marker + WAL).
@@ -31,7 +38,9 @@ impl KindStore {
         };
         let bytes = postcard::to_stdvec(&meta)?;
         std::fs::write(dir.join("kind.bin"), &bytes)?;
-        let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
+        let blobs = PointBlobs::create(&dir.join(BLOBS_FILE))?;
+        let postings = Postings::open(&dir.join(POSTINGS_DIR), None)?;
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
             name: name.to_string(),
@@ -46,17 +55,29 @@ impl KindStore {
             gate: Mutex::new(()),
             metrics: Metrics::default(),
             snapshot: dir.join("kind_snapshot.bin"),
+            blobs,
+            postings,
         }))
     }
 
-    /// Open an existing kind collection, rebuilding the in-memory state by
-    /// replaying the WAL.
+    /// Open an existing kind collection: map the vector file, load the posting
+    /// dictionary, then replay whatever the snapshot does not cover.
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
         let bytes = std::fs::read(dir.join("kind.bin"))?;
         let meta: KindMeta = postcard::from_bytes(&bytes)?;
-        let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         let snapshot_path = dir.join("kind_snapshot.bin");
         let snapshot = crate::storage::snapshot::read::<KindSnapshot>(&snapshot_path)?;
+        let snapshot_lsn = snapshot.as_ref().map(|snapshot| snapshot.lsn);
+        let blobs = PointBlobs::open(
+            &dir.join(BLOBS_FILE),
+            snapshot.as_ref().map(|snapshot| snapshot.blobs_len),
+        )?;
+        let postings = Postings::open(&dir.join(POSTINGS_DIR), snapshot_lsn)?;
+        // The dictionary is only usable when the same checkpoint wrote the
+        // snapshot; otherwise every live point has to be re-inverted from its
+        // blob (a crash between the two files, or a first-ever open).
+        let rebuild_postings = !postings.was_restored();
         let store = Arc::new(Self {
             dir: dir.to_path_buf(),
             name: meta.collection.clone(),
@@ -71,19 +92,22 @@ impl KindStore {
             gate: Mutex::new(()),
             metrics: Metrics::default(),
             snapshot: snapshot_path,
+            blobs,
+            postings,
         });
-        let after = snapshot.as_ref().map(|snapshot| snapshot.lsn);
         if let Some(snapshot) = snapshot {
-            store.restore_snapshot(snapshot)?;
+            store.restore_snapshot(snapshot, rebuild_postings)?;
         }
-        let next_lsn = store.wal.replay_after(after, |txn| store.replay_txn(txn))?;
-        if next_lsn > after.unwrap_or(0) {
+        let next_lsn = store
+            .wal
+            .replay_after(snapshot_lsn, |txn| store.replay_txn(txn))?;
+        if next_lsn > snapshot_lsn.unwrap_or(0) {
             store.inner.lock().next_lsn = next_lsn.saturating_add(1);
         }
         Ok(store)
     }
 
-    fn restore_snapshot(&self, snapshot: KindSnapshot) -> Result<()> {
+    fn restore_snapshot(&self, snapshot: KindSnapshot, rebuild_postings: bool) -> Result<()> {
         let mut inner = self.inner.lock();
         let capacity = snapshot.points.iter().map(|p| p.slot).max().unwrap_or(0) + 1;
         inner.points.resize(capacity as usize, None);
@@ -93,14 +117,29 @@ impl KindStore {
                 .as_ref()
                 .map(|p| serde_json::from_str(p))
                 .transpose()?;
-            self.validate_data(&point.data)?;
-            if let VectorData::Sparse { indices, values } = &point.data {
-                inner.index_sparse(point.slot, indices, values);
+            // Structural check only: the bytes were validated before they were
+            // logged, and re-validating them fully would decode every vector
+            // this snapshot exists to avoid decoding.
+            {
+                let reader = self.blobs.reader();
+                let view = reader.view(point.blob).ok_or_else(|| {
+                    VectorSearchError::CorruptData(format!(
+                        "snapshot slot {} references a missing vector blob",
+                        point.slot
+                    ))
+                })?;
+                self.check_view(&view)?;
+                if rebuild_postings {
+                    inner.index_view(&self.postings, point.slot, view)?;
+                }
             }
-            inner.reverse.insert(point.id.clone(), point.slot);
+            inner.reverse.insert_str(&point.id, point.slot);
+            if let Some(norm) = point.norm {
+                inner.norms.insert(point.slot, norm);
+            }
             inner.points[point.slot as usize] = Some(KindPoint {
                 id: PointId::from(point.id),
-                data: point.data,
+                blob: point.blob,
                 payload,
             });
             inner.live_count += 1;
@@ -109,11 +148,17 @@ impl KindStore {
         Ok(())
     }
 
-    /// Publish a snapshot of the live state and truncate the covered WAL.
+    /// Publish a snapshot of the live state and drop the WAL it covers.
     ///
     /// The gate blocks writers for the whole snapshot-and-truncate window: a
-    /// commit appended between the two would otherwise exist only in the log
-    /// that is about to be discarded.
+    /// commit appended between the two would otherwise exist only in the
+    /// segments that are about to be unlinked.
+    ///
+    /// Order is data first, metadata last: `points.bin` and the posting
+    /// manifest become durable before the snapshot that references them, and
+    /// the WAL is cut back only once the snapshot is published. A crash in the
+    /// middle costs the posting index (its manifest lsn no longer matches the
+    /// snapshot, so it is rebuilt) but never a committed point.
     pub fn checkpoint(&self) -> Result<()> {
         let _gate = self.gate.lock();
         let inner = self.inner.lock();
@@ -121,8 +166,14 @@ impl KindStore {
     }
 
     pub(super) fn checkpoint_from_locked(&self, inner: &Inner) -> Result<()> {
+        let lsn = inner.next_lsn.saturating_sub(1);
+        self.blobs.sync();
+        // The manifest carries `lsn`: it is the promise that these postings
+        // describe exactly the snapshot written below.
+        self.postings.flush(Some(lsn))?;
         let snapshot = KindSnapshot {
-            lsn: inner.next_lsn.saturating_sub(1),
+            lsn,
+            blobs_len: self.blobs.len(),
             points: inner
                 .points
                 .iter()
@@ -131,22 +182,25 @@ impl KindStore {
                     point.as_ref().map(|point| KindSnapshotPoint {
                         slot: slot as u32,
                         id: point.id.to_string(),
-                        data: point.data.clone(),
+                        blob: point.blob,
                         payload: point
                             .payload
                             .as_ref()
                             .and_then(|p| serde_json::to_string(p).ok()),
+                        norm: inner.norms.get(&(slot as u32)).copied(),
                     })
                 })
                 .collect(),
         };
         crate::storage::snapshot::write(&self.snapshot, &snapshot)?;
-        self.wal.truncate()?;
+        // Everything up to `lsn` is durable in the snapshot, so whole segments
+        // covered by it can be unlinked instead of rewritten.
+        self.wal.truncate_through(lsn)?;
         Ok(())
     }
 
     /// Reclaim tombstoned slots and publish the compacted state. Slot ids are
-    /// renumbered in the snapshot; the old WAL is truncated in the same gate.
+    /// renumbered, so both derived files are rewritten inside the same gate.
     pub fn compact(&self) -> Result<u64> {
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
@@ -154,25 +208,56 @@ impl KindStore {
         if reclaimed == 0 {
             return Ok(0);
         }
-        let mut points = Vec::with_capacity(inner.live_count as usize);
-        let mut reverse = HashMap::with_capacity(inner.live_count as usize);
-        let mut inverted = HashMap::new();
-        let mut norms = HashMap::new();
-        for point in inner.points.drain(..).flatten() {
-            let slot = points.len() as u32;
-            if let VectorData::Sparse { indices, values } = &point.data {
-                for (index, value) in indices.iter().zip(values.iter()) {
-                    inverted.entry(*index).or_insert_with(Vec::new).push((slot, *value));
+
+        // Rewrite the vector file: live points in new slot order, dropping the
+        // bytes of every deleted or overwritten version.
+        let staging = self.dir.join("points.compact");
+        let _ = std::fs::remove_file(&staging);
+        let staging_blobs = PointBlobs::create(&staging)?;
+        let mut points: Vec<Option<KindPoint>> = Vec::with_capacity(inner.live_count as usize);
+        let mut reverse = IdMap::with_capacity(inner.live_count as usize);
+        let mut norms = HashMap::with_capacity(inner.norms.len());
+        let old_norms = std::mem::take(&mut inner.norms);
+        {
+            let reader = self.blobs.reader();
+            for (old_slot, point) in std::mem::take(&mut inner.points).into_iter().enumerate() {
+                let Some(point) = point else { continue };
+                let slot = points.len() as u32;
+                let bytes = reader.bytes(point.blob).ok_or_else(|| {
+                    VectorSearchError::CorruptData(format!(
+                        "point {} references a missing vector blob during compaction",
+                        point.id
+                    ))
+                })?;
+                if let Some(norm) = old_norms.get(&(old_slot as u32)) {
+                    norms.insert(slot, *norm);
                 }
-                let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-                norms.insert(slot, norm);
+                let blob = staging_blobs.append(bytes)?;
+                reverse.insert(&point.id, slot);
+                points.push(Some(KindPoint {
+                    id: point.id,
+                    blob,
+                    payload: point.payload,
+                }));
             }
-            reverse.insert(point.id.to_string(), slot);
-            points.push(Some(point));
         }
+        staging_blobs.sync();
+        self.blobs.replace_from(&staging, staging_blobs.len())?;
+
+        // Rebuild the postings from the new slot ids.
+        self.postings.reset()?;
+        {
+            let reader = self.blobs.reader();
+            for (slot, point) in points.iter().enumerate() {
+                let Some(point) = point else { continue };
+                if let Some(view) = reader.view(point.blob) {
+                    inner.index_view(&self.postings, slot as u32, view)?;
+                }
+            }
+        }
+
         inner.points = points;
         inner.reverse = reverse;
-        inner.inverted = inverted;
         inner.norms = norms;
         self.checkpoint_from_locked(&inner)?;
         Ok(reclaimed)
@@ -191,13 +276,13 @@ impl KindStore {
                     self.apply_upsert(&mut inner, id.clone(), data, payload.clone())?;
                 }
                 WalRecord::Delete { point_id } => {
-                    if let Some(slot) = inner.reverse.get(point_id).copied() {
+                    if let Some(slot) = inner.reverse.get_str(point_id) {
                         inner.tombstone_slot(slot);
                     }
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for point_id in point_ids {
-                        if let Some(slot) = inner.reverse.get(point_id).copied() {
+                        if let Some(slot) = inner.reverse.get_str(point_id) {
                             inner.tombstone_slot(slot);
                         }
                     }
@@ -246,7 +331,7 @@ impl KindStore {
     /// Shape, kind, capacity and payload JSON were checked in
     /// `write::validate_records` before the record was appended to the WAL.
     /// Replay therefore never re-validates and cannot reject a persisted
-    /// transaction; decoding trusted bytes is the only fallible step left.
+    /// transaction; appending the blob is the only fallible step left.
     pub(super) fn apply_upsert(
         &self,
         inner: &mut Inner,
@@ -259,19 +344,20 @@ impl KindStore {
             .map(|p| serde_json::from_str(p))
             .transpose()?;
         // Idempotent overwrite: a replayed or repeated upsert of the same id
-        // replaces the stored point in place (the old slot is tombstoned and
-        // its postings dropped).
-        if let Some(&slot) = inner.reverse.get(&id) {
+        // replaces the stored point (the old slot is tombstoned, leaving its
+        // bytes and postings for compaction to reclaim).
+        if let Some(slot) = inner.reverse.get_str(&id) {
             inner.tombstone_slot(slot);
         }
         let slot = inner.points.len() as u32;
+        let blob = self.blobs.append(&encode_vector(&data))?;
         if let VectorData::Sparse { indices, values } = &data {
-            inner.index_sparse(slot, indices, values);
+            inner.index_sparse(&self.postings, slot, indices, values)?;
         }
-        inner.reverse.insert(id.clone(), slot);
+        inner.reverse.insert_str(&id, slot);
         inner.points.push(Some(KindPoint {
             id: PointId::from(id),
-            data,
+            blob,
             payload,
         }));
         inner.live_count += 1;
@@ -287,5 +373,62 @@ impl KindStore {
             )));
         }
         data.validate(self.dim, self.max_vectors_per_point.max(1))
+    }
+
+    /// Structural validation of a decoded view (snapshot restore). Everything
+    /// that could make a query wrong — kind mismatch, ragged arrays, terms
+    /// beyond the declared bound — is checked here; the array contents were
+    /// validated when the point was written.
+    fn check_view(&self, data: &crate::types::VectorView<'_>) -> Result<()> {
+        use crate::types::VectorView;
+        if data.kind() != self.kind {
+            return Err(VectorSearchError::CorruptData(format!(
+                "collection kind is {}, stored payload kind is {}",
+                self.kind.as_name(),
+                data.kind().as_name()
+            )));
+        }
+        match data {
+            VectorView::Dense(values) => {
+                if values.len() != self.dim {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "stored dense vector has {} values, expected {}",
+                        values.len(),
+                        self.dim
+                    )));
+                }
+            }
+            VectorView::Sparse { indices, values } => {
+                if indices.len() != values.len() {
+                    return Err(VectorSearchError::CorruptData(
+                        "stored sparse vector is ragged".to_string(),
+                    ));
+                }
+                if let Some(&last) = indices.last() {
+                    if last as usize >= self.dim {
+                        return Err(VectorSearchError::CorruptData(format!(
+                            "stored sparse term {last} exceeds the vocabulary bound {}",
+                            self.dim
+                        )));
+                    }
+                }
+            }
+            VectorView::Multi { flat, dim } => {
+                if *dim != self.dim {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "stored multi dimension {dim} differs from the declared {}",
+                        self.dim
+                    )));
+                }
+                let count = flat.len() / (*dim).max(1);
+                let cap = self.max_vectors_per_point.max(1);
+                if count == 0 || count > cap {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "stored multi vector has {count} sub-vectors, limit {cap}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }

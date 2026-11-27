@@ -469,3 +469,123 @@ fn invalid_patch_never_reaches_wal_and_reopen_succeeds() {
     let reopened = LocalVectorEngine::open(dir.path()).unwrap();
     assert_eq!(reopened.count("named").unwrap(), 1);
 }
+
+// Storage layout -----------------------------------------------------------
+
+#[test]
+fn named_restart_loads_the_posting_dictionaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("named");
+    let storage = crate::types::StorageConfig::default();
+    let (blob_bytes, posting_bytes);
+    {
+        let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+        let points: Vec<VectorPoint> = (0..20u32)
+            .map(|i| point(&format!("p{i}"), vec![1.0, 0.0, 0.0, 0.0], (0..32).map(|t| (t, 1.0)).collect()))
+            .collect();
+        store.upsert_batch(&points).unwrap();
+        store.checkpoint().unwrap();
+        (blob_bytes, posting_bytes) = store.storage_bytes();
+        assert!(blob_bytes > 0);
+        assert!(posting_bytes > 0, "sparse spaces must persist their postings");
+        let snapshot = std::fs::metadata(dir.join("named_snapshot.bin"))
+            .unwrap()
+            .len();
+        assert!(
+            snapshot * 2 < blob_bytes,
+            "snapshot ({snapshot} B) must stay below the vector bytes ({blob_bytes} B)"
+        );
+    }
+
+    let reopened = NamedStore::open(&dir, &storage).unwrap();
+    assert!(reopened.postings_restored());
+    assert_eq!(reopened.count(), 20);
+    assert_eq!(reopened.storage_bytes(), (blob_bytes, posting_bytes));
+    // Every point carries term 5, so the page is full (the query asks for 10).
+    let query = named_query("keywords", VectorData::sparse(vec![5], vec![1.0]));
+    assert_eq!(reopened.search(&query).unwrap().len(), 10);
+    let text = named_query("text", VectorData::dense(vec![1.0, 0.0, 0.0, 0.0]));
+    assert_eq!(reopened.search(&text).unwrap().len(), 10);
+}
+
+#[test]
+fn named_patch_reallocates_the_point_and_its_postings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("named");
+    let storage = crate::types::StorageConfig::default();
+    let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+    store
+        .upsert_batch(&[point("p1", vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0), (2, 1.0)])])
+        .unwrap();
+    store.checkpoint().unwrap();
+    store
+        .patch_named(
+            &PointId::from("p1"),
+            BTreeMap::from([(
+                "keywords".to_string(),
+                VectorData::sparse(vec![3], vec![2.0]),
+            )]),
+        )
+        .unwrap();
+
+    // The replaced space's old terms must be gone; a stale posting on a live
+    // slot would surface as a phantom hit.
+    assert!(store
+        .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .search(&named_query("keywords", VectorData::sparse(vec![3], vec![1.0])))
+            .unwrap()
+            .len(),
+        1
+    );
+    // The untouched dense space survives the rewrite.
+    let point = store.get(&PointId::from("p1")).unwrap().unwrap();
+    assert_eq!(point.vectors.len(), 2);
+
+    let reopened = NamedStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.count(), 1);
+    assert!(reopened
+        .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        reopened
+            .search(&named_query("keywords", VectorData::sparse(vec![3], vec![1.0])))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn named_compaction_reclaims_blob_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("named");
+    let storage = crate::types::StorageConfig::default();
+    let store = NamedStore::create(&dir, "named", &spaces(), None, &storage).unwrap();
+    let points: Vec<VectorPoint> = (0..10u32)
+        .map(|i| point(&format!("p{i}"), vec![1.0, 0.0, 0.0, 0.0], vec![(1, 1.0)]))
+        .collect();
+    store.upsert_batch(&points).unwrap();
+    store.checkpoint().unwrap();
+    let before = store.storage_bytes().0;
+    for i in 0..5u32 {
+        store.delete(&PointId::from(format!("p{i}"))).unwrap();
+    }
+    assert_eq!(store.compact().unwrap(), 5);
+    assert!(store.storage_bytes().0 <= before / 2);
+
+    let reopened = NamedStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.count(), 5);
+    assert!(reopened.postings_restored());
+    assert_eq!(
+        reopened
+            .search(&named_query("keywords", VectorData::sparse(vec![1], vec![1.0])))
+            .unwrap()
+            .len(),
+        5
+    );
+}

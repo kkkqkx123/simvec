@@ -1,24 +1,25 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::kind_store::{score_pair as kind_score_pair, sparse_candidate_scores};
+use crate::kind_store::sparse_candidate_scores;
+use crate::storage::postings::Postings;
 use crate::types::DistanceMetric;
 
 /// Score a (query, stored) payload pair within one named space.
 ///
-/// Dense, sparse and multi spaces all share the same scoring implementation;
-/// the crate-wide higher-is-better contract is preserved for every kind.
+/// Dense, sparse and multi spaces share one implementation; the crate-wide
+/// higher-is-better contract is preserved for every kind.
 pub(crate) fn score_pair(
     query: &crate::types::VectorData,
-    stored: &crate::types::VectorData,
+    stored: &crate::types::VectorView<'_>,
     metric: DistanceMetric,
 ) -> f32 {
-    kind_score_pair(query, stored, metric)
+    crate::kind_store::score_view(query, stored, metric)
 }
 
 /// Accumulate sparse candidates directly from one space's posting lists.
 pub(crate) fn sparse_scores(
-    space_index: &HashMap<u32, Vec<(u32, f32)>>,
+    space_index: &Postings,
     norms: &HashMap<u32, f32>,
     indices: &[u32],
     values: &[f32],

@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 
-use crate::error::Result;
-use crate::types::{DistanceMetric, VectorData};
+use crate::error::{Result, VectorSearchError};
+use crate::storage::postings::Postings;
+use crate::types::{DistanceMetric, VectorData, VectorView};
 
-/// Score a (query, stored) payload pair under the collection metric.
-///
-/// Scores follow the crate-wide higher-is-better contract: dot product for
-/// `Dot` and its norm-normalized form for `Cosine`.
-pub(crate) fn score_pair(
+/// Score a query against a stored vector borrowed from the blob file.
+pub(crate) fn score_view(
     query: &VectorData,
-    stored: &VectorData,
+    stored: &VectorView<'_>,
     metric: crate::types::DistanceMetric,
 ) -> f32 {
     match (query, stored) {
@@ -18,13 +16,13 @@ pub(crate) fn score_pair(
                 indices: q_idx,
                 values: q_val,
             },
-            VectorData::Sparse {
+            VectorView::Sparse {
                 indices: d_idx,
                 values: d_val,
             },
         ) => sparse_score(q_idx, q_val, d_idx, d_val, metric),
-        (VectorData::Multi(q), VectorData::Multi(d)) => max_sim(q, d, metric),
-        (VectorData::Dense(q), VectorData::Dense(d)) => dense_similarity(q, d, metric),
+        (VectorData::Multi(q), VectorView::Multi { flat, dim }) => max_sim(q, flat, *dim, metric),
+        (VectorData::Dense(q), VectorView::Dense(d)) => dense_similarity(q, d, metric),
         _ => 0.0,
     }
 }
@@ -36,8 +34,12 @@ pub(crate) fn score_pair(
 /// its verdict cached per slot, so a filter never forces a full scan of live
 /// slots — only slots that actually share a query term are tested. A `None`
 /// accept means no filter and every posting hit is accumulated.
+///
+/// Postings still hold tombstoned slots (removing one entry would rewrite the
+/// record that contains it); those candidates are dropped by the caller, which
+/// is where the live slot table is consulted anyway.
 pub(crate) fn sparse_candidate_scores(
-    inverted: &HashMap<u32, Vec<(u32, f32)>>,
+    postings: &Postings,
     norms: &HashMap<u32, f32>,
     indices: &[u32],
     values: &[f32],
@@ -46,24 +48,34 @@ pub(crate) fn sparse_candidate_scores(
 ) -> Result<Vec<(u32, f32)>> {
     let mut scores: HashMap<u32, f32> = HashMap::new();
     let mut verdicts: HashMap<u32, bool> = HashMap::new();
+    // `visit` cannot propagate an error out of its callback, so the first one
+    // is parked here and re-raised before returning.
+    let mut failure: Option<VectorSearchError> = None;
     for (index, weight) in indices.iter().zip(values.iter()) {
-        if let Some(postings) = inverted.get(index) {
-            for (slot, stored_weight) in postings {
-                if let Some(accept) = accept.as_mut() {
-                    let keep = match verdicts.entry(*slot) {
-                        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            let verdict = accept(*slot)?;
-                            *entry.insert(verdict)
-                        }
-                    };
-                    if !keep {
-                        continue;
-                    }
-                }
-                *scores.entry(*slot).or_default() += *weight * *stored_weight;
+        postings.visit(*index, |slot, stored_weight| {
+            if failure.is_some() {
+                return;
             }
-        }
+            if let Some(accept) = accept.as_mut() {
+                let keep = match verdicts.entry(slot) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => match accept(slot) {
+                        Ok(verdict) => *entry.insert(verdict),
+                        Err(error) => {
+                            failure = Some(error);
+                            return;
+                        }
+                    },
+                };
+                if !keep {
+                    return;
+                }
+            }
+            *scores.entry(slot).or_default() += *weight * stored_weight;
+        });
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     if metric == DistanceMetric::Cosine {
         let query_norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -90,14 +102,8 @@ pub(crate) fn sparse_candidate_scores(
 /// Estimate whether direct posting accumulation is cheaper than a full scan
 /// of live points. Uses only posting length and the live-point count — both
 /// local statistics — so no global term-frequency table is needed.
-pub(crate) fn posting_hits(
-    inverted: &HashMap<u32, Vec<(u32, f32)>>,
-    indices: &[u32],
-) -> usize {
-    indices
-        .iter()
-        .map(|index| inverted.get(index).map_or(0, Vec::len))
-        .sum()
+pub(crate) fn posting_hits(postings: &Postings, indices: &[u32]) -> usize {
+    postings.hits(indices)
 }
 
 /// Keep only the best `offset + limit` entries in score order, leaving the
@@ -170,12 +176,15 @@ fn dense_similarity(query: &[f32], stored: &[f32], metric: crate::types::Distanc
 }
 
 /// Exact MaxSim: for every query sub-vector take the best-matching stored
-/// sub-vector and sum the per-query bests. The metric branch is resolved once
-/// into a score-conversion function pointer rather than re-matched for every
-/// sub-vector pair, and inner dense operations reuse the shared SIMD kernel.
+/// sub-vector and sum the per-query bests. The stored sub-vectors are walked
+/// in place out of the blob mapping — one allocation-free pass per pair set.
+/// The metric branch is resolved once into a score-conversion function pointer
+/// rather than re-matched for every sub-vector pair, and inner dense
+/// operations reuse the shared SIMD kernel.
 fn max_sim(
     query: &crate::types::MultiVector,
-    stored: &crate::types::MultiVector,
+    stored: &[f32],
+    dim: usize,
     metric: crate::types::DistanceMetric,
 ) -> f32 {
     use crate::types::DistanceMetric::{Cosine, Dot, Euclid, Manhattan};
@@ -184,10 +193,11 @@ fn max_sim(
         Cosine => |d| 1.0 - d,
         Euclid | Manhattan => |d| 1.0 / (1.0 + d.sqrt()),
     };
+    let dim = dim.max(1);
     let mut total = 0f32;
     for q in query.vectors() {
         let Some(best) = stored
-            .vectors()
+            .chunks_exact(dim)
             .map(|d| to_score(crate::distance::distance(metric, q, d)))
             .max_by(|a, b| a.total_cmp(b))
         else {

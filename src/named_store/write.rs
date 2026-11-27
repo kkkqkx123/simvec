@@ -118,8 +118,7 @@ impl NamedStore {
         let mut inner = self.inner.lock();
         let slot = inner
             .reverse
-            .get(&point_id.to_string())
-            .copied()
+            .get(point_id)
             .ok_or_else(|| {
                 VectorSearchError::InvalidConfig(format!("point {point_id} not found"))
             })?;
@@ -168,14 +167,14 @@ impl NamedStore {
                     self.apply_patch(inner, id, vectors)?;
                 }
                 WalRecord::Delete { point_id } => {
-                    if let Some(slot) = inner.reverse.get(&point_id).copied() {
-                        inner.tombstone_slot(slot, &self.sparse_space_names());
+                    if let Some(slot) = inner.reverse.get_str(&point_id) {
+                        inner.tombstone_slot(slot);
                     }
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for point_id in point_ids {
-                        if let Some(slot) = inner.reverse.get(&point_id).copied() {
-                            inner.tombstone_slot(slot, &self.sparse_space_names());
+                        if let Some(slot) = inner.reverse.get_str(&point_id) {
+                            inner.tombstone_slot(slot);
                         }
                     }
                 }
@@ -229,8 +228,18 @@ impl NamedStore {
     /// checked here against a simulated live set. Replay of an appended batch
     /// skips these checks: only validated records are ever persisted.
     fn validate_records(&self, inner: &Inner, records: &[WalRecord]) -> Result<()> {
-        let mut present: HashSet<String> = inner.reverse.keys().cloned().collect();
+        let mut present: HashSet<String> = HashSet::new();
+        let mut absent: HashSet<String> = HashSet::new();
         let mut projected_live = inner.live_count;
+        let is_live = |id: &String, present: &HashSet<String>, absent: &HashSet<String>| {
+            if present.contains(id) {
+                true
+            } else if absent.contains(id) {
+                false
+            } else {
+                inner.reverse.contains_str(id)
+            }
+        };
         for record in records {
             match record {
                 WalRecord::UpsertVectors {
@@ -240,7 +249,7 @@ impl NamedStore {
                 } => {
                     self.validate_vectors(vectors)?;
                     validate_payload(payload.as_deref())?;
-                    if !present.contains(id) {
+                    if !is_live(id, &present, &absent) {
                         if let Some(cap) = self.max_points {
                             if projected_live >= cap {
                                 return Err(VectorSearchError::CapacityExceeded {
@@ -251,25 +260,30 @@ impl NamedStore {
                             }
                         }
                         present.insert(id.clone());
+                        absent.remove(id);
                         projected_live = projected_live.saturating_add(1);
                     }
                 }
                 WalRecord::PatchNamedVectors { id, vectors } => {
                     self.validate_patch(vectors)?;
-                    if !present.contains(id) {
+                    if !is_live(id, &present, &absent) {
                         return Err(VectorSearchError::InvalidConfig(format!(
                             "patch targets missing point {id}"
                         )));
                     }
                 }
                 WalRecord::Delete { point_id } => {
-                    if present.remove(point_id) {
+                    if is_live(point_id, &present, &absent) {
+                        present.remove(point_id);
+                        absent.insert(point_id.clone());
                         projected_live = projected_live.saturating_sub(1);
                     }
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for point_id in point_ids {
-                        if present.remove(point_id) {
+                        if is_live(point_id, &present, &absent) {
+                            present.remove(point_id);
+                            absent.insert(point_id.clone());
                             projected_live = projected_live.saturating_sub(1);
                         }
                     }

@@ -6,7 +6,7 @@
 //! - `keys.bin`     slot -> point id directory
 //! - `tombstones.bin` slot -> deleted flag (survives WAL truncation)
 //! - `payloads_store/` block-based payload storage (tracker + pages)
-//! - `wal.bin`      append-only transaction log (crash recovery)
+//! - `wal/`         segmented append-only transaction log (crash recovery)
 //!
 //! Readers snapshot the mmap-backed `ArcSwap` views and scan without the
 //! store lock. Mutations go through the commit queue
@@ -34,6 +34,8 @@ mod keys;
 mod meta;
 mod payload_index;
 mod payload_key;
+pub(crate) mod point_blobs;
+pub(crate) mod postings;
 pub(crate) mod payload_store;
 pub(crate) mod quant;
 mod queue;
@@ -62,7 +64,7 @@ pub(crate) use meta::Meta;
 pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
 pub(crate) use tombstones::TombstoneBits;
-pub use wal::{Wal, WalPoint, WalRecord, WalTxn};
+pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 
 use self::filter_bitmap::FilterBitmap;
 use self::index_lifecycle::PublishedIndex;
@@ -88,21 +90,41 @@ use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 /// against 48-56 for the enum) and confines the owned `String` allocation to
 /// ids that really are uuids.
 #[derive(Debug, Default)]
-struct IdMap {
+pub(crate) struct IdMap {
     numeric: HashMap<u64, u32>,
     uuid: HashMap<String, u32>,
 }
 
 impl IdMap {
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             numeric: HashMap::with_capacity(capacity),
             uuid: HashMap::new(),
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.numeric.len() + self.uuid.len()
+    }
+
+    /// Slot holding a point id that arrived as a string (WAL records and
+    /// snapshots carry ids as text). Numeric ids are parsed, never allocated.
+    pub(crate) fn get_str(&self, id: &str) -> Option<u32> {
+        match id.parse::<u64>() {
+            Ok(number) => self.numeric.get(&number).copied(),
+            Err(_) => self.uuid.get(id).copied(),
+        }
+    }
+
+    pub(crate) fn insert_str(&mut self, id: &str, slot: u32) -> Option<u32> {
+        match id.parse::<u64>() {
+            Ok(number) => self.numeric.insert(number, slot),
+            Err(_) => self.uuid.insert(id.to_string(), slot),
+        }
+    }
+
+    pub(crate) fn contains_str(&self, id: &str) -> bool {
+        self.get_str(id).is_some()
     }
 
     /// Slot holding `id`.
@@ -110,33 +132,33 @@ impl IdMap {
     /// Takes the id by reference: the enum-keyed map had to hash the whole
     /// 32-byte key (padding included) on every lookup, while this hashes a
     /// `u64` for the numeric case and reuses the caller's string otherwise.
-    fn get(&self, id: &PointId) -> Option<u32> {
+    pub(crate) fn get(&self, id: &PointId) -> Option<u32> {
         match id {
             PointId::Num(n) => self.numeric.get(n).copied(),
             PointId::Uuid(u) => self.uuid.get(u.as_str()).copied(),
         }
     }
 
-    fn contains_key(&self, id: &PointId) -> bool {
+    pub(crate) fn contains_key(&self, id: &PointId) -> bool {
         self.get(id).is_some()
     }
 
     /// Record `id -> slot`, returning the slot it replaced.
-    fn insert(&mut self, id: &PointId, slot: u32) -> Option<u32> {
+    pub(crate) fn insert(&mut self, id: &PointId, slot: u32) -> Option<u32> {
         match id {
             PointId::Num(n) => self.numeric.insert(*n, slot),
             PointId::Uuid(u) => self.uuid.insert(u.clone(), slot),
         }
     }
 
-    fn remove(&mut self, id: &PointId) -> Option<u32> {
+    pub(crate) fn remove(&mut self, id: &PointId) -> Option<u32> {
         match id {
             PointId::Num(n) => self.numeric.remove(n),
             PointId::Uuid(u) => self.uuid.remove(u.as_str()),
         }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.numeric.clear();
         self.uuid.clear();
     }

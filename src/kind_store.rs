@@ -6,16 +6,24 @@
 //! is variable length and neither kind uses ANN indexes or quantization.
 //! This module hosts a self-contained exact-scan engine for those kinds:
 //!
-//! - in-memory slot table with id -> slot directory;
-//! - inverted postings per sparse term for candidate collection;
+//! - slot table with an id -> slot directory ([`IdMap`], split by id type);
+//! - point vectors in an append-only mmap blob file ([`PointBlobs`]), so a
+//!   reopen maps the data instead of deserializing it;
+//! - sparse postings in persisted bucket files ([`Postings`]), so a reopen
+//!   loads a term dictionary instead of rebuilding the inverted index;
 //! - weighted dot / Euclid / Manhattan scoring for Sparse and exact MaxSim
-//!   for Multi;
-//! - WAL-backed durability by replaying the shared `wal.bin` record format
+//!   for Multi, straight out of the mappings;
+//! - WAL-backed durability by replaying the shared `wal/` record format
 //!   (`WalRecord::UpsertVectors` carries the named payload map).
 //!
-//! The store is a reference implementation on purpose: it keeps every live
-//! point in memory and rebuilds by full WAL replay, mirroring the memory
-//! backend's role in `vector-contracts`.
+//! What stays on the heap is the *directory* — slot -> (blob handle, payload)
+//! plus the sparse term dictionary and norm cache — not the vectors. Only the
+//! postings written since the last checkpoint are staged in memory.
+//!
+//! Nothing in the read path may assume a blob or a posting is unique to a live
+//! slot: deleting or overwriting a point only unlinks the bytes, and
+//! compaction is what rewrites the files. Queries filter tombstoned slots,
+//! which is also what makes stale postings harmless.
 
 #[cfg(test)]
 #[path = "kind_store_tests.rs"]
@@ -27,8 +35,10 @@ use std::path::PathBuf;
 use parking_lot::Mutex;
 
 use crate::metrics::Metrics;
-use crate::storage::Wal;
-use crate::types::{Payload, PointId, StorageConfig, VectorData, VectorKind};
+use crate::storage::point_blobs::{BlobRef, PointBlobs};
+use crate::storage::postings::Postings;
+use crate::storage::{IdMap, Wal};
+use crate::types::{Payload, PointId, StorageConfig, VectorKind};
 
 mod lifecycle;
 mod read;
@@ -37,7 +47,7 @@ mod state;
 mod write;
 
 pub(crate) use self::score::posting_hits;
-pub(crate) use self::score::score_pair;
+pub(crate) use self::score::score_view;
 pub(crate) use self::score::sparse_candidate_scores;
 pub(crate) use self::score::truncate_topk;
 pub use self::write::kind_upsert_record;
@@ -46,7 +56,8 @@ pub use self::write::kind_upsert_record;
 #[derive(Debug, Clone)]
 struct KindPoint {
     id: PointId,
-    data: VectorData,
+    /// Handle to the vector bytes in `points.bin`.
+    blob: BlobRef,
     payload: Option<Payload>,
 }
 
@@ -56,11 +67,10 @@ struct Inner {
     /// Slot-indexed live points; `None` marks a tombstoned slot.
     points: Vec<Option<KindPoint>>,
     /// Point id -> live slot directory.
-    reverse: HashMap<String, u32>,
-    /// Sparse-only inverted index: term -> (slot, weight) postings. Empty for
-    /// Multi collections.
-    inverted: HashMap<u32, Vec<(u32, f32)>>,
-    /// Cached L2 norm of each live sparse vector, indexed by slot.
+    reverse: IdMap,
+    /// Cached L2 norm of each live sparse vector, indexed by slot. One `f32`
+    /// per sparse slot, restored from the snapshot so scoring never has to
+    /// read a blob at open.
     norms: HashMap<u32, f32>,
     next_lsn: u64,
     live_count: u64,
@@ -88,6 +98,10 @@ pub struct KindStore {
     metrics: Metrics,
     /// Snapshot path; the WAL is replayed on top of this derived state.
     snapshot: PathBuf,
+    /// Append-only vector bytes (`points.bin`).
+    blobs: PointBlobs,
+    /// Persisted sparse postings (`postings/`).
+    postings: Postings,
 }
 
 impl std::fmt::Debug for KindStore {
@@ -101,18 +115,25 @@ impl std::fmt::Debug for KindStore {
 }
 
 /// Checkpointed live point. Slot ids stay stable across snapshots so the
-/// slot-addressed payload records in the WAL remain valid.
+/// slot-addressed payload records in the WAL remain valid; the vector itself
+/// is referenced (`blob`), never inlined.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct KindSnapshotPoint {
     slot: u32,
     id: String,
-    data: VectorData,
+    blob: BlobRef,
     payload: Option<String>,
+    /// Sparse L2 norm, so a reopen needs no blob reads to score.
+    #[serde(default)]
+    norm: Option<f32>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct KindSnapshot {
     lsn: u64,
+    /// Length of `points.bin` this snapshot describes; `PointBlobs::open`
+    /// drops anything beyond it.
+    blobs_len: u64,
     points: Vec<KindSnapshotPoint>,
 }
 

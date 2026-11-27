@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use simvec::storage::CollectionStore;
-use simvec::storage::{Wal, WalRecord, WalTxn};
+use simvec::storage::{Wal, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 use simvec::types::{CollectionConfig, DistanceMetric, PointId, VectorPoint};
 
 fn config(dim: usize) -> CollectionConfig {
@@ -102,7 +102,7 @@ fn test_wal_written_memory_not_applied_recovers() {
 
     // Simulate a crash between "WAL fsync" and "apply to memory": append
     // transactions directly to wal.bin, bypassing the in-memory apply.
-    let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+    let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
     wal.append(&WalTxn {
         txn_id: 1,
         ops: vec![WalRecord::Upsert {
@@ -174,7 +174,7 @@ fn test_apply_txn_rejects_invalid_before_wal_append() {
     ));
     // Nothing was logged or applied.
     assert_eq!(store.count(), 0);
-    let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+    let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
     let last = wal.replay(|_| Ok(())).unwrap();
     assert_eq!(last, 0);
 }
@@ -271,7 +271,7 @@ fn test_compact_checkpoint_truncates_wal() {
     }
     store.compact().unwrap();
     // A compaction checkpoint truncates the WAL.
-    let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+    let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
     let last = wal.replay(|_| Ok(())).unwrap();
     assert_eq!(last, 0, "WAL must be empty after compaction");
     assert_eq!(store.count(), 4);
@@ -358,4 +358,62 @@ fn compaction_under_concurrent_writes_stays_consistent() {
     drop(store);
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(reopened.count(), expected.len() as u64);
+}
+
+/// The log is a directory of segments: a tiny segment budget must produce
+/// several segment files, and a checkpoint must drop every one of them in
+/// whole-file `unlink`s rather than truncating one ever-growing file.
+#[test]
+fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
+    use simvec::types::StorageConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+    let storage = StorageConfig {
+        // One upsert record is a few dozen bytes; this forces a segment every
+        // handful of transactions.
+        wal_segment_bytes: 256,
+        wal_checkpoint_bytes: 64 * 1024 * 1024,
+        ..StorageConfig::default()
+    };
+    let store = CollectionStore::create_with_storage(&store_dir, "col", &config(4), &storage)
+        .expect("create");
+
+    let wal_dir = store_dir.join("wal");
+    for id in 0..24u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    let segments = store.wal().segment_names();
+    assert!(
+        segments.len() > 1,
+        "the log must roll over, got {segments:?}"
+    );
+    assert!(
+        store.wal().appended_bytes() > storage.wal_segment_bytes,
+        "several segments must be on disk before the checkpoint"
+    );
+    let files_before = std::fs::read_dir(&wal_dir).unwrap().count();
+    assert_eq!(files_before, segments.len());
+
+    store.checkpoint().unwrap();
+
+    assert_eq!(
+        store.wal().segment_names(),
+        Vec::<u64>::new(),
+        "a checkpoint covering the whole log leaves no segment behind"
+    );
+    assert_eq!(store.wal().appended_bytes(), 0);
+    assert_eq!(
+        std::fs::read_dir(&wal_dir).unwrap().count(),
+        0,
+        "segments are unlinked, not truncated in place"
+    );
+
+    // Appending after the wipe starts a fresh segment and replays cleanly.
+    upsert_logged(&store, &point(100, 4));
+    assert_eq!(store.wal().segment_names(), vec![25]);
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 25);
+    assert!(reopened.get(&PointId::Num(100)).unwrap().is_some());
 }

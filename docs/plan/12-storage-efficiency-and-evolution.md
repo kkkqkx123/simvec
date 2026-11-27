@@ -17,8 +17,8 @@
 | P1-6 | `reverse` 用 `HashMap<PointId, u32>`，1M 点约 50-70 MB | 拆成 `HashMap<u64, u32>` + `HashMap<String, u32>`，约 20 B/点 | 已实施 |
 | P2-1 | 压实后立即丢弃已发布索引，ANN 退回精确扫描 | 压实把索引按槽位映射重编号并重新发布，不再重建 | 已实施 |
 | P2-2 | `rec_size` 是编译期常量而非文件头字段 | `keys.bin` 头写入 `rec_size`，读取端以文件为准 | 已实施 |
-| P2-3 | `kind`/`named` 的倒排不落盘，重启靠全量快照 + WAL | 分阶段方案（见文末），本轮不实施 | 设计完成 |
-| P2-4 | WAL 单文件不分段，每条 upsert 内联完整向量与 payload | 分阶段方案（见文末），本轮不实施 | 设计完成 |
+| P2-3 | `kind`/`named` 的倒排不落盘，重启靠全量快照 + WAL | `points.bin` 追加式 mmap blob + `postings/` 桶文件倒排 + 快照瘦身为目录 | 已实施（见 [13](13-p2-3-p2-4-implementation.md)） |
+| P2-4 | WAL 单文件不分段，每条 upsert 内联完整向量与 payload | `wal/` 分段 + checkpoint 按水位整段 unlink（第 1、2 步；第 3 步向量外置未做） | 已实施（见 [13](13-p2-3-p2-4-implementation.md)） |
 
 ---
 
@@ -207,9 +207,11 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 
 ---
 
-## P2-3（本轮只设计）：`kind` / `named` 的倒排落盘
+## P2-3：`kind` / `named` 的倒排落盘
 
-### 现状
+> 已实施。本节保留当初的设计意图与取舍理由；实际布局、不变式与和下述方案的差异见 [`13-p2-3-p2-4-implementation.md`](13-p2-3-p2-4-implementation.md)。
+
+### 现状（实施前）
 
 两种非 dense 集合的状态是"全量快照 + WAL 回放"：
 
@@ -224,7 +226,24 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 2. **快照瘦身为"目录 + 元数据"**：`kind_snapshot.bin` 只保留 `slot → id` 与 `slot → 向量指针`（进入 `vectors.bin` 风格的分段 mmap），点向量本身搬进 mmap 文件，去掉 postcard 全量反序列化。
 3. **`reverse` 与 `inverted` 的键改成 `PointId` / `u32`**，消掉 `point_id.to_string()` 的每次查询分配（与 P1-6 同一手法）。
 
-不做第 2 步而只做第 1 步收益有限（快照仍是全量），只做第 2 步则倒排仍要重建，所以两步必须同批做——这也是本轮不拆分实施的原因：它是"换存储模型"，不是"改一个模块"。
+不做第 2 步而只做第 1 步收益有限（快照仍是全量），只做第 2 步则倒排仍要重建，所以两步必须同批做——这也是当初不拆分实施的原因：它是"换存储模型"，不是"改一个模块"。
+
+### 落地结果
+
+三步同批落地，落地点与实现细节见 [`13-p2-3-p2-4-implementation.md`](13-p2-3-p2-4-implementation.md)。与上面方案的差异只有三处，都是为了"追加写不保序"这个物理事实：
+
+| 上面写的 | 实际做的 | 原因 |
+|---|---|---|
+| `postings/<dim_bucket>.bin`，每 term 一条排序记录、查询二分 | `postings/<bucket>.bin`，`bucket = term >> 10`，每 term 一条或多条 `Chain{off, count}` 链，查询顺着链读 | 追加写无法维持全局有序，二分需要重写文件 |
+| 向量"进入 `vectors.bin` 风格的分段 mmap" | 新建 `points.bin`（4 字节对齐、12 字节头、4 MiB 分块预分配），`VectorView<'a>` 零拷贝借用 | `vectors.bin` 是 dense 的定长槽位文件，装不了稀疏/多向量/payload |
+| `reverse` 键改成 `PointId` / `u32` | 复用 P1-6 的 `IdMap`（`HashMap<u64,u32>` + `HashMap<String,u32>`） | 同一手法，不重复造 |
+
+保留的部分：快照只存 `{slot, id, blob, payload, norm}` 目录 + `blobs_len`，**向量**全部搬进 `points.bin`（payload 仍是快照里的 JSON 字符串，理由见 13 的"未做与理由"）；`inverted` 从内存 `HashMap` 变成 mmap 上的桶文件，checkpoint 从"重写全部"变成"flush 脏桶"。
+
+新增两条契约（12 原文没有）：
+
+- **lsn 一致性**：`postings/manifest.bin` 里的 `lsn` 必须等于快照的 `lsn` 才复用倒排，否则整目录丢弃重建。这把"倒排落后于快照"变成"倒排直接作废"，不需要增量补齐。
+- **崩溃安全**：checkpoint 的写入顺序固定为 `blobs.sync() → postings.flush(lsn) → snapshot::write → wal.truncate_through(lsn)`，任一步崩溃都只会重放出重复的 posting（幂等合并），不会丢。
 
 ### 触发条件
 
@@ -233,9 +252,11 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 
 ---
 
-## P2-4（本轮只设计）：WAL 分段
+## P2-4：WAL 分段
 
-### 现状
+> 第 1、2 步已实施；第 3 步（向量外置）仍未做，理由见下。段布局、水位判定与崩溃窗口表见 [`13-p2-3-p2-4-implementation.md`](13-p2-3-p2-4-implementation.md)。
+
+### 现状（实施前）
 
 单文件 `wal.bin`，`truncate()` 是 `set_len(0)`；每条 `Upsert` 内联完整向量（`Vec<f32>`）与 JSON payload，所以日志体积 ≈ 数据体积 × 写入次数。1M 点、768 维的一次全量导入，仅向量就是 3 GB 日志。
 
@@ -245,7 +266,22 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 2. **水位截断（依赖第 1 步）**：checkpoint 记录"已落盘到的 lsn"，只删除 `last_lsn < 水位` 的整段，前缀截断从此是删文件而不是重写文件——这正是 P1-3 想进一步缩短"停写窗口"的前提。
 3. **向量外置**：`vectors.bin` 的写入改为"先 pwrite 再 fsync，再写 WAL 记录（只含 slot 与长度）"。这会改变耐久性契约（WAL 不再是唯一权威），必须与 2 的水位语义一起设计，否则会出现"WAL 说没写、文件说有"的歧义。
 
-第 1 步独立可用且低风险；第 2、3 步会动"WAL 是唯一权威"这条核心不变式，需要单独的等价性测试（崩溃点注入）。本轮不做。
+第 1 步独立可用且低风险；第 2、3 步会动"WAL 是唯一权威"这条核心不变式，需要单独的等价性测试（崩溃点注入）。落地时第 2 步随 P2-3 一起做了——快照 lsn 给了水位一个明确来源，删除判定因此不需要额外的水位文件；第 3 步仍不做。
+
+### 落地结果
+
+| 步骤 | 状态 | 落地点 / 备注 |
+|---|---|---|
+| 1 分段 | 已实施 | `src/storage/wal.rs`：段目录 `wal/<20 位 lsn>.bin`、批次不跨段、`WalState{segments, active, active_last_lsn}`；段容量走 `StorageConfig::wal_segment_bytes`（默认 `DEFAULT_SEGMENT_BYTES = 64 MiB`） |
+| 2 水位截断 | 已实施 | `truncate_through(watermark)`：只 `unlink` 全部事务都 ≤ 水位的段（非尾段看"下一段名 − 1"，尾段看 `active_last_lsn`），跨界段原样保留；`truncate()` 退化为"全删"（丢集合 / 压实用） |
+| 3 向量外置 | **未做** | 会打破"WAL 是唯一权威"，需要崩溃点注入的等价性测试；`kind`/`named` 落盘的 `points.bin` 因此是**派生数据**——回放时按 `WalRecord` 重新 append，不由 WAL 引用 |
+
+两条在落地时才明确下来的细节（原方案没写）：
+
+- **尾段容错边界**：只有最后一段允许"末尾半条记录"（写入被打断），静默截断；非尾段的任何损坏报 `CorruptData`，不再假设"损坏=可以忽略"。这避免了早期实现里"中间段坏掉被跳过、数据静默丢失"的漏洞。
+- **段名即首条 lsn**：删除判定只看段名与段内最后一条 lsn，不需要读段内容，所以截断是 O(段数) 的元数据操作。
+
+测试：`src/storage/wal.rs` 内 4 个单测（滚动、跨段读、尾段半条记录、非尾段损坏报错）+ `tests/storage_test.rs::wal_segments_roll_over_and_a_checkpoint_unlinks_them`。
 
 ### 触发条件
 
@@ -274,8 +310,8 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 | P1-6 | `storage.rs`：`IdMap`；`store_open.rs` / `store_read.rs` / `store_write.rs` / `store_payload.rs` / `compaction.rs` 调用点 |
 | P2-1 | `index/persist.rs`：`PersistedHnsw::remap` / `PersistedIvf::remap`；`hnsw/maintain.rs`：`covers_all()`；`compaction.rs`：`remap_published_index()` + pending 重编号 |
 | P2-2 | `directory.rs`：32 B 头部 + `rec_size` 字段 + `DirView::rec_size()`（仅测试用观察口）；`keys.rs` / `compaction.rs` 跟进 |
-| P2-3 | 仅设计（见上） |
-| P2-4 | 仅设计（见上） |
+| P2-3 | `storage/point_blobs.rs`（`points.bin` 追加式 mmap blob + `VectorView` 零拷贝读取）；`storage/postings.rs`（`postings/` 桶文件 + manifest）；`kind_store/*`、`named_store/*` 的快照瘦身与重建路径 |
+| P2-4 | `storage/wal.rs` 重写为段目录（`open_or_create` / `truncate_through` / 尾段容错）；`types/config/storage.rs` 的 `wal_segment_bytes`；`store_open.rs` / `store_maintenance.rs` / `*_store/lifecycle.rs` 的 checkpoint 跟进 |
 
 ## 回归测试
 
@@ -295,6 +331,12 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 | `tests/hnsw_test.rs` | `compacted_index_survives_restart` | 压实后 `has_index` 为真、`built_at_live_count == points_count`、重开后从 `hnsw.bin` 命中且被删点不返回 |
 | `tests/ivf_test.rs` | `compaction_remaps_the_published_index` | 压实后 IVF 仍在发布状态、`built_at_live_count == 38`、重开后命中 |
 | `tests/filter_bitmap_test.rs` | `high_cardinality_field_still_filters_correctly` | 高基数字段降级后 `search` / `count_by_filter` 仍精确（400 点 400 个不同值） |
+| `storage/wal.rs` | `test_segments_roll_over_and_replay_in_order` / `test_truncate_through_removes_only_covered_segments` / `test_truncate_through_drops_the_tail_when_fully_covered` / `test_corrupt_middle_segment_is_reported` | 滚动写入后段数 > 1 且跨段回放顺序正确；水位截断只删已覆盖段、尾段全被覆盖时连尾段一起删；非尾段损坏报 `CorruptData` |
+| `storage/point_blobs.rs` | `vectors_round_trip_through_the_blob_encoding` / `named_entries_round_trip_and_patch` / `appends_are_addressable_and_aligned` / `truncated_encodings_are_rejected` / `a_long_file_is_truncated_to_the_snapshot_length` / `a_short_file_is_reported_as_corruption` / `growth_is_transparent_across_chunks` | 三种向量形状与 named payload 编解码一致；追加地址 4 字节对齐；`rewrite_named` 合并后旧条目不可见；重开按快照的 `blobs_len` 截取，文件偏短报 `CorruptData`；跨 4 MiB 分块增长透明 |
+| `storage/postings.rs` | `a_checkpointed_index_reopens_without_rebuilding` / `a_stale_manifest_discards_the_postings` / `a_corrupt_manifest_makes_open_start_empty` / `pending_postings_are_visible_before_a_flush` / `a_soft_flush_keeps_the_last_checkpoint_as_the_durable_point` / `terms_are_spread_over_buckets` / `repeated_flushes_collapse_into_one_record_per_term` / `reset_removes_every_bucket` | 重启后 `was_restored()` 为真且命中与写前一致；`manifest.lsn` 落后或损坏则从空开始；未 flush 的 posting 立即可查但 `flush(None)` 不推进落盘水位；同 term 重复 flush 合并为一条记录 |
+| `kind_store_tests.rs` | `kind_restart_loads_the_posting_dictionary` / `kind_stale_posting_manifest_is_rebuilt` / `kind_deleted_points_leave_no_phantom_hits` / `kind_compaction_rewrites_blobs_and_postings` / `kind_payload_edits_survive_a_restart_without_touching_vectors` | 重启后 `postings_restored()` 为真；manifest 落后时重建；删除点不留幻影 posting；压实后 `storage_bytes()` 变小且查询不变 |
+| `named_store_tests.rs` | `named_restart_loads_the_posting_dictionaries` / `named_patch_reallocates_the_point_and_its_postings` / `named_compaction_reclaims_blob_bytes` | 每个稀疏空间各自一份字典；patch 后旧槽墓碑、新槽重建；压实回收 blob 字节 |
+| `tests/storage_test.rs` | `wal_segments_roll_over_and_a_checkpoint_unlinks_them` | 小段容量下写入滚动出多段，checkpoint 后只剩活动段 |
 
 两条旧断言按新契约改写（它们编码的正是本轮要消除的行为）：
 
@@ -303,7 +345,7 @@ PersistedIvf::remap(map)   —— slot_list 按 map 重排、截到 live 长度�
 
 ## 验收
 
-- `cargo test --all-targets --features c_api`：**317 个单元测试 + 13 个集成目标（88 条）全部通过**。
+- `cargo test --all-targets --features c_api`：**344 个单元测试 + 13 个集成目标（89 条）全部通过，0 warning**。（P2-3/P2-4 落地前为 317 + 88。）
 - 1M 容量、单字段 4 万取值：位图预算生效，字段降级后常驻归零，查询仍精确。
 - checkpoint 阶段 1 不持写锁（用例直接断言），读路径不再被 flush 阻塞。
 - 压实一次后 `has_index()` 仍为 `true`，`built_at_live_count` 等于压实后 live 数，重开后 `hnsw.bin` / `index.bin` 直接加载。

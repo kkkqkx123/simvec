@@ -86,12 +86,16 @@ impl CollectionStore {
         let inner = self.inner.write();
         inner.meta.save(&self.dir)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
-        // Marker first (this append itself fsyncs the log), then truncate.
+        // Marker first (this append itself fsyncs the log), then truncate
+        // through the water mark: every segment covered by `meta.bin` is
+        // unlinked, and only transactions newer than it would survive (there
+        // are none — the queue gate is closed for the whole call).
+        let watermark = inner.meta.last_applied_txn;
         self.wal.append(&WalTxn {
-            txn_id: inner.meta.last_applied_txn,
+            txn_id: watermark,
             ops: vec![WalRecord::Compact],
         })?;
-        self.wal.truncate()?;
+        self.wal.truncate_through(watermark)?;
         drop(inner);
         self.metrics.record_checkpoint(started.elapsed());
         tracing::debug!(

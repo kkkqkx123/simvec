@@ -13,6 +13,10 @@ use crate::error::{Result, VectorSearchError};
 pub struct StorageConfig {
     /// WAL bytes after which a background checkpoint runs.
     pub wal_checkpoint_bytes: u64,
+    /// Bytes after which the WAL rolls over to a new segment file. Segments
+    /// bound the amount of log a watermark truncation can drop at once and
+    /// keep a single file from growing without bound between checkpoints.
+    pub wal_segment_bytes: u64,
     /// Tombstone ratio that triggers physical reclamation.
     pub compaction_threshold: f64,
     /// Transactions between `meta.bin` saves.
@@ -27,6 +31,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             wal_checkpoint_bytes: 64 * 1024 * 1024,
+            wal_segment_bytes: crate::storage::DEFAULT_SEGMENT_BYTES,
             compaction_threshold: 0.20,
             meta_save_interval: 64,
             payload_block_size: 128,
@@ -52,6 +57,11 @@ impl StorageConfig {
         if self.meta_save_interval == 0 {
             return Err(VectorSearchError::InvalidConfig(
                 "meta_save_interval must be >= 1".to_string(),
+            ));
+        }
+        if self.wal_segment_bytes == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "wal_segment_bytes must be >= 1".to_string(),
             ));
         }
         if self.payload_block_size == 0 {

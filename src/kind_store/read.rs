@@ -8,7 +8,9 @@ use crate::types::{
     PointId, SearchQuery, SearchResult, VectorData, VectorFilter, VectorKind, VectorPoint,
 };
 
-use super::{posting_hits, score_pair, sparse_candidate_scores, truncate_topk, KindStore};
+use super::{
+    posting_hits, score_view, sparse_candidate_scores, truncate_topk, KindStore,
+};
 
 impl KindStore {
     /// Collection kind served by this store.
@@ -57,15 +59,29 @@ impl KindStore {
         &self.metrics
     }
 
-    /// Approximate in-memory payload size of the live points.
+    /// Whether the posting dictionary came from disk at open. `false` means it
+    /// was rebuilt from the snapshot because the manifest did not match it —
+    /// the state a crash between the manifest write and the snapshot leaves.
+    pub fn postings_restored(&self) -> bool {
+        self.postings.was_restored()
+    }
+
+    /// (bytes of the vector blob file, bytes of the posting buckets). Both are
+    /// on disk and mapped, not resident.
+    pub fn storage_bytes(&self) -> (u64, u64) {
+        (self.blobs.len(), self.postings.disk_bytes())
+    }
+
+    /// Approximate resident size of the live points: the directory, the term
+    /// dictionary and the pending posting window. The vectors themselves live
+    /// in the mapped blob file.
     pub fn memory_bytes(&self) -> u64 {
         let inner = self.inner.lock();
-        inner
-            .points
-            .iter()
-            .flatten()
-            .map(|point| vector_data_bytes(&point.data) as u64)
-            .sum()
+        let directory = inner.points.capacity() as u64
+            * std::mem::size_of::<Option<super::KindPoint>>() as u64;
+        let norms = (inner.norms.capacity() as u64) * (std::mem::size_of::<(u32, f32)>() as u64);
+        let postings = self.postings.memory_bytes();
+        directory + norms + postings + self.blobs.mapped_bytes()
     }
 
     /// Number of live points matching `filter`. Pure read.
@@ -134,11 +150,11 @@ impl KindStore {
         let mut candidates: Vec<(u32, f32)> = Vec::new();
         let mut full_scan = false;
         if let VectorData::Sparse { indices, values } = &owned {
-            let hits = posting_hits(&inner.inverted, indices);
+            let hits = posting_hits(&self.postings, indices);
             full_scan = hits > inner.live_count.saturating_mul(2) as usize;
             if !full_scan {
                 candidates = sparse_candidate_scores(
-                    &inner.inverted,
+                    &self.postings,
                     &inner.norms,
                     indices,
                     values,
@@ -154,6 +170,8 @@ impl KindStore {
                 .collect();
         }
 
+        // One borrow of the blob mapping for the whole scoring pass.
+        let reader = self.blobs.reader();
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
             if !accept(slot)? {
@@ -162,12 +180,13 @@ impl KindStore {
             let Some(point) = inner.points[slot as usize].as_ref() else {
                 continue;
             };
+            let Some(view) = reader.view(point.blob) else {
+                continue;
+            };
             let score = match &owned {
-                VectorData::Sparse { .. } if full_scan => {
-                    score_pair(&owned, &point.data, self.distance)
-                }
+                VectorData::Sparse { .. } if full_scan => score_view(&owned, &view, self.distance),
                 VectorData::Sparse { .. } => sparse_score,
-                _ => score_pair(&owned, &point.data, self.distance),
+                _ => score_view(&owned, &view, self.distance),
             };
             // Online threshold pruning: a candidate below the bound never
             // enters the TopK selection, reducing work before the sort.
@@ -200,11 +219,13 @@ impl KindStore {
                     }
                 }
                 if with_vector {
-                    result = result.with_data(point.data.clone());
+                    let data = reader.to_data(point.blob)?;
+                    result = result.with_data(data);
                 }
                 Some(result)
             })
             .collect();
+        drop(reader);
         self.metrics.record_search(
             crate::metrics::SearchPath::Exact,
             query.filter.is_some(),
@@ -216,15 +237,20 @@ impl KindStore {
     /// Fetch a point by id.
     pub fn get(&self, point_id: &PointId) -> Result<Option<VectorPoint>> {
         let inner = self.inner.lock();
-        let Some(&slot) = inner.reverse.get(&point_id.to_string()) else {
+        let Some(slot) = inner.reverse.get(point_id) else {
             return Ok(None);
         };
-        Ok(inner.points[slot as usize].as_ref().map(|point| VectorPoint {
+        let Some(point) = inner.points[slot as usize].as_ref() else {
+            return Ok(None);
+        };
+        let reader = self.blobs.reader();
+        let Some(data) = reader.to_data(point.blob) else {
+            return Ok(None);
+        };
+        drop(reader);
+        Ok(Some(VectorPoint {
             id: point.id.clone(),
-            vectors: BTreeMap::from([(
-                crate::types::DEFAULT_VECTOR_NAME.to_string(),
-                point.data.clone(),
-            )]),
+            vectors: BTreeMap::from([(crate::types::DEFAULT_VECTOR_NAME.to_string(), data)]),
             payload: point.payload.clone(),
         }))
     }
@@ -237,33 +263,60 @@ impl KindStore {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
+        self.scroll_inner(None, limit, offset, with_payload, with_vector)
+    }
+
+    /// Fetch one page of points, optionally filtered.
+    ///
+    /// `filter` counts only matching points; the cursor is the last match.
+    fn scroll_inner(
+        &self,
+        filter: Option<&VectorFilter>,
+        limit: usize,
+        offset: Option<&PointId>,
+        with_payload: Option<bool>,
+        with_vector: Option<bool>,
+    ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
         let inner = self.inner.lock();
         let start_slot = match offset {
             Some(cursor) => inner
                 .reverse
-                .get(&cursor.to_string())
+                .get(cursor)
                 .map(|slot| slot + 1)
                 .unwrap_or(inner.points.len() as u32),
             None => 0,
         };
         let with_payload = with_payload.unwrap_or(true);
         let with_vector = with_vector.unwrap_or(false);
+        let reader = if with_vector {
+            Some(self.blobs.reader())
+        } else {
+            None
+        };
         let mut points = Vec::new();
         let mut cursor = None;
         for slot in start_slot as usize..inner.points.len() {
             let Some(point) = inner.points[slot].as_ref() else {
                 continue;
             };
+            if let Some(filter) = filter {
+                if !filter::matches(filter, &point.id, point.payload.as_ref())? {
+                    continue;
+                }
+            }
+            let vectors = match reader.as_ref() {
+                Some(reader) => match reader.to_data(point.blob) {
+                    Some(data) => BTreeMap::from([(
+                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
+                        data,
+                    )]),
+                    None => continue,
+                },
+                None => BTreeMap::new(),
+            };
             points.push(VectorPoint {
                 id: point.id.clone(),
-                vectors: if with_vector {
-                    BTreeMap::from([(
-                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
-                        point.data.clone(),
-                    )])
-                } else {
-                    BTreeMap::new()
-                },
+                vectors,
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -275,7 +328,6 @@ impl KindStore {
     }
 
     /// Paginated scan over live points matching `filter`, in slot order.
-    /// `limit` counts only matching points; the cursor is the last match.
     pub fn scroll_by_filter(
         &self,
         filter: &VectorFilter,
@@ -284,53 +336,6 @@ impl KindStore {
         with_payload: Option<bool>,
         with_vector: Option<bool>,
     ) -> Result<(Vec<VectorPoint>, Option<PointId>)> {
-        let inner = self.inner.lock();
-        let start_slot = match offset {
-            Some(cursor) => inner
-                .reverse
-                .get(&cursor.to_string())
-                .map(|slot| slot + 1)
-                .unwrap_or(inner.points.len() as u32),
-            None => 0,
-        };
-        let with_payload = with_payload.unwrap_or(true);
-        let with_vector = with_vector.unwrap_or(false);
-        let mut points = Vec::new();
-        let mut cursor = None;
-        for slot in start_slot as usize..inner.points.len() {
-            let Some(point) = inner.points[slot].as_ref() else {
-                continue;
-            };
-            if !filter::matches(filter, &point.id, point.payload.as_ref())? {
-                continue;
-            }
-            points.push(VectorPoint {
-                id: point.id.clone(),
-                vectors: if with_vector {
-                    BTreeMap::from([(
-                        crate::types::DEFAULT_VECTOR_NAME.to_string(),
-                        point.data.clone(),
-                    )])
-                } else {
-                    BTreeMap::new()
-                },
-                payload: with_payload.then(|| point.payload.clone()).flatten(),
-            });
-            cursor = Some(point.id.clone());
-            if points.len() >= limit {
-                break;
-            }
-        }
-        Ok((points, cursor))
-    }
-}
-
-fn vector_data_bytes(data: &VectorData) -> usize {
-    match data {
-        VectorData::Dense(values) => values.len() * std::mem::size_of::<f32>(),
-        VectorData::Sparse { indices, values } => {
-            indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
-        }
-        VectorData::Multi(multi) => multi.flat.len() * std::mem::size_of::<f32>(),
+        self.scroll_inner(Some(filter), limit, offset, with_payload, with_vector)
     }
 }

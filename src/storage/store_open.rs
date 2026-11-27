@@ -162,7 +162,7 @@ impl CollectionStore {
         initial_tombstones.save(dir, meta.slot_capacity)?;
         let tombstones = ArcSwap::from(Arc::new(initial_tombstones));
         let slot_capacity = meta.slot_capacity;
-        let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         // New collections always use the Gridstore-style PayloadStore.
         let payload_store =
             PayloadStore::create(&dir.join("payloads_store"), storage.payload_store_config())?;
@@ -294,7 +294,7 @@ impl CollectionStore {
         };
 
         let payload_store = Some(payload_store);
-        let wal = Wal::open_or_create(&dir.join("wal.bin"))?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         let tombstones = ArcSwap::from(Arc::new(tombstone_bits));
 
         let store = Arc::new_cyclic(|weak| Self {

@@ -97,13 +97,9 @@ impl KindStore {
         let started = Instant::now();
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
-        let slot = inner
-            .reverse
-            .get(&point_id.to_string())
-            .copied()
-            .ok_or_else(|| {
-                VectorSearchError::Internal(format!("point {point_id} not found"))
-            })?;
+        let slot = inner.reverse.get(point_id).ok_or_else(|| {
+            VectorSearchError::Internal(format!("point {point_id} not found"))
+        })?;
         let records = build(slot)?;
         self.commit_records_locked(&mut inner, records, started)
     }
@@ -148,13 +144,13 @@ impl KindStore {
                     self.apply_upsert(inner, id, data, payload)?;
                 }
                 WalRecord::Delete { point_id } => {
-                    if let Some(slot) = inner.reverse.get(&point_id).copied() {
+                    if let Some(slot) = inner.reverse.get_str(&point_id) {
                         inner.tombstone_slot(slot);
                     }
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for point_id in point_ids {
-                        if let Some(slot) = inner.reverse.get(&point_id).copied() {
+                        if let Some(slot) = inner.reverse.get_str(&point_id) {
                             inner.tombstone_slot(slot);
                         }
                     }
@@ -211,8 +207,20 @@ impl KindStore {
     /// an appended batch never re-runs these checks: only validated records
     /// can be persisted, and applying them is a pure state transition.
     fn validate_records(&self, inner: &Inner, records: &[WalRecord]) -> Result<()> {
-        let mut present: HashSet<String> = inner.reverse.keys().cloned().collect();
+        // Only the batch's own effect is tracked here: the live directory is
+        // consulted per record, so a commit no longer clones every point id.
+        let mut present: HashSet<String> = HashSet::new();
+        let mut absent: HashSet<String> = HashSet::new();
         let mut projected_live = inner.live_count;
+        let is_live = |id: &String, present: &HashSet<String>, absent: &HashSet<String>| {
+            if present.contains(id) {
+                true
+            } else if absent.contains(id) {
+                false
+            } else {
+                inner.reverse.contains_str(id)
+            }
+        };
         for record in records {
             match record {
                 WalRecord::UpsertVectors {
@@ -223,7 +231,7 @@ impl KindStore {
                     let data = kind_data(vectors)?;
                     self.validate_data(&data)?;
                     validate_payload(payload.as_deref())?;
-                    if !present.contains(id) {
+                    if !is_live(id, &present, &absent) {
                         if let Some(cap) = self.max_points {
                             if projected_live >= cap {
                                 return Err(VectorSearchError::CapacityExceeded {
@@ -234,17 +242,22 @@ impl KindStore {
                             }
                         }
                         present.insert(id.clone());
+                        absent.remove(id);
                         projected_live = projected_live.saturating_add(1);
                     }
                 }
                 WalRecord::Delete { point_id } => {
-                    if present.remove(point_id) {
+                    if is_live(point_id, &present, &absent) {
+                        present.remove(point_id);
+                        absent.insert(point_id.clone());
                         projected_live = projected_live.saturating_sub(1);
                     }
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for point_id in point_ids {
-                        if present.remove(point_id) {
+                        if is_live(point_id, &present, &absent) {
+                            present.remove(point_id);
+                            absent.insert(point_id.clone());
                             projected_live = projected_live.saturating_sub(1);
                         }
                     }

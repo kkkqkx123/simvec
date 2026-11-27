@@ -5,8 +5,8 @@ use std::sync::Arc;
 use super::*;
 use crate::error::VectorSearchError;
 use crate::types::{
-    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SearchQuery, VectorKind,
-    VectorPoint,
+    CollectionConfig, DistanceMetric, IndexConfig, MultiConfig, PointId, SearchQuery, VectorData,
+    VectorKind, VectorPoint,
 };
 use crate::{LocalVectorEngine, VectorEngine};
 
@@ -384,4 +384,164 @@ fn invalid_upsert_never_reaches_wal_and_reopen_succeeds() {
     // Replay of a WAL with no committed bad record opens cleanly.
     let reopened = LocalVectorEngine::open(tmp.path()).unwrap();
     assert_eq!(reopened.count("kb").unwrap(), 0);
+}
+
+// Storage layout -----------------------------------------------------------
+
+fn sparse_wide(id: &str, terms: u32, weight: f32) -> VectorPoint {
+    let pairs: Vec<(u32, f32)> = (0..terms).map(|term| (term, weight)).collect();
+    sparse_point(id, &pairs)
+}
+
+#[test]
+fn kind_restart_loads_the_posting_dictionary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    let (blob_bytes, posting_bytes);
+    {
+        let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        let points: Vec<VectorPoint> = (0..40u32)
+            .map(|i| sparse_wide(&format!("p{i}"), 64, 1.0))
+            .collect();
+        store.upsert_batch(&points).unwrap();
+        store.checkpoint().unwrap();
+        (blob_bytes, posting_bytes) = store.storage_bytes();
+        assert!(blob_bytes > 0, "vectors must land in points.bin");
+        assert!(posting_bytes > 0, "postings must land in postings/");
+        // The snapshot is a directory: it references blobs instead of copying
+        // the 200-byte vectors they hold.
+        let snapshot = std::fs::metadata(dir.join("kind_snapshot.bin"))
+            .unwrap()
+            .len();
+        assert!(
+            snapshot * 4 < blob_bytes,
+            "snapshot ({snapshot} B) must stay far below the vector bytes ({blob_bytes} B)"
+        );
+    }
+
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.count(), 40);
+    assert!(
+        reopened.postings_restored(),
+        "a checkpointed collection must load its dictionary, not re-invert every point"
+    );
+    assert_eq!(reopened.storage_bytes(), (blob_bytes, posting_bytes));
+    let query = SearchQuery::with_data(VectorData::sparse(vec![3, 7], vec![1.0, 1.0]), 2);
+    assert_eq!(reopened.search(&query).unwrap().len(), 2);
+}
+
+#[test]
+fn kind_stale_posting_manifest_is_rebuilt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    {
+        let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        let points: Vec<VectorPoint> = (0..10u32)
+            .map(|i| sparse_wide(&format!("p{i}"), 8, 1.0))
+            .collect();
+        store.upsert_batch(&points).unwrap();
+        store.checkpoint().unwrap();
+    }
+    // Simulate the crash window: the manifest is gone, so it can no longer
+    // vouch for the buckets.
+    std::fs::remove_file(dir.join("postings").join("manifest.bin")).unwrap();
+
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    assert!(!reopened.postings_restored());
+    assert_eq!(reopened.count(), 10);
+    // Rebuilt from the blobs, so queries still find every point.
+    let query = SearchQuery::with_data(VectorData::sparse(vec![2], vec![1.0]), 10);
+    assert_eq!(reopened.search(&query).unwrap().len(), 10);
+}
+
+#[test]
+fn kind_deleted_points_leave_no_phantom_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    let query = SearchQuery::with_data(VectorData::sparse(vec![1], vec![1.0]), 10);
+    {
+        let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        let points: Vec<VectorPoint> = (0..3u32)
+            .map(|i| sparse_point(&format!("p{i}"), &[(1, 1.0 + i as f32)]))
+            .collect();
+        store.upsert_batch(&points).unwrap();
+        store.checkpoint().unwrap();
+        store.delete(&PointId::from("p1")).unwrap();
+        // The tombstoned slot's postings are still on disk; the scan must skip
+        // them.
+        assert_eq!(store.search(&query).unwrap().len(), 2);
+    }
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.count(), 2);
+    let hits = reopened.search(&query).unwrap();
+    assert_eq!(hits.len(), 2, "stale postings must not resurrect deleted points");
+    assert!(hits.iter().all(|hit| hit.id != PointId::from("p1")));
+}
+
+#[test]
+fn kind_compaction_rewrites_blobs_and_postings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    let query = SearchQuery::with_data(VectorData::sparse(vec![1], vec![1.0]), 10);
+    let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+    let points: Vec<VectorPoint> = (0..20u32)
+        .map(|i| sparse_wide(&format!("p{i}"), 16, 1.0))
+        .collect();
+    store.upsert_batch(&points).unwrap();
+    store.checkpoint().unwrap();
+    let before = store.storage_bytes();
+    for i in 0..10u32 {
+        store.delete(&PointId::from(format!("p{i}"))).unwrap();
+    }
+    let reclaimed = store.compact().unwrap();
+    assert_eq!(reclaimed, 10);
+    let after = store.storage_bytes();
+    assert!(
+        after.0 <= before.0 / 2,
+        "compaction must drop the bytes of deleted points: {before:?} -> {after:?}"
+    );
+    assert_eq!(store.search(&query).unwrap().len(), 10);
+
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    assert_eq!(reopened.count(), 10);
+    assert!(reopened.postings_restored());
+    assert_eq!(reopened.storage_bytes(), after);
+    assert_eq!(reopened.search(&query).unwrap().len(), 10);
+}
+
+#[test]
+fn kind_payload_edits_survive_a_restart_without_touching_vectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("kb");
+    let config = sparse_config();
+    let storage = crate::types::StorageConfig::default();
+    {
+        let store = KindStore::create(&dir, "kb", &config, &storage).unwrap();
+        store
+            .upsert_batch(&[sparse_wide("p1", 4, 1.0)])
+            .unwrap();
+        store.set_payload_fields(
+            &PointId::from("p1"),
+            [("tag".to_string(), serde_json::json!("a"))]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        store.checkpoint().unwrap();
+    }
+    let reopened = KindStore::open(&dir, &storage).unwrap();
+    let point = reopened.get(&PointId::from("p1")).unwrap().unwrap();
+    assert_eq!(
+        point.payload.as_ref().unwrap()["tag"],
+        serde_json::json!("a")
+    );
+    assert_eq!(point.vectors.len(), 1);
 }

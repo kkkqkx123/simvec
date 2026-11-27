@@ -67,3 +67,4 @@
 - `10-qdrant-design-review.md`：对照 `ref/qdrant` 的稀疏、多向量与具名实现，列出剩余问题清单与分优先级的修改方案。
 - `11-storage-correctness-fixes.md`：对照 `ref/qdrant` 的存储布局，收敛存储层的正确性缺陷（墓碑落盘、payload 跨页分配、`payloads.bin` 僵尸链路、`meta.bin` 校验、容量崩溃窗口）与效率问题的分优先级方案，并记录本轮已实施与未实施项。
 - `12-storage-efficiency-and-evolution.md`：承接 11 留下的效率与演进项——checkpoint 停写窗口、向量段大小、`FilterBitmap` 内存上界、反查表内存、压实后索引处置、目录记录长度自描述，以及 `kind`/`named` 倒排落盘与 WAL 分段的分阶段设计。
+- `13-p2-3-p2-4-implementation.md`：12 剩余项 P2-3（`kind`/`named` 倒排与向量落盘、快照瘦身）与 P2-4（WAL 分段 + 水位截断）的细化设计：文件与段布局、`manifest.lsn == snapshot.lsn` 一致性契约、checkpoint 四点写入顺序与崩溃窗口、资源上界公式、落地点与验收用例，以及与 12 原方案的差异和未做项理由。

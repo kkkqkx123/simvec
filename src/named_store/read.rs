@@ -9,6 +9,7 @@ use crate::types::{
 };
 
 use super::{score_pair, sparse_scores, truncate_topk, NamedStore};
+use crate::storage::point_blobs::named_entries;
 
 impl NamedStore {
     /// Declared named-vector spaces.
@@ -57,15 +58,39 @@ impl NamedStore {
         &self.metrics
     }
 
-    /// Approximate in-memory payload size of the live points.
+    /// Whether every sparse space's dictionary came from disk at open. `false`
+    /// means at least one was rebuilt from the snapshot, which is what a crash
+    /// between the manifest write and the snapshot leaves behind.
+    pub fn postings_restored(&self) -> bool {
+        self.postings.values().all(|space| space.was_restored())
+    }
+
+    /// (bytes of the vector blob file, bytes of all posting buckets).
+    pub fn storage_bytes(&self) -> (u64, u64) {
+        (
+            self.blobs.len(),
+            self.postings.values().map(|space| space.disk_bytes()).sum(),
+        )
+    }
+
+    /// Approximate resident size: the point directory, the norm caches, the
+    /// posting dictionaries and the pending posting window. The vectors
+    /// themselves live in the mapped blob file.
     pub fn memory_bytes(&self) -> u64 {
         let inner = self.inner.lock();
-        inner
-            .points
-            .iter()
-            .flatten()
-            .map(|point| point.vectors.values().map(vector_data_bytes).sum::<usize>() as u64)
-            .sum()
+        let directory = inner.points.capacity() as u64
+            * std::mem::size_of::<Option<super::NamedPoint>>() as u64;
+        let norms: u64 = inner
+            .norms
+            .values()
+            .map(|space| space.capacity() as u64 * std::mem::size_of::<(u32, f32)>() as u64)
+            .sum();
+        let postings: u64 = self
+            .postings
+            .values()
+            .map(|space| space.memory_bytes())
+            .sum();
+        directory + norms + postings + self.blobs.mapped_bytes()
     }
 
     /// Number of live points matching `filter`. Pure read.
@@ -140,7 +165,7 @@ impl NamedStore {
         let mut candidates: Vec<(u32, f32)> = Vec::new();
         let mut full_scan = false;
         if let VectorData::Sparse { indices, values } = &owned {
-            let space_index = inner.inverted.get(target);
+            let space_index = self.postings_of(target);
             let norms = inner.norms.get(target);
             if let (Some(space_index), Some(norms)) = (space_index, norms) {
                 let hits = crate::kind_store::posting_hits(space_index, indices);
@@ -166,6 +191,9 @@ impl NamedStore {
                 .collect();
         }
 
+        // One borrow of the blob mapping for the whole scoring pass.
+        let reader = self.blobs.reader();
+        let space_index = self.order_of(target);
         let mut scored: Vec<(u32, f32)> = Vec::new();
         for (slot, sparse_score) in candidates {
             if !accept(slot)? {
@@ -175,13 +203,16 @@ impl NamedStore {
                 continue;
             };
             // A point missing the target space is not a candidate for it.
-            let Some(stored) = point.vectors.get(target) else {
+            let Some(index) = space_index else {
+                continue;
+            };
+            let Some(stored) = reader.space_view(point.blob, index) else {
                 continue;
             };
             let score = match &owned {
-                VectorData::Sparse { .. } if full_scan => score_pair(&owned, stored, metric),
+                VectorData::Sparse { .. } if full_scan => score_pair(&owned, &stored, metric),
                 VectorData::Sparse { .. } => sparse_score,
-                _ => score_pair(&owned, stored, metric),
+                _ => score_pair(&owned, &stored, metric),
             };
             if threshold.is_some_and(|bound| score < bound) {
                 continue;
@@ -212,15 +243,21 @@ impl NamedStore {
                     }
                 }
                 if with_vector {
-                    for (space, data) in &point.vectors {
+                    let bytes = reader.bytes(point.blob)?;
+                    for (index, entry) in named_entries(bytes).unwrap_or_default() {
+                        let Some(space) = self.space_at(index) else {
+                            continue;
+                        };
                         if query
                             .vector_spaces
                             .as_ref()
-                            .is_some_and(|allowed| !allowed.contains(space))
+                            .is_some_and(|allowed| !allowed.iter().any(|name| name == space))
                         {
                             continue;
                         }
-                        result = result.with_named_vector(space, data.clone());
+                        if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
+                            result = result.with_named_vector(space, view.to_data());
+                        }
                     }
                 }
                 Some(result)
@@ -262,12 +299,29 @@ impl NamedStore {
     /// Fetch a point by id.
     pub fn get(&self, point_id: &PointId) -> Result<Option<VectorPoint>> {
         let inner = self.inner.lock();
-        let Some(&slot) = inner.reverse.get(&point_id.to_string()) else {
+        let Some(slot) = inner.reverse.get(point_id) else {
             return Ok(None);
         };
-        Ok(inner.points[slot as usize].as_ref().map(|point| VectorPoint {
+        let Some(point) = inner.points[slot as usize].as_ref() else {
+            return Ok(None);
+        };
+        let reader = self.blobs.reader();
+        let Some(bytes) = reader.bytes(point.blob) else {
+            return Ok(None);
+        };
+        let mut vectors = BTreeMap::new();
+        for (index, entry) in named_entries(bytes).unwrap_or_default() {
+            let Some(space) = self.space_at(index) else {
+                continue;
+            };
+            if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
+                vectors.insert(space.to_string(), view.to_data());
+            }
+        }
+        drop(reader);
+        Ok(Some(VectorPoint {
             id: point.id.clone(),
-            vectors: point.vectors.clone(),
+            vectors,
             payload: point.payload.clone(),
         }))
     }
@@ -308,7 +362,7 @@ impl NamedStore {
         let start_slot = match offset {
             Some(cursor) => inner
                 .reverse
-                .get(&cursor.to_string())
+                .get(cursor)
                 .map(|slot| slot + 1)
                 .unwrap_or(inner.points.len() as u32),
             None => 0,
@@ -326,13 +380,26 @@ impl NamedStore {
                     continue;
                 }
             }
+            let vectors = if with_vector {
+                let reader = self.blobs.reader();
+                let mut vectors = BTreeMap::new();
+                if let Some(bytes) = reader.bytes(point.blob) {
+                    for (index, entry) in named_entries(bytes).unwrap_or_default() {
+                        let Some(space) = self.space_at(index) else {
+                            continue;
+                        };
+                        if let Some(view) = crate::storage::point_blobs::decode_vector(entry) {
+                            vectors.insert(space.to_string(), view.to_data());
+                        }
+                    }
+                }
+                vectors
+            } else {
+                BTreeMap::new()
+            };
             points.push(VectorPoint {
                 id: point.id.clone(),
-                vectors: if with_vector {
-                    point.vectors.clone()
-                } else {
-                    Default::default()
-                },
+                vectors,
                 payload: with_payload.then(|| point.payload.clone()).flatten(),
             });
             cursor = Some(point.id.clone());
@@ -341,15 +408,5 @@ impl NamedStore {
             }
         }
         Ok((points, cursor))
-    }
-}
-
-fn vector_data_bytes(data: &VectorData) -> usize {
-    match data {
-        VectorData::Dense(values) => values.len() * std::mem::size_of::<f32>(),
-        VectorData::Sparse { indices, values } => {
-            indices.len() * std::mem::size_of::<u32>() + values.len() * std::mem::size_of::<f32>()
-        }
-        VectorData::Multi(multi) => multi.flat.len() * std::mem::size_of::<f32>(),
     }
 }

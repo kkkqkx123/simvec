@@ -186,6 +186,72 @@ fn validate_finite(values: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// Borrowed view of a [`VectorData`].
+///
+/// The exact-scan stores keep variable-length payloads in an mmap'd blob file
+/// and score straight out of the mapping, so the read paths work on this view
+/// instead of materializing an owned payload per candidate. `to_data()`
+/// converts back at the API boundary, where an owned value is required.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VectorView<'a> {
+    Dense(&'a [f32]),
+    Sparse {
+        indices: &'a [u32],
+        values: &'a [f32],
+    },
+    Multi {
+        flat: &'a [f32],
+        dim: usize,
+    },
+}
+
+impl<'a> VectorView<'a> {
+    pub fn kind(&self) -> VectorKind {
+        match self {
+            VectorView::Dense(_) => VectorKind::Dense,
+            VectorView::Sparse { .. } => VectorKind::Sparse,
+            VectorView::Multi { .. } => VectorKind::Multi,
+        }
+    }
+
+    /// Materialize an owned payload (fetch paths, snapshot writes).
+    pub fn to_data(&self) -> VectorData {
+        match self {
+            VectorView::Dense(values) => VectorData::Dense(values.to_vec()),
+            VectorView::Sparse { indices, values } => VectorData::Sparse {
+                indices: indices.to_vec(),
+                values: values.to_vec(),
+            },
+            VectorView::Multi { flat, dim } => VectorData::Multi(MultiVector {
+                flat: flat.to_vec(),
+                dim: *dim,
+            }),
+        }
+    }
+
+    /// Sub-vector iterator for the multi variant; empty for the others.
+    pub fn vectors(&self) -> impl Iterator<Item = &'a [f32]> {
+        let (flat, dim) = match self {
+            VectorView::Multi { flat, dim } => (*flat, *dim),
+            _ => (&[] as &[f32], 1usize),
+        };
+        flat.chunks_exact(dim.max(1))
+    }
+
+    /// Number of sub-vectors (multi) or pairs/elements (dense/sparse).
+    pub fn len(&self) -> usize {
+        match self {
+            VectorView::Dense(values) => values.len(),
+            VectorView::Sparse { indices, .. } => indices.len(),
+            VectorView::Multi { flat, dim } => flat.len() / (*dim).max(1),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A point carries one vector per declared space. The default space is used
 /// by single-space collections and by the dense storage/WAL paths; named
 /// collections simply add more entries to the same map.

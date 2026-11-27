@@ -1,7 +1,7 @@
 //! WAL replay idempotency integration tests.
 
 use simvec::storage::CollectionStore;
-use simvec::storage::{Wal, WalPoint, WalRecord, WalTxn};
+use simvec::storage::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 use simvec::types::{CollectionConfig, DistanceMetric, PointId, SearchQuery, VectorPoint};
 
 fn config() -> CollectionConfig {
@@ -74,7 +74,7 @@ fn test_replay_delete_batch_and_compact_marker() {
     // Append a delete-batch + compact marker directly to the WAL (simulating a
     // crash after WAL fsync before memory apply).
     {
-        let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
         wal.append(&WalTxn {
             txn_id: 2,
             ops: vec![WalRecord::DeleteBatch {
@@ -120,13 +120,12 @@ fn test_partial_wal_record_is_tolerated() {
     }
 
     // Crash mid-append: a length prefix claiming bytes that were never
-    // written.
+    // written, in the segment the log ends with.
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(store_dir.join("wal.bin"))
-            .unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
+        let active = wal.active_segment_path().expect("log has a tail segment");
+        let mut f = std::fs::OpenOptions::new().append(true).open(active).unwrap();
         f.write_all(&4096u32.to_le_bytes()).unwrap();
         f.sync_all().unwrap();
     }
@@ -153,7 +152,7 @@ fn test_upsert_overwrite_after_replay_does_not_duplicate() {
     // Same point id with a different vector, logged after a crash that lost
     // the memory apply of txn 2.
     {
-        let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
         let mut updated = point(1);
         updated.set_dense(vec![9.0, 9.0, 9.0, 9.0]);
         wal.append(&WalTxn {
@@ -188,7 +187,7 @@ fn test_replay_reconciles_stale_meta_counts() {
             .unwrap();
         // Crash window: WAL written but meta.bin not yet persisted with the
         // live_count bump. Append directly to the WAL.
-        let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
         wal.append(&WalTxn {
             txn_id: 2,
             ops: vec![WalRecord::Upsert {
@@ -311,7 +310,7 @@ fn test_wal_replay_after_checkpoint_marker_stays_idempotent() {
         // Crash window between the `Compact` marker and `truncate()`: the log
         // keeps both the marker and everything logged before it.
         store.checkpoint().unwrap();
-        let wal = Wal::open_or_create(&store_dir.join("wal.bin")).unwrap();
+        let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
         wal.append(&WalTxn {
             txn_id: 99,
             ops: vec![WalRecord::Compact],
