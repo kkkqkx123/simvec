@@ -1,6 +1,6 @@
 # AGENTS.md — simvec
 
-Local vector search engine in Rust: HNSW-first ANN with exact-scan fallback, WAL durability, mmap storage, plus a C ABI (`--features c_api`) that all language bindings wrap. A separate Rust shell in `cli/` uses the public Rust API directly. `crate-type = ["cdylib", "staticlib", "rlib"]`, rust-version 1.97, edition 2021. Storage audit and hardening plan: `docs/plan/storage-audit-and-hardening.md`; CLI design: `docs/plan/standalone-cli-shell.md`.
+Local vector search engine in Rust: HNSW-first ANN with exact-scan fallback, WAL durability, mmap storage, plus a C ABI (`--features c_api`) that all language bindings wrap. A separate Rust shell in `cli/` uses the public Rust API directly. `crate-type = ["cdylib", "staticlib", "rlib"]`, rust-version 1.97, edition 2021. Storage audit and hardening plan: `docs/plan/storage-audit-and-hardening.md`; qdrant comparison issue inventory: `docs/issue/storage-comparison-with-qdrant.md`; storage gap remediation stages: `docs/plan/storage-gap-remediation.md`; future version and migration design: `docs/plan/long-term/versioning-and-migration.md`; CLI design: `docs/plan/standalone-cli-shell.md`.
 
 ## Commands
 

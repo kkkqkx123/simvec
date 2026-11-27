@@ -1,6 +1,6 @@
 # 存储结构审计与加固方案
 
-本文对比当前 `simvec` 原生存储与 `ref/qdrant`，给出完整问题清单、本轮已落地的修改和剩余改进方案。范围只包括本地引擎的原生存储；wasm 内存引擎不在讨论范围内。
+本文对比当前 `simvec` 原生存储与 `ref/qdrant`，给出完整问题清单、本轮已落地的修改和剩余改进方案。范围只包括本地引擎的原生存储；wasm 内存引擎不在讨论范围内。后续按 qdrant 对照形成的完整问题清单见 `docs/issue/storage-comparison-with-qdrant.md`，分阶段执行计划见 `docs/plan/storage-gap-remediation.md`。
 
 ## 现状对比
 
