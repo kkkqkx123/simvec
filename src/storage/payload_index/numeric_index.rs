@@ -13,7 +13,7 @@ use bitvec::prelude::*;
 use crate::types::ConditionType;
 
 /// Range index over one numeric payload field.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NumericIndex {
     /// Ascending values (total order via `f64::total_cmp`; zero normalized).
     sorted: Vec<f64>,
@@ -75,6 +75,25 @@ impl NumericIndex {
             i += 1;
         }
         self.reverse.remove(&slot);
+    }
+
+    pub(crate) fn values(&self) -> &[f64] {
+        &self.sorted
+    }
+
+    pub(crate) fn slots(&self) -> &[u32] {
+        &self.slots
+    }
+
+    pub(crate) fn restore(&mut self, values: Vec<f64>, slots: Vec<u32>, capacity: usize) {
+        self.reverse = slots
+            .iter()
+            .zip(values.iter())
+            .map(|(&slot, &value)| (slot, value))
+            .collect();
+        self.sorted = values;
+        self.slots = slots;
+        self.capacity = capacity.max(1);
     }
 
     fn set_bit(&self, mask: &mut BitVec, slot: u32) {

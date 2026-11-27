@@ -201,7 +201,7 @@ fn eval_f64_range(
     true
 }
 
-fn eval_uint_range(
+pub(crate) fn eval_uint_range(
     n: u64,
     gt: Option<u64>,
     gte: Option<u64>,
@@ -274,7 +274,7 @@ fn is_empty_value(v: &serde_json::Value) -> bool {
     }
 }
 
-fn geo_point(v: Option<&serde_json::Value>) -> Option<crate::types::GeoPoint> {
+pub(crate) fn geo_point(v: Option<&serde_json::Value>) -> Option<crate::types::GeoPoint> {
     let Value::Object(map) = v? else {
         return None;
     };
@@ -285,7 +285,7 @@ fn geo_point(v: Option<&serde_json::Value>) -> Option<crate::types::GeoPoint> {
 
 /// Great-circle distance in meters (haversine, Earth radius 6371.0088 km as
 /// used by Qdrant).
-fn haversine_meters(a: crate::types::GeoPoint, b: crate::types::GeoPoint) -> f64 {
+pub(crate) fn haversine_meters(a: crate::types::GeoPoint, b: crate::types::GeoPoint) -> f64 {
     const EARTH_RADIUS_M: f64 = 6_371_008.8;
     let d_lat = (b.lat - a.lat).to_radians();
     let d_lon = (b.lon - a.lon).to_radians();

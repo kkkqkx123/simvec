@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use super::maintenance::maintenance_loop;
 use super::{LocalVectorEngine, MaintenanceJob, SpaceHandle};
 use crate::error::{Result, VectorSearchError};
-use crate::storage::CollectionStore;
+use crate::storage::{CollectionStore, SnapshotInfo};
 use crate::types::{
     CollectionConfig, CollectionInfo, CollectionStatus, HnswConfig, IndexConfig, StorageConfig,
 };
@@ -435,6 +435,28 @@ impl LocalVectorEngine {
         self.handle(collection)
             .and_then(|h| h.as_dense().cloned())
             .ok_or_else(|| VectorSearchError::CollectionNotFound(collection.to_string()))
+    }
+
+    /// Take a point-in-time dense collection snapshot.
+    ///
+    /// Exact-scan stores have their own generation format and are not mixed
+    /// into the dense snapshot envelope.
+    pub fn snapshot_collection(
+        &self,
+        collection: &str,
+        dest: impl AsRef<Path>,
+    ) -> Result<SnapshotInfo> {
+        self.store(collection)?.snapshot_to(dest)
+    }
+
+    /// Take a dense snapshot that reuses unchanged files from `base`.
+    pub fn snapshot_collection_incremental(
+        &self,
+        collection: &str,
+        base: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> Result<SnapshotInfo> {
+        self.store(collection)?.snapshot_to_incremental(base, dest)
     }
 }
 

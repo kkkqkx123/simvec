@@ -745,3 +745,53 @@ pub(super) fn test_concurrent_insert_and_probe_exercises_version_reload() {
         "write/read contention must exercise the version double-read reload path"
     );
 }
+
+#[test]
+fn test_healing_removes_deleted_neighbor_without_rebuild() {
+    let data = blobs(12);
+    let vectors: Vec<Vec<f32>> = data.iter().map(|(v, _)| v.clone()).collect();
+    let (_dir, mmaps) = mmap_from(&vectors);
+    let slots: Vec<u32> = (0..data.len() as u32).collect();
+    let index = HnswIndex::build(
+        &IndexBuildParams::new("col", DIM, DistanceMetric::Euclid, &slots, &mmaps, 256),
+        &config(),
+    )
+    .unwrap();
+
+    let removed = 3u32;
+    let mut bits = bitvec::bitvec![0; data.len()];
+    bits.set(removed as usize, true);
+    let tombstones = TombstoneBits::from_bits(bits);
+
+    index.heal_deleted(removed, &mmaps, 256, 0, |slot| tombstones.bit(slot as usize));
+
+    for slot in slots {
+        let Some(node) = index.node(slot) else {
+            continue;
+        };
+        for layer in 0..node.neighbors.len() {
+            assert!(
+                !node.layer(layer as u8).read().contains(&removed),
+                "healed graph still links to deleted slot {removed}"
+            );
+        }
+    }
+
+    let hits = index
+        .probe_candidates(
+            &[0.0; DIM],
+            32,
+            8,
+            &HnswSearchContext {
+                tombstones: Some(&tombstones),
+                vectors: &mmaps,
+                segment_slots: 256,
+                slot_base: 0,
+                filter_mask: None,
+                quant: None,
+            },
+        )
+        .unwrap();
+    assert!(hits.iter().any(|(_, slot)| *slot != removed));
+    assert!(!hits.iter().any(|(_, slot)| *slot == removed));
+}

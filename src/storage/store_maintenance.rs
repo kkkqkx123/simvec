@@ -127,6 +127,15 @@ impl CollectionStore {
             &tombstones,
         );
         DenseSnapshot::write(&data_dir, &snapshot)?;
+        // The field posting file is derived too, but keeping it at the same
+        // generation/lsn as the snapshot avoids a full rebuild at open. A
+        // crash before the manifest advance leaves it ahead of the manifest
+        // and open discards it.
+        inner.payload_indexes.save(
+            &data_dir,
+            generation.id(),
+            inner.meta.last_applied_txn,
+        )?;
         // Publish the generation's lsn before the WAL watermark: recovery
         // never replays past what this generation's files contain.
         self.generation.write().set_lsn(inner.meta.last_applied_txn)?;

@@ -15,7 +15,7 @@ use crate::types::ConditionType;
 
 /// Equal-value index over one payload field (keyword / boolean / numeric
 /// stringified equality and `MatchAny` containment).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct MapIndex {
     postings: HashMap<Key, BitVec>,
     slot_entries: HashMap<u32, Vec<Key>>,
@@ -93,6 +93,26 @@ impl MapIndex {
             }
         }
         Some(mask)
+    }
+
+    pub(crate) fn postings(&self) -> &HashMap<Key, BitVec> {
+        &self.postings
+    }
+
+    pub(crate) fn restore(&mut self, postings: HashMap<Key, BitVec>, capacity: usize) {
+        self.postings = postings;
+        self.slot_entries.clear();
+        self.capacity = capacity.max(1);
+        for (key, bits) in &self.postings {
+            for (slot, matched) in bits.iter().enumerate() {
+                if *matched {
+                    self.slot_entries
+                        .entry(slot as u32)
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+        }
     }
 
     fn keys_for(value: &serde_json::Value) -> Vec<Key> {

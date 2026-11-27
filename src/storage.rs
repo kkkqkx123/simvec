@@ -481,6 +481,29 @@ impl CollectionStore {
     /// read. Because the copied WAL is complete at that point, the
     /// manifest's replay floor pins a self-consistent restore point.
     pub fn snapshot_to(&self, dest: impl AsRef<Path>) -> Result<SnapshotInfo> {
+        self.snapshot_capture(None, dest)
+    }
+
+    /// Take a snapshot that reuses unchanged files from a verified base
+    /// snapshot. Reuse is a hard link: the destination remains a complete,
+    /// self-contained directory tree, but only changed files are copied.
+    /// Every candidate is checked by generation, length and CRC before it is
+    /// linked, so a rewritten file can never be mistaken for an old one.
+    pub fn snapshot_to_incremental(
+        &self,
+        base: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> Result<SnapshotInfo> {
+        let base = base.as_ref();
+        let base_info = snapshot::verify_snapshot(base)?;
+        self.snapshot_capture(Some((base, base_info)), dest)
+    }
+
+    fn snapshot_capture(
+        &self,
+        base: Option<(&Path, SnapshotInfo)>,
+        dest: impl AsRef<Path>,
+    ) -> Result<SnapshotInfo> {
         let dest = dest.as_ref();
         if dest.exists() {
             return Err(VectorSearchError::InvalidConfig(format!(
@@ -500,20 +523,32 @@ impl CollectionStore {
 
         std::fs::create_dir_all(dest)?;
         let mut files = Vec::new();
-        copy_snapshot_tree(
+        let mut reused_files = 0;
+        let mut copy = |src: &Path, rel: &str| -> Result<()> {
+            copy_snapshot_file(
+                src,
+                dest,
+                rel,
+                generation.id(),
+                base.as_ref(),
+                &mut files,
+                &mut reused_files,
+            )
+        };
+        copy(
             &self.dir.join("generation.bin"),
-            dest,
             "generation.bin",
-            &mut files,
         )?;
         let generation_rel = format!("{}/g{:020}", generation::GENERATIONS_DIR, generation.id());
-        copy_snapshot_tree(&generation.path(), dest, &generation_rel, &mut files)?;
-        copy_snapshot_tree(&self.dir.join("wal"), dest, "wal", &mut files)?;
+        copy(&generation.path(), &generation_rel)?;
+        copy(&self.dir.join("wal"), "wal")?;
+        drop(copy);
 
         let info = SnapshotInfo {
             version: snapshot::SNAPSHOT_FORMAT_VERSION,
             generation: generation.id(),
             lsn: generation.lsn(),
+            reused_files,
             files,
         };
         snapshot::write_info(&dest.join(snapshot::SNAPSHOT_MANIFEST_FILE), &info)?;
@@ -661,15 +696,17 @@ pub fn restore_snapshot(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result
     Ok(())
 }
 
-fn copy_snapshot_tree(
+fn copy_snapshot_file(
     src: &Path,
     dest_root: &Path,
     rel: &str,
+    version: u64,
+    base: Option<&(&Path, SnapshotInfo)>,
     files: &mut Vec<snapshot::SnapshotFile>,
+    reused: &mut usize,
 ) -> Result<()> {
     if src.is_dir() {
-        let target = dest_root.join(rel);
-        std::fs::create_dir_all(&target)?;
+        std::fs::create_dir_all(dest_root.join(rel))?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -678,7 +715,15 @@ fn copy_snapshot_tree(
             } else {
                 format!("{rel}/{name}")
             };
-            copy_snapshot_tree(&entry.path(), dest_root, &child, files)?;
+            copy_snapshot_file(
+                &entry.path(),
+                dest_root,
+                &child,
+                version,
+                base,
+                files,
+                reused,
+            )?;
         }
         return Ok(());
     }
@@ -686,10 +731,29 @@ fn copy_snapshot_tree(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(src, &target)?;
     let (len, crc32) = snapshot::file_checksum(src)?;
+    let reusable = base.and_then(|(base_dir, info)| {
+        info.files.iter().find(|file| {
+            file.path == rel
+                && file.version == version
+                && file.len == len
+                && file.crc32 == crc32
+        })?; snapshot::checked_path(base_dir, rel).ok()
+    });
+    let mut linked = false;
+    if let Some(from) = reusable {
+        if from.is_file() && std::fs::hard_link(&from, &target).is_ok() {
+            linked = true;
+        }
+    }
+    if !linked {
+        std::fs::copy(src, &target)?;
+    } else {
+        *reused += 1;
+    }
     files.push(snapshot::SnapshotFile {
         path: rel.to_string(),
+        version,
         len,
         crc32,
     });

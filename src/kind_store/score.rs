@@ -100,10 +100,18 @@ pub(crate) fn sparse_candidate_scores(
 }
 
 /// Estimate whether direct posting accumulation is cheaper than a full scan
-/// of live points. Uses only posting length and the live-point count — both
-/// local statistics — so no global term-frequency table is needed.
-pub(crate) fn posting_hits(postings: &Postings, indices: &[u32]) -> usize {
-    postings.hits(indices)
+/// of live points. The persisted document frequency gives the selectivity of
+/// the rarest query term; a term present in most points makes posting
+/// accumulation more expensive than one filtered pass over the live set.
+/// The verdict only chooses an execution path — every path applies the full
+/// filter to each candidate.
+pub(crate) fn prefer_posting_scan(postings: &Postings, indices: &[u32], live: u64) -> bool {
+    // An empty query has no posting hits at all; taking the posting path
+    // yields an empty candidate set instead of a full scan of zero scores.
+    if indices.is_empty() || live == 0 {
+        return true;
+    }
+    postings.max_document_frequency(indices) as u64 <= live.saturating_mul(2)
 }
 
 /// Keep only the best `offset + limit` entries in score order, leaving the

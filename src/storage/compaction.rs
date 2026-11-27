@@ -571,6 +571,18 @@ impl CollectionStore {
             .as_ref()
             .expect("PayloadStore must be present");
         let new_store = old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
+        // Rebuild the field postings against compacted slot numbers before
+        // the generation is published. The staged file carries the staged
+        // generation and lsn so open can use it without rebuilding.
+        let mut staged_indexes = self.inner.read().payload_indexes.clone();
+        if !staged_indexes.is_empty() {
+            staged_indexes.rebuild(
+                plan.new_capacity as usize,
+                |slot| new_store.get(slot).ok().flatten(),
+                0..plan.live_count as u32,
+            );
+            staged_indexes.save(dir, staged.id(), meta.last_applied_txn)?;
+        }
         drop(new_store);
         drop(ps_guard);
 

@@ -200,7 +200,14 @@ impl CollectionStore {
             let payload = self.read_payload_at(slot).ok().flatten();
             inner.payload_indexes.register_slot(slot, payload.as_ref());
         }
-        inner.payload_indexes.save_defs(&self.data_dir())?;
+        let data_dir = self.data_dir();
+        let generation = self.generation.read().clone();
+        inner.payload_indexes.save_defs(&data_dir)?;
+        inner.payload_indexes.save(
+            &data_dir,
+            generation.id(),
+            generation.lsn(),
+        )?;
         Ok(())
     }
 
@@ -211,7 +218,14 @@ impl CollectionStore {
         if !inner.payload_indexes.delete(field) {
             return Ok(false);
         }
-        inner.payload_indexes.save_defs(&self.data_dir())?;
+        let data_dir = self.data_dir();
+        inner.payload_indexes.save_defs(&data_dir)?;
+        let generation = self.generation.read().clone();
+        inner.payload_indexes.save(
+            &data_dir,
+            generation.id(),
+            generation.lsn(),
+        )?;
         Ok(true)
     }
 

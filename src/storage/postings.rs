@@ -44,7 +44,7 @@
 //! tombstoned slots), and compaction — which renumbers slots anyway — rebuilds
 //! the index from scratch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,6 +138,9 @@ impl Bucket {
 struct State {
     /// bucket -> term -> record list.
     dict: HashMap<u32, HashMap<u32, Vec<Chain>>>,
+    /// Number of distinct slots known for each term. Used for sparse planner
+    /// selectivity; it never decides which candidates are eligible.
+    doc_freq: HashMap<u32, u32>,
     /// term -> postings applied since the last flush.
     pending: HashMap<u32, Vec<Posting>>,
     pending_bytes: usize,
@@ -155,6 +158,8 @@ struct Manifest {
     buckets: Vec<(u32, u64)>,
     /// bucket -> (term -> record list)
     terms: Vec<(u32, Vec<(u32, Vec<Chain>)>)>,
+    /// term -> distinct document count at the checkpoint.
+    doc_freq: Vec<(u32, u32)>,
 }
 
 /// Persisted sparse postings of one space.
@@ -261,25 +266,23 @@ impl Postings {
         Ok(())
     }
 
-    /// Number of postings the query terms reach. Drives the full-scan
-    /// threshold; stale postings of tombstoned slots are counted here too,
-    /// which can only make the caller prefer a full scan.
-    pub fn hits(&self, terms: &[u32]) -> usize {
+    /// Distinct documents known for `term`: checkpointed frequencies plus
+    /// the pending window. Soft-flushed bytes are included only after the
+    /// next checkpoint, so the estimate can be low but never excludes a
+    /// candidate from the posting path.
+    pub fn document_frequency(&self, term: u32) -> usize {
         let state = self.state.lock();
+        let pending = state.pending.get(&term).map_or(0, Vec::len);
+        state.doc_freq.get(&term).copied().unwrap_or(0) as usize + pending
+    }
+
+    /// Largest document frequency among the query terms.
+    pub fn max_document_frequency(&self, terms: &[u32]) -> usize {
         terms
             .iter()
-            .map(|term| {
-                let on_disk = state
-                    .dict
-                    .get(&bucket_of(*term))
-                    .and_then(|terms| terms.get(term))
-                    .map_or(0, |chains| {
-                        chains.iter().map(|chain| chain.count as usize).sum()
-                    });
-                let pending = state.pending.get(term).map_or(0, Vec::len);
-                on_disk + pending
-            })
-            .sum()
+            .map(|term| self.document_frequency(*term))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Visit every posting of `term`, both flushed and pending.
@@ -327,6 +330,7 @@ impl Postings {
         let mut state = self.state.lock();
         if state.pending.is_empty() {
             if let Some(lsn) = lsn {
+                refresh_doc_freq(&mut state)?;
                 write_manifest(&self.dir, &state, lsn)?;
             }
             return Ok(());
@@ -366,6 +370,7 @@ impl Postings {
         }
 
         if let Some(lsn) = lsn {
+            refresh_doc_freq(&mut state)?;
             write_manifest(&self.dir, &state, lsn)?;
         }
         Ok(())
@@ -555,7 +560,52 @@ fn append_bucket(
     Ok(needs_rewrite)
 }
 
-fn write_manifest(dir: &Path, state: &State, lsn: u64) -> Result<()> {    let manifest = Manifest {
+/// Recompute per-term distinct document counts from flushed and pending
+/// postings. Checkpoint-only: the scan is bounded by the number of terms and
+/// their chain lengths, which is exactly what the manifest persists.
+fn refresh_doc_freq(state: &mut State) -> Result<()> {
+    let mut docs: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for (term, postings) in &state.pending {
+        let set = docs.entry(*term).or_default();
+        for posting in postings {
+            set.insert(posting.slot);
+        }
+    }
+    for (bucket_id, terms) in &state.dict {
+        let Some(bucket) = state.buckets.get(bucket_id) else {
+            continue;
+        };
+        let Some(map) = bucket.map.as_ref() else {
+            continue;
+        };
+        for (term, chains) in terms {
+            let set = docs.entry(*term).or_default();
+            for chain in chains {
+                let start = chain.off as usize;
+                let end = start + chain.count as usize * POSTING_BYTES;
+                if end > map.len() {
+                    return Err(VectorSearchError::CorruptData(format!(
+                        "posting record for term {term} lies beyond its bucket"
+                    )));
+                }
+                let slice = unsafe {
+                    std::slice::from_raw_parts(map[start..].as_ptr() as *const Posting, chain.count as usize)
+                };
+                for posting in slice {
+                    set.insert(posting.slot);
+                }
+            }
+        }
+    }
+    state.doc_freq = docs
+        .into_iter()
+        .map(|(term, slots)| (term, slots.len() as u32))
+        .collect();
+    Ok(())
+}
+
+fn write_manifest(dir: &Path, state: &State, lsn: u64) -> Result<()> {
+    let manifest = Manifest {
         lsn,
         buckets: state.lens.iter().map(|(bucket, len)| (*bucket, *len)).collect(),
         terms: state
@@ -570,6 +620,11 @@ fn write_manifest(dir: &Path, state: &State, lsn: u64) -> Result<()> {    let ma
                         .collect::<Vec<_>>(),
                 )
             })
+            .collect(),
+        doc_freq: state
+            .doc_freq
+            .iter()
+            .map(|(term, count)| (*term, *count))
             .collect(),
     };
     crate::storage::snapshot::write(&dir.join(MANIFEST_FILE), &manifest)
@@ -601,6 +656,7 @@ fn load_state(dir: &Path, manifest: Manifest) -> Result<State> {
         }
         state.dict.insert(bucket_id, entries);
     }
+    state.doc_freq = manifest.doc_freq.into_iter().collect();
     Ok(state)
 }
 
@@ -662,7 +718,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let postings = open(dir.path(), None);
         postings.index(0, &[5, 9], &[0.5, 1.5]).unwrap();
-        assert_eq!(postings.hits(&[5, 9, 11]), 2);
+        assert_eq!(postings.document_frequency(5), 1);
+        assert_eq!(postings.max_document_frequency(&[5, 9, 11]), 1);
         assert_eq!(collect(&postings, 5), vec![(0, 0.5)]);
         assert_eq!(collect(&postings, 9), vec![(0, 1.5)]);
         assert!(collect(&postings, 11).is_empty());
@@ -681,7 +738,8 @@ mod tests {
         let reopened = open(dir.path(), Some(7));
         assert_eq!(reopened.term_count(), 2);
         assert_eq!(collect(&reopened, 2), vec![(3, 0.75), (4, 1.0)]);
-        assert_eq!(reopened.hits(&[1, 2]), 3);
+        assert_eq!(reopened.document_frequency(1), 1);
+        assert_eq!(reopened.document_frequency(2), 2);
     }
 
     #[test]
@@ -696,7 +754,7 @@ mod tests {
         // same (slot, term) pairs, so the index must not be trusted.
         let reopened = open(dir.path(), Some(6));
         assert_eq!(reopened.term_count(), 0);
-        assert_eq!(reopened.hits(&[1]), 0);
+        assert_eq!(reopened.document_frequency(1), 0);
         assert!(collect(&reopened, 1).is_empty());
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
@@ -715,7 +773,7 @@ mod tests {
             // Appended after the checkpoint, without a manifest update.
             postings.index(2, &[1], &[2.0]).unwrap();
             postings.flush(None).unwrap();
-            assert_eq!(postings.hits(&[1]), 2);
+            assert_eq!(postings.document_frequency(1), 1);
         }
         let reopened = open(dir.path(), Some(4));
         assert_eq!(
@@ -769,6 +827,22 @@ mod tests {
         let weights: Vec<u32> = collect(&postings, 7).into_iter().map(|(s, _)| s).collect();
         assert_eq!(weights.len(), MAX_CHAINS as usize + 4);
         assert_eq!(weights, (0..(MAX_CHAINS as u32 + 4)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn document_frequencies_survive_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let postings = open(dir.path(), None);
+            postings.index(1, &[7], &[1.0]).unwrap();
+            postings.index(2, &[7, 8], &[1.0, 1.0]).unwrap();
+            postings.flush(Some(4)).unwrap();
+        }
+        let reopened = open(dir.path(), Some(4));
+        assert!(reopened.was_restored());
+        assert_eq!(reopened.document_frequency(7), 2);
+        assert_eq!(reopened.document_frequency(8), 1);
+        assert_eq!(reopened.max_document_frequency(&[7, 8]), 2);
     }
 
     #[test]

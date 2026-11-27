@@ -281,8 +281,10 @@ fn test_snapshot_manifest_rejects_escaping_paths() {
         version: super::snapshot::SNAPSHOT_FORMAT_VERSION,
         generation: 1,
         lsn: 1,
+        reused_files: 0,
         files: vec![super::snapshot::SnapshotFile {
             path: "../outside.bin".to_string(),
+            version: 1,
             len: 0,
             crc32: 0,
         }],
@@ -376,6 +378,125 @@ fn test_numeric_index_range_accelerated_search() {
     assert!(reopened.delete_payload_index("price").unwrap());
     assert!(!reopened.delete_payload_index("price").unwrap());
     assert!(reopened.list_payload_indexes().is_empty());
+}
+
+#[test]
+fn test_field_index_contents_survive_checkpoint_and_fallback_rebuild() {
+    use crate::types::{
+        FilterCondition, GeoPoint, GeoRadius, PayloadSchemaType, SearchQuery, VectorFilter,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_fields");
+    let store = CollectionStore::create(&store_dir, "col_fields", &config(2)).unwrap();
+    store
+        .create_payload_index("title", PayloadSchemaType::Text)
+        .unwrap();
+    store
+        .create_payload_index("location", PayloadSchemaType::Geo)
+        .unwrap();
+    store
+        .create_payload_index("active", PayloadSchemaType::Bool)
+        .unwrap();
+    for (id, title, lat, active) in [
+        (1u64, "hello world", 48.8566, true),
+        (2, "rust vector", 45.7640, false),
+        (3, "hello rust", 48.8600, true),
+    ] {
+        let payload = HashMap::from([
+            ("title".to_string(), serde_json::json!(title)),
+            (
+                "location".to_string(),
+                serde_json::json!({ "lat": lat, "lon": 2.3522 }),
+            ),
+            ("active".to_string(), serde_json::json!(active)),
+        ]);
+        upsert_logged(&store, &point_with_payload(id, 2, payload));
+    }
+    store.checkpoint().unwrap();
+
+    let generation = store.data_dir();
+    let index_file = generation.join("field_indexes.bin");
+    assert!(index_file.exists(), "checkpoint must publish field postings");
+
+    let query = || {
+        SearchQuery::new(vec![0.5, 0.5], 10).with_filter(
+            VectorFilter::new()
+                .must(FilterCondition::match_value("title", "hello world"))
+                .must(FilterCondition::geo_radius(
+                    "location",
+                    GeoRadius::new(GeoPoint::new(48.8566, 2.3522), 100.0),
+                ))
+                .must(FilterCondition::match_value("active", "true")),
+        )
+    };
+    let expected: Vec<_> = store
+        .search(&query())
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect();
+    assert_eq!(expected, vec![PointId::Num(1)]);
+
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    let actual: Vec<_> = reopened
+        .search(&query())
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect();
+    assert_eq!(actual, expected);
+
+    // A damaged derived index is discarded and rebuilt, not fatal.
+    std::fs::write(&index_file, b"not a snapshot").unwrap();
+    drop(reopened);
+    let rebuilt = CollectionStore::open(&store_dir).unwrap();
+    let actual: Vec<_> = rebuilt
+        .search(&query())
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_incremental_snapshot_reuses_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_incremental");
+    let base_dir = dir.path().join("snap_base");
+    let second_dir = dir.path().join("snap_second");
+    let third_dir = dir.path().join("snap_third");
+    let restored_dir = dir.path().join("restored_incremental");
+    let store = CollectionStore::create(&store_dir, "col_incremental", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    let base = store.snapshot_to(&base_dir).unwrap();
+    assert_eq!(base.reused_files, 0);
+
+    let second = store.snapshot_to_incremental(&base_dir, &second_dir).unwrap();
+    assert_eq!(second.reused_files, second.files.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert!(
+            std::fs::metadata(second_dir.join("generation.bin"))
+                .unwrap()
+                .nlink()
+                > 1,
+            "unchanged files must be hard-linked, not copied"
+        );
+    }
+
+    upsert_logged(&store, &point(2, 4));
+    let third = store.snapshot_to_incremental(&base_dir, &third_dir).unwrap();
+    verify_snapshot(&third_dir).unwrap();
+    assert!(third.reused_files < third.files.len());
+    drop(store);
+
+    restore_snapshot(&third_dir, &restored_dir).unwrap();
+    let restored = CollectionStore::open(&restored_dir).unwrap();
+    assert_eq!(restored.count(), 2);
 }
 
 #[test]

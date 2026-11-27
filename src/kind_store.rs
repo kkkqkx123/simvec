@@ -50,7 +50,7 @@ mod score;
 mod state;
 mod write;
 
-pub(crate) use self::score::posting_hits;
+pub(crate) use self::score::prefer_posting_scan;
 pub(crate) use self::score::score_view;
 pub(crate) use self::score::sparse_candidate_scores;
 pub(crate) use self::score::truncate_topk;

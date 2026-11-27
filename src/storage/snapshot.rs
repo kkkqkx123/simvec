@@ -72,9 +72,14 @@ pub const SNAPSHOT_MANIFEST_FILE: &str = "snapshot.json";
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 /// One copied file, addressed relative to the snapshot root.
+///
+/// `version` is the generation that produced the file; WAL files keep the
+/// generation they were bound to. Incremental snapshots reuse a base file
+/// only when all four fields agree, so a same-length rewrite is never reused.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotFile {
     pub path: String,
+    pub version: u64,
     pub len: u64,
     pub crc32: u32,
 }
@@ -89,6 +94,8 @@ pub struct SnapshotInfo {
     pub version: u32,
     pub generation: u64,
     pub lsn: u64,
+    /// Files linked from a verified base snapshot instead of copied.
+    pub reused_files: usize,
     pub files: Vec<SnapshotFile>,
 }
 

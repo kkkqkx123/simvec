@@ -9,7 +9,7 @@ use crate::types::{
 };
 
 use super::{
-    posting_hits, score_view, sparse_candidate_scores, truncate_topk, KindStore,
+    prefer_posting_scan, score_view, sparse_candidate_scores, truncate_topk, KindStore,
 };
 
 impl KindStore {
@@ -160,8 +160,7 @@ impl KindStore {
         let mut candidates: Vec<(u32, f32)> = Vec::new();
         let mut full_scan = false;
         if let VectorData::Sparse { indices, values } = &owned {
-            let hits = posting_hits(&self.postings.load(), indices);
-            full_scan = hits > inner.live_count.saturating_mul(2) as usize;
+            full_scan = !prefer_posting_scan(&self.postings.load(), indices, inner.live_count);
             if !full_scan {
                 candidates = sparse_candidate_scores(
                     &self.postings.load(),

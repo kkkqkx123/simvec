@@ -12,9 +12,9 @@
 4. 拆分 dense 物理段并引入段级 id tracker。
 5. 建立段级 flush 水位、WAL ACK pin 和并发写入路径。
 6. 改造 payload 存储：压缩、blob 外置、槽位身份解耦。
-7. 补齐字段索引持久化与 named/sparse 一等公民支持。
-8. 改造成增量快照并暴露必要接口。
-9. 补齐 ANN 高级能力与文档同步。
+7. 补齐字段索引持久化与 named/sparse 一等公民支持（细化方案见 `stage-7-field-indexes-and-sparse-spaces.md`）。
+8. 改造成增量快照并暴露必要接口（细化方案见 `stage-8-incremental-snapshots.md`）。
+9. 补齐 ANN 高级能力与文档同步（细化方案见 `stage-9-ann-healing-and-capabilities.md`）。
 
 前面的阶段可以独立验证；后面的阶段依赖前面的文件格式和并发语义稳定。
 

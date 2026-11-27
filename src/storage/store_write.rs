@@ -483,11 +483,38 @@ impl CollectionStore {
 
     pub(super) fn apply_delete_slot_locked(&self, inner: &mut StoreInner, slot: u32) -> Result<()> {
         self.update_tombstone_bit(slot as usize, true);
+        self.heal_hnsw_after_delete(inner, slot);
         inner.filter_bitmap.unregister_slot(slot);
         inner.payload_indexes.unregister_slot(slot);
         inner.meta.live_count = inner.meta.live_count.saturating_sub(1);
         inner.meta.tombstone_count += 1;
         Ok(())
+    }
+
+    /// Repair the one segment graph that contains a deleted slot. Replay does
+    /// not see a published graph at open, so this is a live-only optimization;
+    /// the persisted graph keeps the node and searches still filter it out.
+    fn heal_hnsw_after_delete(&self, inner: &StoreInner, slot: u32) {
+        if inner.meta.segment_slots == 0 {
+            return;
+        }
+        let data = self.data_arc();
+        let graphs = data.hnsw_segments.load();
+        let Some(target) = graphs
+            .iter()
+            .find(|segment| slot >= segment.start && slot < segment.end)
+        else {
+            return;
+        };
+        let tombstones = data.tombstones.load();
+        let vectors = data.vectors.snapshot();
+        target.index.heal_deleted(
+            slot - target.start,
+            &vectors,
+            inner.meta.segment_slots,
+            target.start,
+            |global| tombstones.bit(global as usize),
+        );
     }
 
     pub(super) fn update_tombstone_bit(&self, slot: usize, value: bool) {

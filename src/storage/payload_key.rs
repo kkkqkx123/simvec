@@ -11,7 +11,17 @@
 //!   an equality condition).
 
 /// A normalized payload/filter value used as an index key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub(crate) enum Key {
     Str(String),
     Num(u64),

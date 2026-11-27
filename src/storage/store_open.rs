@@ -267,13 +267,23 @@ impl CollectionStore {
         let mut versions: IdMap<u64> = IdMap::default();
         let mut filter_bitmap = FilterBitmap::with_capacity(meta.slot_capacity as usize);
         let mut payload_indexes = PayloadIndexManager::new();
-        for def in PayloadIndexManager::load_defs(&data_dir) {
-            if payload_indexes
-                .declare(&def.field, def.schema, meta.slot_capacity as usize)
-                .is_err()
-            {
-                continue;
+        let definitions = PayloadIndexManager::load_defs(&data_dir);
+        let declare_all = |manager: &mut PayloadIndexManager| {
+            for def in &definitions {
+                let _ = manager.declare(&def.field, def.schema, meta.slot_capacity as usize);
             }
+        };
+        declare_all(&mut payload_indexes);
+        // A published posting file is acceleration only. It must describe the
+        // exact generation view; otherwise the payload store and WAL replay
+        // rebuild the masks from scratch.
+        let restored = PayloadIndexManager::load(&data_dir, generation.id(), generation.lsn())
+            .is_some_and(|data| {
+                payload_indexes.restore(data, generation.id(), generation.lsn())
+            });
+        if !restored && !definitions.is_empty() {
+            payload_indexes = PayloadIndexManager::new();
+            declare_all(&mut payload_indexes);
         }
         let tombstone_count = files.tombstones.load().count_ones();
         // The snapshot owns the id directory, not the payload bytes: a payload

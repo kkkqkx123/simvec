@@ -179,8 +179,11 @@ impl NamedStore {
             let space_index = self.postings_of(target);
             let norms = inner.norms.get(target);
             if let (Some(space_index), Some(norms)) = (space_index, norms) {
-                let hits = crate::kind_store::posting_hits(&space_index, indices);
-                full_scan = hits > inner.live_count.saturating_mul(2) as usize;
+                full_scan = !crate::kind_store::prefer_posting_scan(
+                    &space_index,
+                    indices,
+                    inner.live_count,
+                );
                 if !full_scan {
                     candidates = sparse_scores(
                         &space_index,

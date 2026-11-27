@@ -33,6 +33,7 @@ use crate::types::{DistanceMetric, HnswConfig};
 use bitvec::prelude::*;
 
 mod build;
+mod heal;
 mod maintain;
 mod persist;
 mod search;
@@ -345,6 +346,10 @@ pub(crate) struct HnswIndex {
     /// diagnostics. Attached by the store after construction; `None` in
     /// standalone builds (benches, tests), which then record nothing.
     lock_metrics: Option<Arc<Metrics>>,
+    /// Deleted nodes whose neighborhood was repaired locally instead of
+    /// waiting for a segment rebuild. Diagnostic counters only.
+    healed_nodes: AtomicU64,
+    healed_edges: AtomicU64,
 }
 
 impl HnswIndex {
@@ -371,6 +376,8 @@ impl HnswIndex {
                 .max(1),
             max_scan_tuples: config.max_scan_tuples,
             lock_metrics: None,
+            healed_nodes: AtomicU64::new(0),
+            healed_edges: AtomicU64::new(0),
         }
     }
 
