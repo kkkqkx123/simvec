@@ -1,9 +1,11 @@
-//! `index.bin` — persisted IVFFlat state (centroids + slot membership).
+//! Persisted ANN state (per-segment IVF centroids + slot membership).
 //!
-//! The IVF index is a *derived* structure: it can be rebuilt from
-//! `vectors.bin` at any time, so persistence is a pure optimization for open
-//! latency. Any validation failure on load discards the file and falls back to
-//! exact scan rather than blocking startup.
+//! Indexes are *derived* structures: they can be rebuilt from `vectors.bin`
+//! at any time, so persistence is a pure optimization for open latency. Any
+//! validation failure on load discards the file and falls back to exact scan
+//! rather than blocking startup. One file is written per completed dense
+//! segment (`hnsw_seg_<start>.bin` / `ivf_seg_<start>.bin` layout); there is
+//! no whole-collection index file.
 
 use std::fs::File;
 use std::io::Write;
@@ -22,13 +24,9 @@ pub(crate) const INDEX_MAGIC: [u8; 4] = *b"VIVF";
 /// falls back" contract. The format is CRC32-protected tag
 /// `[magic 4][version u16 LE][crc32 u32 LE][postcard payload]`.
 pub(crate) const INDEX_VERSION: u16 = 1;
-const INDEX_TMP: &str = "index_tmp.bin";
-
-const HNSW_FILE: &str = "hnsw.bin";
 const HNSW_MAGIC: [u8; 4] = *b"VHSW";
 /// Same dev-stage policy as `INDEX_VERSION`; version locked at 1.
 const HNSW_VERSION: u16 = 1;
-const HNSW_TMP: &str = "hnsw_tmp.bin";
 
 /// The persisted subset of the IVF index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,47 +59,6 @@ impl PersistedIvf {
                 .iter()
                 .all(|&l| l == u32::MAX || (l as usize) < self.centroids.len())
     }
-
-    /// Check against the live collection metadata on open.
-    pub(crate) fn valid_for(&self, dim: usize, distance: DistanceMetric, next_slot: u64) -> bool {
-        self.structurally_valid()
-            && self.dim == dim
-            && self.distance == distance
-            && self.slot_list.len() as u64 <= next_slot
-    }
-
-    /// Renumber slot assignments through `map` (`u32::MAX` = dropped).
-    ///
-    /// Compaction renumbers the live slots densely while keeping their order,
-    /// so the list assignment of a surviving point is unchanged — only its
-    /// slot number moves. Rebuilding the index (k-means included) to
-    /// rediscover that would be pure waste.
-    pub(crate) fn remap(&self, map: &[u32]) -> Self {
-        let live = map.iter().filter(|m| **m != u32::MAX).count();
-        let mut slot_list = vec![u32::MAX; live];
-        for (old_slot, &list) in self.slot_list.iter().enumerate() {
-            let Some(&new_slot) = map.get(old_slot) else {
-                // Slots appended after the build have no assignment yet; the
-                // pending path adopts them after the remap.
-                continue;
-            };
-            if new_slot != u32::MAX {
-                slot_list[new_slot as usize] = list;
-            }
-        }
-        Self {
-            slot_list,
-            built_at_live_count: live as u64,
-            ..self.clone()
-        }
-    }
-}
-
-/// Write `data` to `<dir>/index.bin` atomically (temp file + fsync + rename).
-pub(crate) fn save(dir: &Path, data: &PersistedIvf) -> Result<()> {
-    write_tagged(&dir.join(INDEX_TMP), &INDEX_MAGIC, INDEX_VERSION, data)?;
-    std::fs::rename(dir.join(INDEX_TMP), dir.join("index.bin"))?;
-    Ok(())
 }
 
 /// Write a single segment's IVF state to an explicit path.
@@ -129,30 +86,6 @@ pub(crate) fn load_at(path: &Path) -> Result<Option<PersistedIvf>> {
     }
 }
 
-/// Load `<dir>/index.bin`. Returns `Ok(None)` when the file is absent or
-/// fails any structural check; a failing check also deletes the file so the
-/// next save starts clean.
-pub(crate) fn load(dir: &Path) -> Result<Option<PersistedIvf>> {
-    let path = dir.join("index.bin");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-
-    let parsed = read_tagged::<PersistedIvf>(&bytes, &INDEX_MAGIC, INDEX_VERSION);
-
-    match parsed {
-        // Any malformed content is treated as absent: the index is a derived
-        // structure and must never block startup.
-        Ok(data) if data.structurally_valid() => Ok(Some(data)),
-        _ => {
-            discard(&path);
-            Ok(None)
-        }
-    }
-}
-
 pub(crate) fn discard(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
@@ -170,7 +103,7 @@ pub(crate) struct PersistedNodeRecord {
     pub neighbors: Vec<Vec<u32>>,
 }
 
-/// The persisted subset of the HNSW index (`hnsw.bin`).
+/// The persisted subset of one HNSW segment graph.
 ///
 /// Like the IVF state this is a *derived* structure: any validation failure
 /// on load discards the file and falls back to exact scan.
@@ -184,7 +117,7 @@ pub(crate) struct PersistedHnsw {
     /// `(slot, level)` of the graph entry point; `None` = empty graph.
     pub entry: Option<(u32, i32)>,
     pub built_at_live_count: u64,
-    /// Dense from slot 0 (compaction renumbers live slots densely and the
+    /// Dense from slot 0 (segment rebuilds number live slots densely and the
     /// insert path appends in ascending order).
     pub nodes: Vec<PersistedNodeRecord>,
 }
@@ -200,7 +133,7 @@ impl PersistedHnsw {
             n.neighbors.len() == n.level as usize + 1
                 && n.neighbors.iter().enumerate().all(|(lc, list)| {
                     let cap = if lc == 0 { self.m * 2 } else { self.m };
-                    list.len() <= cap && list.iter().all(|&s| slots.contains(&s))
+                    list.len() <= cap && list.iter().all(|s| slots.contains(s))
                 })
         }) && match self.entry {
             None => true,
@@ -209,76 +142,6 @@ impl PersistedHnsw {
                 .iter()
                 .any(|n| n.slot == slot && n.level as i32 == level),
         }
-    }
-
-    /// Check against the live collection metadata on open. Nodes are dense
-    /// from slot 0, so every recorded slot must sit below `next_slot`.
-    pub(crate) fn valid_for(&self, dim: usize, distance: DistanceMetric, next_slot: u64) -> bool {
-        self.structurally_valid()
-            && self.dim == dim
-            && self.distance == distance
-            && self.nodes.iter().all(|n| (n.slot as u64) < next_slot)
-    }
-
-    /// Renumber the graph through `map` (`u32::MAX` = dropped).
-    ///
-    /// The topology carries over unchanged: adjacency lists are translated
-    /// and pruned of dead ids, which only ever shortens them, so the per-layer
-    /// caps still hold. Returns `None` when the result would not be a valid
-    /// `hnsw.bin` — a hole in the node table (a point that never made it into
-    /// the graph) cannot be invented here, and [`HnswIndex::from_persisted`]
-    /// requires the table to be dense from slot 0.
-    pub(crate) fn remap(&self, map: &[u32]) -> Option<Self> {
-        let mut nodes = Vec::with_capacity(self.nodes.len());
-        for record in &self.nodes {
-            let new_slot = *map.get(record.slot as usize)?;
-            if new_slot == u32::MAX {
-                continue;
-            }
-            nodes.push(PersistedNodeRecord {
-                slot: new_slot,
-                level: record.level,
-                version: record.version,
-                neighbors: record
-                    .neighbors
-                    .iter()
-                    .map(|list| {
-                        list.iter()
-                            .filter_map(|slot| match map.get(*slot as usize) {
-                                Some(&m) if m != u32::MAX => Some(m),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            });
-        }
-        // Live slots are renumbered densely in ascending order, so sorting by
-        // the new id yields exactly `0..live`.
-        nodes.sort_unstable_by_key(|n| n.slot);
-        if nodes.iter().enumerate().any(|(i, n)| n.slot as usize != i) {
-            return None;
-        }
-        let entry = match self.entry {
-            None => None,
-            Some((slot, level)) => match map.get(slot as usize).copied() {
-                Some(m) if m != u32::MAX => Some((m, level)),
-                // The entry point was tombstoned and is about to be dropped.
-                // The deepest surviving node takes over: any node can serve as
-                // an entry point, the level only decides where traversal
-                // starts.
-                _ => nodes
-                    .iter()
-                    .max_by_key(|n| n.level)
-                    .map(|n| (n.slot, n.level as i32)),
-            },
-        };
-        Some(Self {
-            entry,
-            built_at_live_count: nodes.len() as u64,
-            nodes,
-            ..self.clone()
-        })
     }
 }
 
@@ -302,33 +165,6 @@ pub(crate) fn load_hnsw_at(path: &Path) -> Result<Option<PersistedHnsw>> {
         Ok(data) if data.structurally_valid() => Ok(Some(data)),
         _ => {
             discard(path);
-            Ok(None)
-        }
-    }
-}
-
-/// Write `data` to `<dir>/hnsw.bin` atomically (temp file + fsync + rename).
-pub(crate) fn save_hnsw(dir: &Path, data: &PersistedHnsw) -> Result<()> {
-    write_tagged(&dir.join(HNSW_TMP), &HNSW_MAGIC, HNSW_VERSION, data)?;
-    std::fs::rename(dir.join(HNSW_TMP), dir.join(HNSW_FILE))?;
-    Ok(())
-}
-
-/// Load `<dir>/hnsw.bin`. Same contract as [`load`]: absent or invalid means
-/// `Ok(None)` with the file removed so the next save starts clean.
-pub(crate) fn load_hnsw(dir: &Path) -> Result<Option<PersistedHnsw>> {
-    let path = dir.join(HNSW_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-
-    let parsed = read_tagged::<PersistedHnsw>(&bytes, &HNSW_MAGIC, HNSW_VERSION);
-    match parsed {
-        Ok(data) if data.structurally_valid() => Ok(Some(data)),
-        _ => {
-            discard(&path);
             Ok(None)
         }
     }
@@ -391,12 +227,17 @@ mod tests {
         }
     }
 
+    fn segment_path(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        dir.path().join(name)
+    }
+
     #[test]
     fn test_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let data = sample(3, 4);
-        save(dir.path(), &data).unwrap();
-        let loaded = load(dir.path()).unwrap().unwrap();
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        save_at(&path, &data).unwrap();
+        let loaded = load_at(&path).unwrap().unwrap();
         assert_eq!(loaded.lists, 3);
         assert_eq!(loaded.dim, 4);
         assert_eq!(loaded.slot_list.len(), 4);
@@ -407,45 +248,29 @@ mod tests {
     #[test]
     fn test_load_absent_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).unwrap().is_none());
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        assert!(load_at(&path).unwrap().is_none());
     }
 
     #[test]
     fn test_load_corrupt_discards_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("index.bin"), b"XXXXgarbage").unwrap();
-        assert!(load(dir.path()).unwrap().is_none());
-        assert!(!dir.path().join("index.bin").exists());
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        std::fs::write(&path, b"XXXXgarbage").unwrap();
+        assert!(load_at(&path).unwrap().is_none());
+        assert!(!path.exists());
     }
 
     #[test]
     fn test_load_truncated_postcard_discards_file() {
         let dir = tempfile::tempdir().unwrap();
-        save(dir.path(), &sample(2, 3)).unwrap();
-        let mut bytes = std::fs::read(dir.path().join("index.bin")).unwrap();
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        save_at(&path, &sample(2, 3)).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
         bytes.truncate(10);
-        std::fs::write(dir.path().join("index.bin"), &bytes).unwrap();
-        assert!(load(dir.path()).unwrap().is_none());
-        assert!(!dir.path().join("index.bin").exists());
-    }
-
-    #[test]
-    fn test_valid_for_checks() {
-        let data = sample(2, 3);
-        // slot_list covers slots 0..4; valid only if next_slot >= 4.
-        assert!(data.valid_for(3, DistanceMetric::Cosine, 4));
-        assert!(
-            !data.valid_for(4, DistanceMetric::Cosine, 4),
-            "dim mismatch"
-        );
-        assert!(
-            !data.valid_for(3, DistanceMetric::Euclid, 4),
-            "metric mismatch"
-        );
-        assert!(
-            !data.valid_for(3, DistanceMetric::Cosine, 2),
-            "slot_list longer than next_slot"
-        );
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_at(&path).unwrap().is_none());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -458,18 +283,19 @@ mod tests {
     #[test]
     fn test_payload_bitflip_detected_by_crc() {
         let dir = tempfile::tempdir().unwrap();
-        save(dir.path(), &sample(2, 3)).unwrap();
-        let mut bytes = std::fs::read(dir.path().join("index.bin")).unwrap();
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        save_at(&path, &sample(2, 3)).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() > 10, "payload must exist");
         // Flip an arbitrary payload byte (header is 10 bytes: magic 4 + version 2 + crc 4).
         bytes[10] ^= 0xFF;
-        std::fs::write(dir.path().join("index.bin"), &bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
         assert!(
-            load(dir.path()).unwrap().is_none(),
+            load_at(&path).unwrap().is_none(),
             "CRC mismatch must be treated as corrupt"
         );
         assert!(
-            !dir.path().join("index.bin").exists(),
+            !path.exists(),
             "corrupt payload file must be deleted"
         );
     }
@@ -487,28 +313,30 @@ mod tests {
             built_at_live_count: 0,
             nodes: vec![],
         };
-        save_hnsw(dir.path(), &data).unwrap();
-        let mut bytes = std::fs::read(dir.path().join("hnsw.bin")).unwrap();
+        let path = segment_path(&dir, "hnsw_seg_0000000000.bin");
+        save_hnsw_at(&path, &data).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() > 10);
         bytes[10] ^= 0xA5;
-        std::fs::write(dir.path().join("hnsw.bin"), &bytes).unwrap();
-        assert!(load_hnsw(dir.path()).unwrap().is_none());
-        assert!(!dir.path().join("hnsw.bin").exists());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_hnsw_at(&path).unwrap().is_none());
+        assert!(!path.exists());
     }
 
     #[test]
     fn test_old_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        save(dir.path(), &sample(2, 3)).unwrap();
-        let mut bytes = std::fs::read(dir.path().join("index.bin")).unwrap();
+        let path = segment_path(&dir, "ivf_seg_0000000000.bin");
+        save_at(&path, &sample(2, 3)).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
         // Flip version from 1 to 2 (bytes 4..6 LE). Keep CRC/payload otherwise valid.
         bytes[4] = 2;
         bytes[5] = 0;
-        std::fs::write(dir.path().join("index.bin"), &bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
         assert!(
-            load(dir.path()).unwrap().is_none(),
+            load_at(&path).unwrap().is_none(),
             "unsupported version must be treated as corrupt"
         );
-        assert!(!dir.path().join("index.bin").exists());
+        assert!(!path.exists());
     }
 }

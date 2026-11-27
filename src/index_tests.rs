@@ -203,23 +203,6 @@ fn test_pending_slots_are_probed() {
 }
 
 #[test]
-fn test_adopt_range_covers_new_slots() {
-    let vectors: Vec<Vec<f32>> = blobs(2).into_iter().map(|(v, _)| v).collect();
-    let (_dir, mmaps) = mmap_from(&vectors);
-    let first_half: Vec<u32> = (0..4).collect();
-    let index = IvfIndex::build(
-        &IndexBuildParams::new("col", 8, DistanceMetric::Euclid, &first_half, &mmaps, 16),
-        &config(),
-    )
-    .unwrap();
-
-    let tombstones = crate::storage::TombstoneBits::from_bits(bitvec::bitvec![0; vectors.len()]);
-    index.adopt_range(4, vectors.len() as u32, &tombstones, &mmaps, 16, 0);
-    let total: usize = index.lists.iter().map(|l| l.read().len()).sum();
-    assert_eq!(total, vectors.len());
-}
-
-#[test]
 fn test_drift_ratio_detects_moved_points() {
     let vectors: Vec<Vec<f32>> = blobs(4).into_iter().map(|(v, _)| v).collect();
     let (_dir, mmaps) = mmap_from(&vectors);

@@ -321,7 +321,7 @@ impl QuantStore {
             return Ok(false);
         }
         let total = segment_bytes(self.bytes_per_vector, segment_slots);
-        let mut file = File::options()
+        let file = File::options()
             .read(true)
             .write(true)
             .create(true)

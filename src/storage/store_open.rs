@@ -182,7 +182,6 @@ impl CollectionStore {
             tombstones: ArcSwap::from(Arc::new(initial_tombstones)),
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: parking_lot::RwLock::new(quant),
-            index: ArcSwap::from(Arc::new(None)),
             hnsw_segments: ArcSwap::from(Arc::new(Vec::new())),
             ivf_segments: ArcSwap::from(Arc::new(Vec::new())),
             segments: ArcSwap::from(Arc::new(super::segments::SegmentSet::new(

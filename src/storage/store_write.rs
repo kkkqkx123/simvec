@@ -354,14 +354,17 @@ impl CollectionStore {
     }
 
     /// Record the overwrite distance leg for an in-graph slot.
-    /// Fresh slots and collections without a published graph have no graph
-    /// position to go stale, so the graph itself decides via presence whether
-    /// the leg counts. Runs under the store write lock; the graph read lock
-    /// is leaf-level, matching the store-then-graph order of every reader.
+    /// Fresh slots and slots outside every published segment graph have no
+    /// graph position to go stale, so the segment graph decides via presence
+    /// whether the leg counts. Runs under the store write lock; the graph
+    /// read lock is leaf-level, matching the store-then-graph order of every
+    /// reader.
     fn note_overwrite_distance(&self, inner: &StoreInner, slot: u32, new_vector: &[f32]) {
         let data = self.data_arc();
-        let published = data.index.load();
-        let Some(super::index_lifecycle::PublishedIndex::Hnsw(index)) = published.as_ref()
+        let segments = data.hnsw_segments.load();
+        let Some(target) = segments
+            .iter()
+            .find(|segment| slot >= segment.start && slot < segment.end)
         else {
             return;
         };
@@ -376,7 +379,7 @@ impl CollectionStore {
         };
         let delta =
             (crate::distance::distance(inner.meta.distance, new_vector, old) * 1e6) as u64;
-        index.note_overwrite_delta(slot, delta);
+        target.index.note_overwrite_delta(slot - target.start, delta);
     }
 
     /// Resolve the id a payload mutation targets. Shared by the pre-logging

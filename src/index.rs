@@ -34,9 +34,9 @@ pub(crate) const UNASSIGNED: u32 = u32::MAX;
 /// Inputs shared by both ANN-tier build entry points.
 ///
 /// Groups the corpus description and the observability sink so the build
-/// signatures stay stable as knobs are added. `progress` is only wired by
-/// the store's lifecycle paths; standalone builders (tests, tooling) leave
-/// it unset via [`IndexBuildParams::new`].
+/// signatures stay stable as knobs are added. `progress`, when set, is
+/// incremented once per processed slot; builders leave it unset via
+/// [`IndexBuildParams::new`] unless they report progress.
 pub(crate) struct IndexBuildParams<'a> {
     /// Target collection name; seeds the deterministic build RNG.
     pub collection: &'a str,
@@ -84,11 +84,6 @@ impl<'a> IndexBuildParams<'a> {
         self
     }
 
-    /// Attach a per-slot progress sink for long builds.
-    pub(crate) fn with_progress(mut self, progress: &'a AtomicU64) -> Self {
-        self.progress = Some(progress);
-        self
-    }
 }
 
 /// Upper bound for reported drift ratios so stored/serialized values stay
@@ -338,7 +333,7 @@ impl IvfIndex {
         self.built_at_live_count
     }
 
-    /// Snapshot of the persisted representation (for `index.bin`).
+    /// Snapshot of the persisted representation (for per-segment `ivf_seg_*` files).
     pub(crate) fn to_persisted(&self) -> PersistedIvf {
         PersistedIvf {
             lists: self.centroids.len() as u32,
@@ -387,29 +382,6 @@ impl IvfIndex {
             }
         }
         timed_write_lock(self.lock_metrics.as_deref(), &self.lists[new_list as usize]).push(slot);
-    }
-
-    /// Assign every non-tombstoned slot in `start..end` (publish path: slots
-    /// appended while this index was being built).
-    pub(crate) fn adopt_range(
-        &self,
-        start: u32,
-        end: u32,
-        tombstones: &crate::storage::TombstoneBits,
-        vectors: &[Arc<Mmap>],
-        segment_slots: u32,
-        slot_base: u32,
-    ) {
-        for slot in start..end {
-            if tombstones.bit((slot + slot_base) as usize) {
-                continue;
-            }
-            if let Some(v) =
-                Vectors::read_slot(vectors, (slot + slot_base) as u64, segment_slots, self.dim)
-            {
-                self.assign_slot(slot, v);
-            }
-        }
     }
 
     /// Probe search over the `nprobe` closest lists plus any unassigned

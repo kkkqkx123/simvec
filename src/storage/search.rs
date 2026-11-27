@@ -15,7 +15,6 @@ use std::time::Instant;
 use bitvec::prelude::*;
 
 use super::directory::DirView;
-use super::index_lifecycle::PublishedIndex;
 use super::segment_hnsw::SegmentHnsw;
 use super::segment_ivf;
 use super::{CollectionStore, PayloadStore, TombstoneBits};
@@ -82,7 +81,6 @@ impl CollectionStore {
             tombstones,
             vsnap,
             keysnap,
-            published,
             filter_mask,
             pending,
             hnsw_segments,
@@ -114,7 +112,6 @@ impl CollectionStore {
                 data.tombstones.load(),
                 data.vectors.snapshot(),
                 data.keys.snapshot(),
-                data.index.load(),
                 mask,
                 self.pending.lock().clone(),
                 data.hnsw_segments.load(),
@@ -145,47 +142,14 @@ impl CollectionStore {
             } else {
                 self.search_segmented_hnsw(query, &snap, &pending, started)
             };
-            drop(published);
             return results;
         }
         if !snap.ivf_segments.is_empty() {
             let results = self.search_segmented_ivf(query, &snap, &pending);
             self.metrics
                 .record_search(SearchPath::Ivf, filtered, started.elapsed());
-            drop(published);
             return results;
         }
-        match published.as_ref() {
-            Some(PublishedIndex::Ivf(index)) => {
-                let results = self.search_ivf(index.as_ref(), query, &snap, &pending);
-                self.metrics
-                    .record_search(SearchPath::Ivf, filtered, started.elapsed());
-                drop(published);
-                return results;
-            }
-            Some(PublishedIndex::Hnsw(index)) => {
-                // Highly selective filters match fewer slots than one layer-0
-                // pass would score, so the exact scan underneath is cheaper
-                // than the graph walk plus its retries and returns true top-k.
-                let selective = snap.filter_mask.as_ref().is_some_and(|m| {
-                    m.count_ones()
-                        <= query.hnsw_ef().unwrap_or_else(|| index.default_ef())
-                });
-                if selective {
-                    let results =
-                        self.search_exact(query, &snap, metric, next_slot, filtered, started);
-                    drop(published);
-                    return results;
-                }
-                let results = self.search_hnsw(index.as_ref(), query, &snap, &pending);
-                self.metrics
-                    .record_search(SearchPath::Hnsw, filtered, started.elapsed());
-                drop(published);
-                return results;
-            }
-            None => {}
-        }
-        drop(published);
 
         // Quantized path: when quantization is active and ready, do a coarse
         // quantized scan for `k * oversample` then rerank with exact vectors.

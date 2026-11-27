@@ -13,7 +13,7 @@ impl HnswIndex {
     pub(crate) fn from_persisted(data: PersistedHnsw, config: &HnswConfig) -> Result<Self> {
         if data.dim == 0 || data.m < MIN_M {
             return Err(VectorSearchError::CorruptData(
-                "hnsw.bin invalid header".to_string(),
+                "segment graph invalid header".to_string(),
             ));
         }
         let index = Self::new(
@@ -31,12 +31,12 @@ impl HnswIndex {
         for record in &data.nodes {
             if record.slot as usize != nodes.len() {
                 return Err(VectorSearchError::CorruptData(
-                    "hnsw.bin nodes not dense from slot 0".to_string(),
+                    "segment graph nodes not dense from slot 0".to_string(),
                 ));
             }
             if record.neighbors.len() != record.level as usize + 1 {
                 return Err(VectorSearchError::CorruptData(
-                    "hnsw.bin node layer count mismatch".to_string(),
+                    "segment graph node layer count mismatch".to_string(),
                 ));
             }
             nodes.push(Some(Arc::new(Node::new(record.level))));
@@ -58,7 +58,7 @@ impl HnswIndex {
                 let cap = index.layer_cap(lc as u8);
                 if list.len() > cap || list.iter().any(|&s| s as usize >= nodes.len()) {
                     return Err(VectorSearchError::CorruptData(format!(
-                        "hnsw.bin adjacency violation at slot {}",
+                        "segment graph adjacency violation at slot {}",
                         record.slot
                     )));
                 }
@@ -71,7 +71,7 @@ impl HnswIndex {
                 Some(Some(node)) if node.level as i32 == level => {}
                 _ => {
                     return Err(VectorSearchError::CorruptData(
-                        "hnsw.bin entry point invalid".to_string(),
+                        "segment graph entry point invalid".to_string(),
                     ))
                 }
             }
@@ -88,7 +88,7 @@ impl HnswIndex {
         Ok(index)
     }
 
-    /// Snapshot of the persisted representation (for `hnsw.bin`).
+    /// Snapshot of the persisted representation (for per-segment graph files).
     pub(crate) fn to_persisted(&self) -> PersistedHnsw {
         let nodes = self.nodes.read();
         let records = nodes

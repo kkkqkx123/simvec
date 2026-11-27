@@ -78,7 +78,6 @@ pub(crate) use tombstones::TombstoneBits;
 pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 
 use self::filter_bitmap::FilterBitmap;
-use self::index_lifecycle::PublishedIndex;
 use self::keys::Keys;
 use self::quant::QuantStore;
 use self::queue::CommitQueue;
@@ -295,7 +294,6 @@ pub(super) struct DataFiles {
     tombstones: ArcSwap<TombstoneBits>,
     payload_store: ArcSwap<Option<PayloadStore>>,
     quant: RwLock<Option<QuantStore>>,
-    index: ArcSwap<Option<PublishedIndex>>,
     /// One HNSW graph per completed dense segment.
     hnsw_segments: ArcSwap<Vec<segment_hnsw::SegmentHnsw>>,
     /// One IVF index per completed dense segment.
@@ -350,7 +348,6 @@ impl DataFiles {
             tombstones: ArcSwap::from(Arc::new(tombstones)),
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: RwLock::new(quant),
-            index: ArcSwap::from(Arc::new(None)),
             hnsw_segments: ArcSwap::from(Arc::new(Vec::new())),
             ivf_segments: ArcSwap::from(Arc::new(Vec::new())),
             segments: ArcSwap::from(Arc::new(segments)),

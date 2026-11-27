@@ -382,11 +382,6 @@ impl PayloadStore {
         Ok(())
     }
 
-    /// Delete specific keys from a slot's payload.
-    pub fn delete_keys(&self, slot: u32, keys: &[&str]) -> Result<()> {
-        self.delete_keys_at(slot, keys, 0)
-    }
-
     pub(super) fn delete_keys_at(&self, slot: u32, keys: &[&str], lsn: u64) -> Result<()> {
         let mut current = match self.get(slot)? {
             Some(p) => p,
@@ -405,13 +400,6 @@ impl PayloadStore {
     /// A single-field write (`set_field`) is expressed as a one-entry merge;
     /// block allocation always follows the write-to-new model, so no
     /// compaction is needed to reclaim superseded blobs.
-    pub fn merge<I>(&self, slot: u32, partial: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (String, serde_json::Value)>,
-    {
-        self.merge_at(slot, partial, 0)
-    }
-
     pub(super) fn merge_at<I>(&self, slot: u32, partial: I, lsn: u64) -> Result<()>
     where
         I: IntoIterator<Item = (String, serde_json::Value)>,
@@ -515,7 +503,7 @@ mod tests {
                 ])),
             )
             .unwrap();
-        store.delete_keys(0, &["b", "c"]).unwrap();
+        store.delete_keys_at(0, &["b", "c"], 0).unwrap();
         let got = store.get(0).unwrap().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got.get("a"), Some(&json!(1)));
@@ -548,16 +536,17 @@ mod tests {
     fn test_merge_creates_and_updates() {
         let (store, _dir) = temp_store();
         // A merge on an empty slot creates the payload.
-        store.merge(0, [("a".to_string(), json!(1))]).unwrap();
+        store.merge_at(0, [("a".to_string(), json!(1))], 0).unwrap();
         assert_eq!(store.get(0).unwrap().unwrap().get("a"), Some(&json!(1)));
         // Merging preserves the other keys and overwrites only given ones.
         store
-            .merge(
+            .merge_at(
                 0,
                 [
                     ("b".to_string(), json!("x")),
                     ("a".to_string(), json!(true)),
                 ],
+                0,
             )
             .unwrap();
         let got = store.get(0).unwrap().unwrap();

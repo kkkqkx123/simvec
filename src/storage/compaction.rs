@@ -634,8 +634,7 @@ impl CollectionStore {
             DataFiles::open(staged.path(), &meta, &self.storage, meta.last_applied_txn)?;
         drop(staged_files);
         let old_files_view = self.data_arc();
-        let had_index = old_files_view.index.load().is_some()
-            || !old_files_view.hnsw_segments.load().is_empty()
+        let had_index = !old_files_view.hnsw_segments.load().is_empty()
             || !old_files_view.ivf_segments.load().is_empty();
         drop(old_files_view);
         let old_generation = self.generation.read().clone();
@@ -652,7 +651,6 @@ impl CollectionStore {
         // Reopen from the published path so every handle's path stays valid
         // for later growth and checkpoint writes.
         let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage, watermark)?;
-        new_files.index.store(Arc::new(None));
         new_files.ivf_segments.store(Arc::new(staged_index.ivf));
         new_files.hnsw_segments.store(Arc::new(staged_index.hnsw));
         let has_new_index =

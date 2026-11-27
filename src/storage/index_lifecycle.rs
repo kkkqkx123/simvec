@@ -33,13 +33,6 @@ use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
 use crate::metrics::IndexTier;
 use crate::types::{HnswConfig, IndexConfig, IndexInfo, IndexKind, IvfConfig};
 
-/// A published ANN index; `None` = exact scan. Both tiers are derived
-/// structures over `vectors.bin` and swap in atomically.
-pub(super) enum PublishedIndex {
-    Ivf(Arc<IvfIndex>),
-    Hnsw(Arc<HnswIndex>),
-}
-
 impl CollectionStore {
     /// Whether a pending backlog of `pending` slots warrants a full HNSW
     /// rebuild of a published graph with `nodes` nodes. Draining and
@@ -150,9 +143,6 @@ impl CollectionStore {
         drop(inner);
         for segment in files.ivf_segments.load().iter() {
             segment.index.set_config(config.clone());
-        }
-        if let Some(PublishedIndex::Ivf(index)) = files.index.load().as_ref() {
-            index.set_config(config);
         }
         Ok(())
     }
@@ -386,7 +376,7 @@ impl CollectionStore {
     /// For published HNSW the slot is pushed to `pending` rather than
     /// inserted inline into the graph, so the upsert critical section stays
     /// O(1) instead of O(ef_construct) graph search.  Pending slots are
-    /// scored by brute force in `search_hnsw` for correct visibility, and
+    /// scored by brute force in the segmented HNSW path for correct visibility, and
     /// drained into the graph by the maintenance worker on each tick.
     pub(super) fn register_slot(&self, slot: u32, vector: &[f32], segment_slots: u32) {
         // Writes to the partial tail segment stay out of the frozen index.
@@ -480,32 +470,12 @@ impl CollectionStore {
             }
             return;
         }
-        let published = files.index.load();
-        match published.as_ref() {
-            Some(PublishedIndex::Ivf(index)) => {
-                index.assign_slot(slot, vector);
-                index.note_upsert();
-                return;
-            }
-            Some(PublishedIndex::Hnsw(_)) => {
-                // Defer graph insertion to the maintenance worker; the
-                // brute-force pending path in search_hnsw guarantees
-                // correct visibility in the interim.
-                self.pending.lock().push(slot);
-                return;
-            }
-            None => {}
-        }
-        drop(published);
+        // No global published index exists: segment graphs are immutable, so
+        // a slot that missed every segment above lands in `pending` (exact
+        // scan) when a build is in flight, exactly like the appendable tail.
         if self.building.load(AtomicOrdering::Relaxed) {
             self.pending.lock().push(slot);
         }
-    }
-
-    /// Discard every persisted index artifact (both tiers).
-    pub(super) fn discard_index_files(&self) {
-        persist::discard(&self.data_dir().join("index.bin"));
-        persist::discard(&self.data_dir().join("hnsw.bin"));
     }
 
     /// Build and publish the configured ANN tier from the current live set.
@@ -680,7 +650,6 @@ impl CollectionStore {
         }
         let published = !built.is_empty();
         files.ivf_segments.store(Arc::new(built));
-        files.index.store(Arc::new(None));
         self.build_inserted
             .store(total as u64, AtomicOrdering::Relaxed);
         self.building.store(false, AtomicOrdering::Relaxed);
@@ -698,7 +667,6 @@ impl CollectionStore {
     pub fn drop_index(&self) -> Result<()> {
         let files = self.data_arc();
         let _guard = self.compact_mutex.lock();
-        files.index.store(Arc::new(None));
         files.hnsw_segments.store(Arc::new(Vec::new()));
         files.ivf_segments.store(Arc::new(Vec::new()));
         if let Ok(entries) = std::fs::read_dir(files.dir()) {
@@ -715,7 +683,6 @@ impl CollectionStore {
         self.pending.lock().clear();
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
-        self.discard_index_files();
         Ok(())
     }
 
@@ -925,9 +892,7 @@ impl CollectionStore {
     /// Whether an index is published.
     pub fn has_index(&self) -> bool {
         let files = self.data_arc();
-        files.index.load().is_some()
-            || !files.hnsw_segments.load().is_empty()
-            || !files.ivf_segments.load().is_empty()
+        !files.hnsw_segments.load().is_empty() || !files.ivf_segments.load().is_empty()
     }
 
     /// Number of slots waiting in the pending queue (not yet incorporated
@@ -1054,62 +1019,27 @@ impl CollectionStore {
                 build_points_total,
             });
         }
-        let published = files.index.load();
-        match published.as_ref() {
-            Some(PublishedIndex::Ivf(index)) => Some(IndexInfo {
-                index_kind: IndexKind::Ivf,
-                lists: index.list_count() as u32,
-                nprobe_default: index.default_nprobe(),
+        // Nothing published: report a placeholder when an ANN tier is
+        // configured, `None` for permanent exact-scan collections.
+        let inner = self.inner.read();
+        if matches!(inner.meta.index, IndexConfig::Flat) {
+            None
+        } else {
+            Some(IndexInfo {
+                index_kind: IndexKind::ExactScan,
+                lists: 0,
+                nprobe_default: 0,
                 m: 0,
                 ef_construct: 0,
                 ef_search_default: 0,
-                built_at_live_count: index.built_at_live_count(),
+                built_at_live_count: 0,
                 stale_overwrite_count: 0,
                 stale_ratio: None,
-                last_drift_ratio: self.inner.read().last_drift_ratio,
-                building,
-                build_inserted,
-                build_points_total,
-            }),
-            Some(PublishedIndex::Hnsw(index)) => Some(IndexInfo {
-                index_kind: IndexKind::Hnsw,
-                lists: 0,
-                nprobe_default: 0,
-                m: index.m(),
-                ef_construct: index.ef_construct(),
-                ef_search_default: index.default_ef(),
-                built_at_live_count: index.built_at_live_count(),
-                stale_overwrite_count: index.overwrites_since_build(),
-                stale_ratio: Some(index.stale_ratio()),
                 last_drift_ratio: None,
                 building,
                 build_inserted,
                 build_points_total,
-            }),
-            None => {
-                // Nothing published: report a placeholder when an ANN tier is
-                // configured, `None` for permanent exact-scan collections.
-                let inner = self.inner.read();
-                if matches!(inner.meta.index, IndexConfig::Flat) {
-                    None
-                } else {
-                    Some(IndexInfo {
-                        index_kind: IndexKind::ExactScan,
-                        lists: 0,
-                        nprobe_default: 0,
-                        m: 0,
-                        ef_construct: 0,
-                        ef_search_default: 0,
-                        built_at_live_count: 0,
-                        stale_overwrite_count: 0,
-                        stale_ratio: None,
-                        last_drift_ratio: None,
-                        building,
-                        build_inserted,
-                        build_points_total,
-                    })
-                }
-            }
+            })
         }
     }
 }
