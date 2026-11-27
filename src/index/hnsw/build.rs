@@ -225,9 +225,14 @@ impl HnswIndex {
                 segment_slots,
                 slot_base,
             );
-            *timed_write_lock(self.lock_metrics.as_deref(), node.layer(layer)) =
-                selected.iter().map(|c| c.slot).collect();
-            node.bump_version();
+            let previous = {
+                let mut adjacency = timed_write_lock(self.lock_metrics.as_deref(), node.layer(layer));
+                let previous = adjacency.clone();
+                *adjacency = selected.iter().map(|c| c.slot).collect();
+                previous
+            };
+            let new: Vec<u32> = selected.iter().map(|c| c.slot).collect();
+            self.record_neighbor_change(slot, layer, &previous, &new);
             for cand in &selected {
                 self.link_neighbor(
                     cand.slot,
@@ -377,8 +382,12 @@ impl HnswIndex {
             return;
         }
         if adj.len() < lm {
+            let previous = adj.clone();
             adj.push(slot);
-            node.bump_version();
+            drop(adj);
+            self.record_neighbor_change(neighbor, layer, &previous, &[
+                slot,
+            ]);
             return;
         }
 
@@ -397,6 +406,8 @@ impl HnswIndex {
         ) else {
             return;
         };
+        let previous = adj.clone();
+        let mut new = Vec::with_capacity(lm);
         LINK_SCRATCH.with(|link_cell| {
             let mut link = link_cell.borrow_mut();
             let HnswLinkScratch { pool, selected } = &mut *link;
@@ -422,9 +433,11 @@ impl HnswIndex {
                 selected,
             );
             adj.clear();
-            adj.extend(selected.iter().map(|c| c.slot));
+            new.extend(selected.iter().map(|c| c.slot));
+            adj.extend(new.iter().copied());
         });
-        node.bump_version();
+        drop(adj);
+        self.record_neighbor_change(neighbor, layer, &previous, &new);
     }
 
     pub(super) fn random_level(&self) -> u8 {

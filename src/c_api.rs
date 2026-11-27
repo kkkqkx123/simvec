@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod maintenance;
 pub mod read;
+pub mod snapshots;
 pub mod types;
 pub mod write;
 

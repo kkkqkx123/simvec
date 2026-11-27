@@ -226,6 +226,25 @@ int simvec_set_default_quantization_config(struct simvec_engine_t *engine, const
 
 int simvec_get_default_quantization_config(struct simvec_engine_t *engine, char **out);
 
+int simvec_snapshot_collection(struct simvec_engine_t *engine,
+                               const char *collection,
+                               const char *dest,
+                               char **out);
+
+int simvec_snapshot_collection_incremental(struct simvec_engine_t *engine,
+                                            const char *collection,
+                                            const char *base,
+                                            const char *dest,
+                                            char **out);
+
+int simvec_verify_snapshot(struct simvec_engine_t *engine,
+                           const char *src,
+                           char **out);
+
+int simvec_restore_snapshot(struct simvec_engine_t *engine,
+                            const char *src,
+                            const char *dest);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

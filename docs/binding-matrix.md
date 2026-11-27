@@ -1,6 +1,6 @@
 # 绑定功能矩阵：C API / Python / JavaScript / Go / Java / R / WASM
 
-统计口径：C 侧以 `include/simvec.h` 与 `src/c_api` 对照为准，两者一致，共 52 个导出函数。
+统计口径：C 侧以 `include/simvec.h` 与 `src/c_api` 对照为准，两者一致，共 56 个导出函数。
 Python 侧看 `bindings/python/simvec/engine.py` 的 `Engine` 方法与 `_native.py` 的签名声明。
 JavaScript 侧看 `bindings/js/src/engine.js` 的 `Engine` 方法与 `native.js` 的签名声明。
 Go 侧看 `bindings/go/engine.go` 的 `Engine` 方法。
@@ -98,6 +98,17 @@ WASM 侧看 `bindings/wasm/src/index.js` 的 `Engine` 方法与 `src/wasm_api.rs
 | 全局维护扫描 | `simvec_run_maintenance_sweep` | `run_maintenance_sweep` | `runMaintenanceSweep` | `RunMaintenanceSweep` | `runMaintenanceSweep` | `simvec_run_maintenance_sweep` |
 
 该分组五端完全对齐，无缺口。
+
+## 文件快照
+
+| 能力 | C API | Python Engine | JS Engine | Go Engine | Java Engine | R |
+|---|---|---|---|---|---|---|
+| 创建快照 | `simvec_snapshot_collection` | `snapshot_collection` | `snapshotCollection` | `SnapshotCollection` | `snapshotCollection` | `simvec_snapshot_collection` |
+| 增量快照 | `simvec_snapshot_collection_incremental` | `snapshot_collection_incremental` | `snapshotCollectionIncremental` | `SnapshotCollectionIncremental` | `snapshotCollectionIncremental` | `simvec_snapshot_collection_incremental` |
+| 校验快照 | `simvec_verify_snapshot` | `verify_snapshot` | `verifySnapshot` | `VerifySnapshot` | `verifySnapshot` | `simvec_verify_snapshot` |
+| 恢复快照 | `simvec_restore_snapshot` | `restore_snapshot` | `restoreSnapshot` | `RestoreSnapshot` | `restoreSnapshot` | `simvec_restore_snapshot` |
+
+快照元数据以 JSON 字符串返回，WASM 侧不暴露文件快照。
 
 ## 引擎级默认配置
 
@@ -245,7 +256,18 @@ WASM 为浏览器内存形态，与五端本机形态并存。`Rust` 侧是 `Mem
 | 集合指标快照 | 有，空快照 | 同形 |
 | 全局维护扫描 | 空操作 | 无后台线程 |
 
-### 引擎级默认配置
+### 文件快照
+
+| 能力 | C API | Python Engine | JS Engine | Go Engine | Java Engine | R |
+|---|---|---|---|---|---|---|
+| 创建快照 | `simvec_snapshot_collection` | `snapshot_collection` | `snapshotCollection` | `SnapshotCollection` | `snapshotCollection` | `simvec_snapshot_collection` |
+| 增量快照 | `simvec_snapshot_collection_incremental` | `snapshot_collection_incremental` | `snapshotCollectionIncremental` | `SnapshotCollectionIncremental` | `snapshotCollectionIncremental` | `simvec_snapshot_collection_incremental` |
+| 校验快照 | `simvec_verify_snapshot` | `verify_snapshot` | `verifySnapshot` | `VerifySnapshot` | `verifySnapshot` | `simvec_verify_snapshot` |
+| 恢复快照 | `simvec_restore_snapshot` | `restore_snapshot` | `restoreSnapshot` | `RestoreSnapshot` | `restoreSnapshot` | `simvec_restore_snapshot` |
+
+快照元数据以 JSON 字符串返回，WASM 侧不暴露文件快照。
+
+## 引擎级默认配置
 
 | 能力 | WASM | 备注 |
 |---|---|---|

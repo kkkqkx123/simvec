@@ -168,13 +168,14 @@ impl CollectionStore {
         // exactly that); the marker is a no-op whose LSN was consumed from
         // `next_lsn`, so a back-to-back checkpoint naturally allocates a new
         // one. Replay converges on the same numbering.
-        let effective = self.wal_pins.clamp(watermark);
+        let effective = self.wal_pins.clamp(inner.min_persisted(watermark));
         let live_now = inner.meta.live_count;
         let collection = inner.meta.collection.clone();
         drop(inner);
         if effective != 0 || watermark == 0 {
             self.wal.truncate_through(effective)?;
         }
+        self.clear_maintenance_error();
         self.metrics.record_checkpoint(started.elapsed());
         tracing::debug!(
             collection = %collection,
@@ -192,19 +193,53 @@ impl CollectionStore {
     /// before any water mark is published, so the WAL stays authoritative
     /// for whatever the first pass missed.
     fn flush_data_files(&self, slot_capacity: u64) -> Result<()> {
-        let data = self.data_arc();
-        // Payload store: dirty pages, block bitmask, slot→pointer table.
-        let ps_guard = data.payload_store.load();
-        if let Some(ps) = ps_guard.as_ref().as_ref() {
-            ps.checkpoint()?;
+        let segment_slots = self.inner.read().meta.segment_slots;
+        if segment_slots == 0 {
+            return Ok(());
         }
-        drop(ps_guard);
-        // Directory and vector files touched since the last checkpoint.
-        data.keys.sync()?;
-        data.vectors.sync()?;
-        // Tombstones before meta and before the truncate: they are the only
-        // surviving record of the deletes once the log is cleared.
-        data.tombstones.load().save(data.dir(), slot_capacity)?;
+        let count = slot_capacity.div_ceil(segment_slots as u64) as usize;
+        for index in 0..count {
+            if let Err(err) = self.flush_segment(index, segment_slots, slot_capacity) {
+                self.record_maintenance_error(&err.to_string());
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush one segment's dirty files and publish its durable LSN.
+    ///
+    /// The frontier is captured in a short metadata read; fsyncs run outside
+    /// the store lock so writers in other segments keep going. A failure
+    /// leaves this segment's persisted mark untouched, so the WAL ack cannot
+    /// advance past bytes this segment has not written.
+    fn flush_segment(&self, index: usize, segment_slots: u32, slot_capacity: u64) -> Result<()> {
+        let (frontier, start, end) = {
+            let inner = self.inner.read();
+            (
+                inner
+                    .segment_applied
+                    .get(index)
+                    .copied()
+                    .unwrap_or(inner.meta.last_applied_txn),
+                index as u32 * segment_slots,
+                ((index as u32 * segment_slots) as u64 + segment_slots as u64)
+                    .min(slot_capacity) as u32,
+            )
+        };
+        let data = self.data_arc();
+        if let Some(ps) = data.payload_store.load().as_ref().as_ref() {
+            ps.checkpoint_segment(index)?;
+        }
+        data.keys.sync_segment(index)?;
+        data.vectors.sync_segment(index)?;
+        data.tombstones
+            .load()
+            .save_segment(data.dir(), start, segment_slots, slot_capacity)?;
+        segments::write_id_tracker(&data, start, end, &self.inner.read())?;
+        let mut inner = self.inner.write();
+        inner.ensure_segment_len(index + 1);
+        inner.segment_persisted[index] = inner.segment_persisted[index].max(frontier);
         Ok(())
     }
 
@@ -300,14 +335,22 @@ impl CollectionStore {
             )
         };
         let tombstones = data.tombstones.load();
+        let vectors = data.vectors.snapshot();
         let _guard = self.build_mutex.lock();
         let mut repaired = 0usize;
         let mut graphs = Vec::with_capacity(segments.len());
         for segment in segments.iter() {
-            let len = (segment.end - segment.start) as usize;
-            let has_tombstone =
-                (segment.start..segment.end).any(|slot| tombstones.bit(slot as usize));
-            if !segment.index.covers_all(len) || has_tombstone {
+            let len = (segment.end - segment.start).max(1) as usize;
+            let dead = (segment.start..segment.end)
+                .filter(|slot| tombstones.bit(*slot as usize))
+                .count();
+            let drift = dead as f64 / len as f64;
+            // A few tombstones are repaired through their complete inbound
+            // neighborhoods; a dense stale graph is cheaper to rebuild.
+            if !segment.index.covers_all(len)
+                || drift > 0.25
+                || segment.index.stale_ratio() > 0.25
+            {
                 if let Some(rebuilt) = self.rebuild_segment_hnsw(
                     segment.start,
                     segment.end,
@@ -321,6 +364,19 @@ impl CollectionStore {
                     repaired += len;
                     continue;
                 }
+            } else if dead > 0 {
+                for slot in segment.start..segment.end {
+                    if tombstones.bit(slot as usize) {
+                        segment.index.heal_deleted(
+                            slot - segment.start,
+                            &vectors,
+                            segment_slots,
+                            segment.start,
+                            |global| tombstones.bit(global as usize),
+                        );
+                    }
+                }
+                repaired += dead;
             }
             graphs.push(segment.clone());
         }
@@ -370,6 +426,7 @@ impl CollectionStore {
         // of once per point. Failures are non-fatal (the WAL covers replay).
         let ps_guard = data.payload_store.load();
         if let Some(ps) = ps_guard.as_ref().as_ref() {
+            let _ = ps.ensure_segments(new_capacity);
             let _ = ps.checkpoint();
         }
         Ok(())

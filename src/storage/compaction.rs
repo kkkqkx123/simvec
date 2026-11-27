@@ -229,7 +229,7 @@ fn stage_hnsw_segments(
         return Ok(Vec::new());
     }
     let vectors = Vectors::open(
-        &dir.join("vectors.bin"),
+        dir,
         meta.vector_size,
         meta.segment_slots,
         meta.slot_capacity,
@@ -306,11 +306,6 @@ fn write_at(file: &mut File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(buf)
-}
-
-/// Size of `path` in bytes, or 0 when it does not exist.
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Recursive size of `dir` in bytes, or 0 when it does not exist.
@@ -460,12 +455,7 @@ impl CollectionStore {
     /// every file that gets rewritten bounds the peak usage of the rewrite
     /// phase, which briefly doubles that space.
     fn compaction_footprint(&self) -> u64 {
-        let dir = self.data_dir();
-        let mut total = file_len(&dir.join("vectors.bin"));
-        total += file_len(&dir.join("keys.bin"));
-        total += file_len(&dir.join("quant.bin"));
-        total += dir_len(&dir.join("payloads_store"));
-        total
+        dir_len(&self.data_dir().join("segments"))
     }
 
     /// Reject a compaction whose temp files cannot fit on the target volume.
@@ -513,14 +503,30 @@ impl CollectionStore {
         meta.live_count = plan.live_count;
         meta.tombstone_count = 0;
 
-        write_vectors_file(
-            &dir.join("vectors.bin"),
-            plan.dim,
-            plan.segment_slots,
-            plan.new_capacity,
-            &files.vectors.snapshot(),
-            &plan.map,
-        )?;
+        let old_vectors = files.vectors.snapshot();
+        let step = plan.segment_slots.max(1);
+        for start in (0..plan.new_capacity).step_by(step as usize) {
+            let end = (start + step as u64).min(plan.new_capacity);
+            let map: Vec<u32> = plan
+                .map
+                .iter()
+                .map(|&new| {
+                    if new == u32::MAX || new < start as u32 || new >= end as u32 {
+                        u32::MAX
+                    } else {
+                        new - start as u32
+                    }
+                })
+                .collect();
+            write_vectors_file(
+                &segments::segment_dir(dir, start as u32).join("vectors.bin"),
+                plan.dim,
+                plan.segment_slots,
+                end - start,
+                &old_vectors,
+                &map,
+            )?;
+        }
 
         if let Some(q) = files.quant.read().as_ref() {
             q.write_compacted_file(
@@ -534,7 +540,7 @@ impl CollectionStore {
 
         {
             let keys_view = files.keys.snapshot();
-            let mut entries = Vec::with_capacity(plan.live_count as usize);
+            let mut live_keys = Vec::with_capacity(plan.live_count as usize);
             for (old_slot, new_slot) in plan.map.iter().enumerate() {
                 if *new_slot == u32::MAX {
                     continue;
@@ -542,19 +548,27 @@ impl CollectionStore {
                 let key = Keys::read_key(&keys_view, old_slot)?.ok_or_else(|| {
                     VectorSearchError::CorruptData(format!("live slot {old_slot} has no key"))
                 })?;
-                entries.push(DirEntry {
-                    slot: *new_slot,
-                    blob: key.into_bytes(),
-                    flags: 0,
-                });
+                live_keys.push((*new_slot, key));
             }
-            write_dir_file(
-                &dir.join("keys.bin"),
-                *b"VKEY",
-                KEY_REC_SIZE,
-                plan.new_capacity,
-                &entries,
-            )?;
+            for start in (0..plan.new_capacity).step_by(step as usize) {
+                let end = (start + step as u64).min(plan.new_capacity);
+                let entries: Vec<DirEntry> = live_keys
+                    .iter()
+                    .filter(|(slot, _)| *slot >= start as u32 && *slot < end as u32)
+                    .map(|(slot, key)| DirEntry {
+                        slot: slot - start as u32,
+                        blob: key.clone().into_bytes(),
+                        flags: 0,
+                    })
+                    .collect();
+                write_dir_file(
+                    &segments::segment_dir(dir, start as u32).join("keys.bin"),
+                    *b"VKEY",
+                    KEY_REC_SIZE,
+                    end - start,
+                    &entries,
+                )?;
+            }
         }
 
         let live_slots: Vec<(u32, u32)> = plan
@@ -569,7 +583,8 @@ impl CollectionStore {
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        let new_store = old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
+        let new_store =
+            old_store.compact_to(dir, plan.segment_slots, plan.new_capacity, &live_slots)?;
         // Rebuild the field postings against compacted slot numbers before
         // the generation is published. The staged file carries the staged
         // generation and lsn so open can use it without rebuilding.
@@ -585,7 +600,8 @@ impl CollectionStore {
         drop(new_store);
         drop(ps_guard);
 
-        TombstoneBits::new(plan.new_capacity as usize).save(dir, plan.new_capacity)?;
+        TombstoneBits::new(plan.new_capacity as usize)
+            .save_segments(dir, plan.segment_slots, plan.new_capacity)?;
         let defs = files.dir().join("payload_indexes.json");
         if defs.exists() {
             std::fs::copy(defs, dir.join("payload_indexes.json"))?;
@@ -771,7 +787,7 @@ impl CollectionStore {
             return Ok(Vec::new());
         }
         let vectors = Vectors::open(
-            &dir.join("vectors.bin"),
+            dir,
             meta.vector_size,
             meta.segment_slots,
             meta.slot_capacity,

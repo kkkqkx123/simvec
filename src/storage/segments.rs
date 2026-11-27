@@ -6,12 +6,14 @@
 //! frozen. The manifest is derived from `meta.bin`; a stale or missing copy
 //! is rewritten instead of being treated as authoritative.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::snapshot;
+use super::{DataFiles, StoreInner};
 use crate::error::Result;
+use crate::types::PointId;
 
 const SEGMENTS_FILE: &str = "segments.json";
 const FORMAT_VERSION: u32 = 1;
@@ -87,6 +89,32 @@ impl SegmentSet {
     }
 }
 
+/// Directory holding one physical segment. Creating it on demand lets a
+/// newly appended segment own all of its files without a generation-wide
+/// rename.
+pub(crate) fn segment_dir(generation: &Path, start: u32) -> PathBuf {
+    let dir = generation.join("segments").join(format!("{start:010}"));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %err, path = %dir.display(), "cannot create segment directory");
+    }
+    dir
+}
+
+/// Every published physical segment directory of a generation.
+pub(crate) fn segment_dirs(generation: &Path) -> Vec<PathBuf> {
+    let root = generation.join("segments");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 /// Which segment a slot belongs to.
 pub(crate) fn segment_index(slot: u64, segment_slots: u32) -> usize {
     if segment_slots == 0 {
@@ -159,6 +187,58 @@ pub(crate) fn select_for_compaction(entries: &[SegmentEntry], threshold: f64) ->
         .filter(|e| e.garbage_ratio() >= threshold && e.tombstone_count > 0)
         .map(|e| e.start)
         .collect()
+}
+
+/// One external id's authoritative placement inside a segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IdTrackerEntry {
+    pub id: String,
+    pub offset: u32,
+    pub point_lsn: u64,
+    pub delete_lsn: u64,
+    pub free: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdTracker {
+    generation: u64,
+    entries: Vec<IdTrackerEntry>,
+}
+
+/// Persist one segment's id tracker after its data files are durable.
+pub(super) fn write_id_tracker(
+    data: &DataFiles,
+    start: u32,
+    end: u32,
+    inner: &StoreInner,
+) -> Result<()> {
+    let keys = data.keys.snapshot();
+    let tombstones = data.tombstones.load();
+    let mut entries = Vec::new();
+    for offset in 0..(end - start) {
+        let slot = start + offset;
+        let Ok(Some(id_text)) = super::keys::Keys::read_key(&keys, slot as usize) else {
+            continue;
+        };
+        let id = PointId::from(id_text.as_str());
+        let live = inner.reverse.get(&id) == Some(slot);
+        let deleted = tombstones.bit(slot as usize);
+        let version = inner.versions.get_value(&id).unwrap_or(0);
+        entries.push(IdTrackerEntry {
+            id: id_text,
+            offset,
+            point_lsn: if live { version } else { 0 },
+            delete_lsn: if deleted { version } else { 0 },
+            free: !live || deleted,
+        });
+    }
+    snapshot::write(
+        &segment_dir(data.dir(), start).join("id_tracker.bin"),
+        &IdTracker {
+            generation: inner.meta.next_slot,
+            entries,
+        },
+    )
 }
 
 /// Publish the derived segment manifest for a generation.

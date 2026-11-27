@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::error::{Result, VectorSearchError};
 
-const SNAPSHOT_MAGIC: [u8; 4] = *b"SVSP";
+const SNAPSHOT_MAGIC: [u8; 4] = *b"SVPC";
 const SNAPSHOT_VERSION: u16 = 1;
 
 /// Write `value` to a temporary file, fsync it, then publish by rename.
@@ -22,7 +22,7 @@ pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut payload = Vec::with_capacity(10 + bytes.len());
     payload.extend_from_slice(&SNAPSHOT_MAGIC);
     payload.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-    payload.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    payload.extend_from_slice(&crate::checksum::hash(&bytes).to_le_bytes());
     payload.extend_from_slice(&bytes);
 
     let temp = path.with_extension("tmp");
@@ -58,7 +58,7 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
     let expected = u32::from_le_bytes(header[6..10].try_into().expect("crc slice"));
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() || crc32fast::hash(&bytes) != expected {
+    if file.read_to_end(&mut bytes).is_err() || crate::checksum::hash(&bytes) != expected {
         return Ok(None);
     }
     postcard::from_bytes(&bytes)
@@ -165,7 +165,7 @@ pub(crate) fn checked_path(base: &Path, rel: &str) -> Result<PathBuf> {
 /// Stream a file's length and CRC without holding the whole file in memory.
 pub(crate) fn file_checksum(path: &Path) -> Result<(u64, u32)> {
     let mut file = File::open(path)?;
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::checksum::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut len = 0u64;
     loop {
@@ -177,4 +177,23 @@ pub(crate) fn file_checksum(path: &Path) -> Result<(u64, u32)> {
         len += read as u64;
     }
     Ok((len, hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_crc32_envelope_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.bin");
+        let body = postcard::to_stdvec(&42u32).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SVSP");
+        bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read::<u32>(&path).unwrap().is_none());
+    }
 }

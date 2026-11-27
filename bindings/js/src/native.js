@@ -144,6 +144,16 @@ const DEFINITIONS = {
     arguments: ["pointer", "string", "pointer"],
     return: "int32",
   },
+  simvec_snapshot_collection: {
+    arguments: ["pointer", "string", "string", "pointer"],
+    return: "int32",
+  },
+  simvec_snapshot_collection_incremental: {
+    arguments: ["pointer", "string", "string", "string", "pointer"],
+    return: "int32",
+  },
+  simvec_verify_snapshot: { arguments: ["pointer", "string", "pointer"], return: "int32" },
+  simvec_restore_snapshot: { arguments: ["pointer", "string", "string"], return: "int32" },
   simvec_set_default_hnsw_config: { arguments: ["pointer", "string"], return: "int32" },
   simvec_get_default_hnsw_config: { arguments: ["pointer", "pointer"], return: "int32" },
   simvec_set_default_ivf_config: { arguments: ["pointer", "string"], return: "int32" },

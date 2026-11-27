@@ -78,7 +78,7 @@
 
 本轮已经完成：payload 编码后长度准入与批次合并校验、旧 payload 格式分支清理、WAL replay 与前缀扫描的只读 mmap 化、未使用记录索引清理、`.spare` 锁外补建与滚动失败清理、未使用 WAL 变体与读取助手清理、按段压实调度、快照 generation 绑定校验，以及项目说明中与这些事实不一致的描述。
 
-明确延后且已在本文记录理由：dense 物理文件拆分、段级 flush worker、引用式 WAL、named/sparse ANN、CRC32C、多向量类型、快照 C ABI，以及删除时对全部反向入边的穷尽清理。
+明确延后且已在本文记录理由：dense 物理文件拆分、段级 flush worker、引用式 WAL、named/sparse ANN、CRC32C、多向量类型、快照 C ABI，以及删除时对全部反向入边的穷尽清理。下一阶段的完整细化方案见 `docs/plan/deferred-storage-refactor.md`。
 
 ## 验收方式
 

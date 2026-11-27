@@ -367,6 +367,82 @@ func (e *Engine) ListOldBackups(live string) ([]string, error) {
 	return names, nil
 }
 
+// SnapshotCollection copies the serving generation and WAL into dest.
+func (e *Engine) SnapshotCollection(collection, dest string) (map[string]any, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return nil, newError(CodeMisuse, "engine is closed")
+	}
+	cCollection, cDest := cString(collection), cString(dest)
+	defer C.free(unsafe.Pointer(cCollection))
+	defer C.free(unsafe.Pointer(cDest))
+	var out *C.char
+	if err := e.fail(C.simvec_snapshot_collection(e.handle, cCollection, cDest, &out)); err != nil {
+		return nil, err
+	}
+	var info map[string]any
+	if err := decodeText(out, &info); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// SnapshotCollectionIncremental links unchanged files from a verified base.
+func (e *Engine) SnapshotCollectionIncremental(collection, base, dest string) (map[string]any, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return nil, newError(CodeMisuse, "engine is closed")
+	}
+	cCollection, cBase, cDest := cString(collection), cString(base), cString(dest)
+	defer C.free(unsafe.Pointer(cCollection))
+	defer C.free(unsafe.Pointer(cBase))
+	defer C.free(unsafe.Pointer(cDest))
+	var out *C.char
+	if err := e.fail(C.simvec_snapshot_collection_incremental(e.handle, cCollection, cBase, cDest, &out)); err != nil {
+		return nil, err
+	}
+	var info map[string]any
+	if err := decodeText(out, &info); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// VerifySnapshot validates a snapshot manifest and every file it names.
+func (e *Engine) VerifySnapshot(src string) (map[string]any, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return nil, newError(CodeMisuse, "engine is closed")
+	}
+	cSrc := cString(src)
+	defer C.free(unsafe.Pointer(cSrc))
+	var out *C.char
+	if err := e.fail(C.simvec_verify_snapshot(e.handle, cSrc, &out)); err != nil {
+		return nil, err
+	}
+	var info map[string]any
+	if err := decodeText(out, &info); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// RestoreSnapshot copies a verified snapshot into an independent directory.
+func (e *Engine) RestoreSnapshot(src, dest string) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.handle == nil {
+		return newError(CodeMisuse, "engine is closed")
+	}
+	cSrc, cDest := cString(src), cString(dest)
+	defer C.free(unsafe.Pointer(cSrc))
+	defer C.free(unsafe.Pointer(cDest))
+	return e.fail(C.simvec_restore_snapshot(e.handle, cSrc, cDest))
+}
+
 // Upsert inserts or replaces one point. A nil payload stores no payload.
 func (e *Engine) Upsert(collection, id string, vector []float32, payload any) error {
 	var raw []byte

@@ -1,6 +1,6 @@
 //! Persist CRC32 overhead baseline.
 //!
-//! Quantifies `crc32fast::hash` cost inside `index/persist.rs::write_tagged`
+//! Quantifies `simvec::checksum::hash` cost inside `index/persist.rs::write_tagged`
 //! relative to the full `save`/`save_hnsw` path (postcard serialization +
 //! CRC + `File::create`/`write_all`/`sync_all`). Ratio must stay `< 10%`:
 //! payloads are multi-MB memory-linear scans while the file write dominates
@@ -70,7 +70,7 @@ fn write_tagged<T: Serialize>(
     data: &T,
 ) -> std::io::Result<()> {
     let bytes = postcard::to_stdvec(data).expect("postcard");
-    let crc = crc32fast::hash(&bytes);
+    let crc = simvec::checksum::hash(&bytes);
     let mut file = File::create(path)?;
     file.write_all(magic)?;
     file.write_all(&version.to_le_bytes())?;
@@ -181,7 +181,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     // IVF CRC only (hash of already-serialized payload) — pure memory scan.
     group.bench_function(BenchmarkId::new("ivf_crc", size_tag), |b| {
         b.iter(|| {
-            let crc = crc32fast::hash(black_box(&ivf_bytes));
+            let crc = simvec::checksum::hash(black_box(&ivf_bytes));
             black_box(crc)
         })
     });
@@ -190,7 +190,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("ivf_serialize_plus_crc", size_tag), |b| {
         b.iter(|| {
             let bytes = postcard::to_stdvec(black_box(&ivf)).unwrap();
-            let crc = crc32fast::hash(&bytes);
+            let crc = simvec::checksum::hash(&bytes);
             black_box((bytes.len(), crc))
         })
     });
@@ -210,7 +210,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     // HNSW CRC only.
     group.bench_function(BenchmarkId::new("hnsw_crc", size_tag), |b| {
         b.iter(|| {
-            let crc = crc32fast::hash(black_box(&hnsw_bytes));
+            let crc = simvec::checksum::hash(black_box(&hnsw_bytes));
             black_box(crc)
         })
     });
@@ -218,7 +218,7 @@ fn bench_persist_crc(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("hnsw_serialize_plus_crc", size_tag), |b| {
         b.iter(|| {
             let bytes = postcard::to_stdvec(black_box(&hnsw)).unwrap();
-            let crc = crc32fast::hash(&bytes);
+            let crc = simvec::checksum::hash(&bytes);
             black_box((bytes.len(), crc))
         })
     });
@@ -243,7 +243,7 @@ fn bench_persist_crc(c: &mut Criterion) {
         let ivf_t_crc = {
             let t0 = Instant::now();
             for _ in 0..iters {
-                black_box(crc32fast::hash(&ivf_bytes));
+                black_box(simvec::checksum::hash(&ivf_bytes));
             }
             t0.elapsed()
         };
@@ -258,7 +258,7 @@ fn bench_persist_crc(c: &mut Criterion) {
         let hnsw_t_crc = {
             let t0 = Instant::now();
             for _ in 0..iters {
-                black_box(crc32fast::hash(&hnsw_bytes));
+                black_box(simvec::checksum::hash(&hnsw_bytes));
             }
             t0.elapsed()
         };

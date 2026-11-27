@@ -535,6 +535,44 @@ export class Engine {
     return takeJson(readPointer(out));
   }
 
+  snapshotCollection(collection, dest) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(
+      functions.simvec_snapshot_collection(handle, String(collection), String(dest), out),
+      handle,
+    );
+    return takeJson(readPointer(out));
+  }
+
+  snapshotCollectionIncremental(collection, base, dest) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(
+      functions.simvec_snapshot_collection_incremental(
+        handle,
+        String(collection),
+        String(base),
+        String(dest),
+        out,
+      ),
+      handle,
+    );
+    return takeJson(readPointer(out));
+  }
+
+  verifySnapshot(src) {
+    const handle = this._requireOpen();
+    const out = outPointer();
+    check(functions.simvec_verify_snapshot(handle, String(src), out), handle);
+    return takeJson(readPointer(out));
+  }
+
+  restoreSnapshot(src, dest) {
+    const handle = this._requireOpen();
+    check(functions.simvec_restore_snapshot(handle, String(src), String(dest)), handle);
+  }
+
   setDefaultHnswConfig(config) {
     const handle = this._requireOpen();
     check(functions.simvec_set_default_hnsw_config(handle, encodeJson(config)), handle);

@@ -33,7 +33,7 @@ pub(crate) const FORMAT_VERSION: u32 = 1;
 
 /// Envelope format for `meta.bin` itself (independent of `FORMAT_VERSION`,
 /// which versions the `Meta` payload).
-const META_MAGIC: [u8; 4] = *b"VSM2";
+const META_MAGIC: [u8; 4] = *b"VSMC";
 const META_ENVELOPE_VERSION: u32 = 1;
 const META_HEADER_LEN: usize = 12;
 
@@ -177,7 +177,7 @@ impl Meta {
         let mut bytes = Vec::with_capacity(META_HEADER_LEN + body.len());
         bytes.extend_from_slice(&META_MAGIC);
         bytes.extend_from_slice(&META_ENVELOPE_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        bytes.extend_from_slice(&crate::checksum::hash(&body).to_le_bytes());
         bytes.extend_from_slice(&body);
 
         let target = dir.join("meta.bin");
@@ -213,7 +213,7 @@ impl Meta {
         }
         let expected_crc = u32::from_le_bytes(bytes[8..12].try_into().expect("crc slice"));
         let body = &bytes[META_HEADER_LEN..];
-        let actual_crc = crc32fast::hash(body);
+        let actual_crc = crate::checksum::hash(body);
         if actual_crc != expected_crc {
             return Err(VectorSearchError::CorruptData(format!(
                 "meta.bin checksum mismatch: stored {expected_crc:#x}, computed {actual_crc:#x}"

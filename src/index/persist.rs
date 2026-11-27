@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, VectorSearchError};
 use crate::types::DistanceMetric;
 
-pub(crate) const INDEX_MAGIC: [u8; 4] = *b"VIVF";
+pub(crate) const INDEX_MAGIC: [u8; 4] = *b"VICF";
 /// Development stage: version locked at 1. No backward compatibility is
 /// maintained (see the `FORMAT_VERSION` note in `storage::meta`): older files
 /// fail version / checksum validation and are discarded in favor of exact
@@ -24,7 +24,7 @@ pub(crate) const INDEX_MAGIC: [u8; 4] = *b"VIVF";
 /// falls back" contract. The format is CRC32-protected tag
 /// `[magic 4][version u16 LE][crc32 u32 LE][postcard payload]`.
 pub(crate) const INDEX_VERSION: u16 = 1;
-const HNSW_MAGIC: [u8; 4] = *b"VHSW";
+const HNSW_MAGIC: [u8; 4] = *b"VHSC";
 /// Same dev-stage policy as `INDEX_VERSION`; version locked at 1.
 const HNSW_VERSION: u16 = 1;
 
@@ -177,7 +177,7 @@ fn write_tagged<T: serde::Serialize>(
     data: &T,
 ) -> Result<()> {
     let bytes = postcard::to_stdvec(data)?;
-    let crc = crc32fast::hash(&bytes);
+    let crc = crate::checksum::hash(&bytes);
     let mut file = File::create(path)?;
     file.write_all(magic)?;
     file.write_all(&version.to_le_bytes())?;
@@ -203,7 +203,7 @@ fn read_tagged<T: serde::de::DeserializeOwned>(
     }
     let expected_crc = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
     let payload = &bytes[10..];
-    if crc32fast::hash(payload) != expected_crc {
+    if crate::checksum::hash(payload) != expected_crc {
         return Err(VectorSearchError::CorruptData("crc32 mismatch".to_string()));
     }
     Ok(postcard::from_bytes(payload)?)

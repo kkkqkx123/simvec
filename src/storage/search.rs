@@ -14,10 +14,10 @@ use std::time::Instant;
 
 use bitvec::prelude::*;
 
-use super::directory::DirView;
+use super::keys::KeysView;
 use super::segment_hnsw::SegmentHnsw;
 use super::segment_ivf;
-use super::{CollectionStore, PayloadStore, TombstoneBits};
+use super::{CollectionStore, SegmentPayloadStore, TombstoneBits};
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::SearchPath;
 use crate::types::{SearchQuery, SearchResult};
@@ -38,12 +38,12 @@ struct SearchSnapshot<'a> {
     segment_slots: u32,
     tombstones: &'a TombstoneBits,
     vsnap: &'a [Arc<memmap2::Mmap>],
-    keysnap: &'a DirView,
+    keysnap: &'a KeysView,
     filter_mask: Option<&'a BitVec>,
     /// Snapshot of the payload store. Held via a read lock for the search
     /// duration so a concurrent compaction cannot swap the store (and renumber
     /// slots) while we are reading payloads.
-    payload_view: Option<&'a PayloadStore>,
+    payload_view: Option<&'a SegmentPayloadStore>,
     hnsw_segments: &'a [SegmentHnsw],
     ivf_segments: &'a [segment_ivf::SegmentIvf],
 }
@@ -120,7 +120,7 @@ impl CollectionStore {
         };
         // Same generation guard as the vectors/keys/tombstones above.
         let ps_guard = data.payload_store.load();
-        let payload_view: Option<&PayloadStore> = (*ps_guard).as_ref().as_ref();
+        let payload_view: Option<&SegmentPayloadStore> = (*ps_guard).as_ref().as_ref();
         let filtered = query.filter.is_some();
         let snap = SearchSnapshot {
             dim,

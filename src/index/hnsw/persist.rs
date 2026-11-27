@@ -82,6 +82,9 @@ impl HnswIndex {
         }
 
         *index.nodes.write() = nodes;
+        // Inbound lists are derived from the persisted forward links; the
+        // file format stores only forward adjacency.
+        index.rebuild_reverse();
         index
             .built_at_live_count
             .store(data.built_at_live_count, Ordering::Relaxed);

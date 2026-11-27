@@ -12,7 +12,6 @@ use super::generation::Generation;
 use super::keys::Keys;
 use super::meta::Meta;
 use super::payload_index::PayloadIndexManager;
-use super::payload_store::PayloadStore;
 use super::quant::QuantStore;
 use super::queue::CommitQueue;
 use super::tombstones::TombstoneBits;
@@ -144,12 +143,8 @@ impl CollectionStore {
         meta.save(&data_dir)?;
         super::segments::write(&data_dir, meta.segment_slots, 0)?;
 
-        let vectors = Vectors::create(
-            &data_dir.join("vectors.bin"),
-            config.vector_size,
-            meta.segment_slots,
-        )?;
-        let keys = Keys::create(&data_dir.join("keys.bin"), meta.slot_capacity)?;
+        let vectors = Vectors::create(&data_dir, config.vector_size, meta.segment_slots)?;
+        let keys = Keys::create(&data_dir, meta.slot_capacity, meta.segment_slots)?;
         // Create quantized storage if requested. Scalar/Binary are ready immediately;
         // Product needs a codebook build before it becomes usable.
         let quant = if let Some(qc) = &config.quantization_config {
@@ -168,13 +163,14 @@ impl CollectionStore {
         let initial_tombstones = TombstoneBits::new(meta.slot_capacity as usize);
         // A fresh collection owns a valid, all-zero table so `open` never has
         // to guess whether a missing file means "nothing deleted".
-        initial_tombstones.save(&data_dir, meta.slot_capacity)?;
+        initial_tombstones.save_segments(&data_dir, meta.segment_slots, meta.slot_capacity)?;
         let slot_capacity = meta.slot_capacity;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         wal.bind_generation(generation.id());
         // New collections always use the Gridstore-style PayloadStore.
-        let payload_store = PayloadStore::create(
-            &data_dir.join("payloads_store"),
+        let payload_store = SegmentPayloadStore::create(
+            &data_dir,
+            meta.segment_slots,
             storage.payload_store_config(),
         )?;
         let files = ArcSwap::from(Arc::new(DataFiles {
@@ -224,6 +220,7 @@ impl CollectionStore {
             building: AtomicBool::new(false),
             needs_rebuild: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
+            maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),
@@ -244,7 +241,7 @@ impl CollectionStore {
         let dir_lock = CollectionLock::acquire(dir)?;
         let generation = Generation::open(dir)?;
         let data_dir = generation.path();
-        for name in &["meta.bin", "vectors.bin", "keys.bin"] {
+        for name in &["meta.bin"] {
             let path = data_dir.join(name);
             if !path.exists() {
                 return Err(VectorSearchError::CollectionIncomplete {
@@ -374,6 +371,7 @@ impl CollectionStore {
             building: AtomicBool::new(false),
             needs_rebuild: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
+            maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),

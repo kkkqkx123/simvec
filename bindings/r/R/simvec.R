@@ -438,6 +438,37 @@ simvec_list_old_backups <- function(engine, live) {
 }
 
 #' @export
+#' @export
+simvec_snapshot_collection <- function(engine, collection, dest) {
+  check_engine(engine)
+  res <- .Call(C_simvec_snapshot_collection, engine$ptr,
+    tostring(collection, "collection"), tostring(dest, "dest"))
+  from_json(payload_or_raise(res))
+}
+
+#' @export
+simvec_snapshot_collection_incremental <- function(engine, collection, base, dest) {
+  check_engine(engine)
+  res <- .Call(C_simvec_snapshot_collection_incremental, engine$ptr,
+    tostring(collection, "collection"), tostring(base, "base"), tostring(dest, "dest"))
+  from_json(payload_or_raise(res))
+}
+
+#' @export
+simvec_verify_snapshot <- function(engine, src) {
+  check_engine(engine)
+  res <- .Call(C_simvec_verify_snapshot, engine$ptr, tostring(src, "src"))
+  from_json(payload_or_raise(res))
+}
+
+#' @export
+simvec_restore_snapshot <- function(engine, src, dest) {
+  check_engine(engine)
+  res <- .Call(C_simvec_restore_snapshot, engine$ptr,
+    tostring(src, "src"), tostring(dest, "dest"))
+  raise_if_failed(res)
+}
+
 simvec_set_default_hnsw_config <- function(engine, config) {
   check_engine(engine)
   res <- .Call(C_simvec_set_default_hnsw_config, engine$ptr,

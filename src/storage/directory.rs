@@ -106,7 +106,6 @@ impl DirView {
 /// Append-only directory file with a fixed-size record array and blob area.
 pub struct BlobDirectory {
     path: PathBuf,
-    magic: [u8; 4],
     rec_size: usize,
     file: parking_lot::Mutex<File>,
     view: ArcSwap<DirView>,
@@ -121,8 +120,7 @@ impl BlobDirectory {
     /// Create a new file with `initial_capacity` records.
     pub fn create(
         path: &Path,
-        magic: [u8; 4],
-        rec_size: usize,
+            rec_size: usize,
         initial_capacity: u64,
     ) -> Result<Self> {
         if rec_size < MIN_REC_SIZE {
@@ -150,7 +148,6 @@ impl BlobDirectory {
         });
         Ok(Self {
             path: path.to_path_buf(),
-            magic,
             rec_size,
             file: parking_lot::Mutex::new(file),
             view: ArcSwap::from(view),
@@ -207,7 +204,6 @@ impl BlobDirectory {
         }
         Ok(Self {
             path: path.to_path_buf(),
-            magic,
             rec_size,
             file: parking_lot::Mutex::new(file),
             view: ArcSwap::from(view),
@@ -299,179 +295,11 @@ impl BlobDirectory {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-
-    /// Grow the record array to at least `target_capacity` records.
-    ///
-    /// Relocates the blob area, so the file is rebuilt atomically via a
-    /// temp-file + rename.
-    pub fn grow_to(&self, target_capacity: u64) -> Result<()> {
-        let view = self.view.load();
-        if target_capacity as usize <= view.rec_capacity {
-            return Ok(());
-        }
-
-        let tmp_path = self.path.with_extension("bin.tmp");
-        let mut tmp = File::create(&tmp_path)?;
-        tmp.set_len((HEADER_LEN + target_capacity as usize * self.rec_size) as u64)?;
-        write_header(
-            &tmp,
-            self.magic,
-            self.rec_size,
-            target_capacity,
-            view.blob_len,
-        )?;
-
-        // Copy live records then the blob area.
-        let old_capacity = view.rec_capacity;
-        let old_rec_bytes = old_capacity * self.rec_size;
-        write_region(
-            &mut tmp,
-            &self.file.lock(),
-            HEADER_LEN,
-            HEADER_LEN,
-            old_rec_bytes,
-        )?;
-        let old_blob_start = HEADER_LEN + old_capacity * self.rec_size;
-        let new_blob_start = HEADER_LEN + target_capacity as usize * self.rec_size;
-        write_region(
-            &mut tmp,
-            &self.file.lock(),
-            new_blob_start,
-            old_blob_start,
-            view.blob_len as usize,
-        )?;
-        tmp.sync_all()?;
-
-        let dir = self.path.parent().ok_or_else(|| {
-            VectorSearchError::Internal(format!("no parent dir for {}", self.path.display()))
-        })?;
-        std::fs::rename(&tmp_path, &self.path)?;
-        open_dir(dir)?.sync_all()?;
-
-        let file = File::options().read(true).write(true).open(&self.path)?;
-        let file_len = file.metadata()?.len() as usize;
-        let mmap = map_file(&file, file_len)?;
-        *self.file.lock() = file;
-        self.view.store(Arc::new(DirView {
-            mmap: Arc::new(mmap),
-            rec_size: self.rec_size,
-            rec_capacity: target_capacity as usize,
-            blob_len: view.blob_len,
-            mapped_len: file_len,
-        }));
-        self.dirty
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for BlobDirectory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let view = self.view.load();
-        f.debug_struct("BlobDirectory")
-            .field("path", &self.path)
-            .field("rec_size", &self.rec_size)
-            .field("rec_capacity", &view.rec_capacity)
-            .field("blob_len", &view.blob_len)
-            .finish()
-    }
-}
-
-fn encode_rec(off: u32, len: u32, flags: u8, rec_size: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rec_size);
-    out.extend_from_slice(&off.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
-    if rec_size >= 12 {
-        out.push(flags);
-        out.extend_from_slice(&[0u8; 3]);
-    }
-    out.truncate(rec_size);
-    out
-}
-
-fn write_header(
-    file: &File,
-    magic: [u8; 4],
-    rec_size: usize,
-    rec_capacity: u64,
-    blob_len: u64,
-) -> Result<()> {
-    let mut header = Vec::with_capacity(HEADER_LEN);
-    header.extend_from_slice(&magic);
-    header.extend_from_slice(&FILE_VERSION.to_le_bytes());
-    header.extend_from_slice(&(rec_size as u32).to_le_bytes());
-    header.extend_from_slice(&0u32.to_le_bytes());
-    header.extend_from_slice(&rec_capacity.to_le_bytes());
-    header.extend_from_slice(&blob_len.to_le_bytes());
-    write_at(file, &header, 0)?;
-    Ok(())
-}
-
-fn read_magic(file: &File) -> Result<[u8; 4]> {
-    let mut buf = [0u8; 4];
-    read_exact_at(file, &mut buf, 0)?;
-    Ok(buf)
-}
-
-fn read_version(file: &File) -> Result<u32> {
-    let mut buf = [0u8; 4];
-    read_exact_at(file, &mut buf, OFF_VERSION)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_rec_size(file: &File) -> Result<usize> {
-    let mut buf = [0u8; 4];
-    read_exact_at(file, &mut buf, OFF_REC_SIZE)?;
-    let rec_size = u32::from_le_bytes(buf) as usize;
-    if rec_size < MIN_REC_SIZE {
-        return Err(VectorSearchError::CorruptData(format!(
-            "directory record size {rec_size} < minimum {MIN_REC_SIZE}"
-        )));
-    }
-    Ok(rec_size)
-}
-
-fn read_rec_capacity(file: &File) -> Result<u64> {
-    let mut buf = [0u8; 8];
-    read_exact_at(file, &mut buf, OFF_REC_CAPACITY)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_blob_len(file: &File) -> Result<u64> {
-    let mut buf = [0u8; 8];
-    read_exact_at(file, &mut buf, OFF_BLOB_LEN)?;
-    Ok(u64::from_le_bytes(buf))
 }
 
 fn map_file(file: &File, len: usize) -> Result<Mmap> {
     let mmap = unsafe { MmapOptions::new().len(len).map(file) }?;
     Ok(mmap)
-}
-
-fn open_dir(dir: &Path) -> Result<File> {
-    Ok(File::open(dir)?)
-}
-
-/// Copy `len` bytes from `src` at `src_off` into `dst` at `dst_off`.
-fn write_region(
-    dst: &mut File,
-    src: &File,
-    dst_off: usize,
-    src_off: usize,
-    len: usize,
-) -> Result<()> {
-    const CHUNK: usize = 64 * 1024;
-    let mut remaining = len;
-    let mut pos = 0;
-    while remaining > 0 {
-        let n = remaining.min(CHUNK);
-        let mut buf = vec![0u8; n];
-        read_exact_at(src, &mut buf, (src_off + pos) as u64)?;
-        write_at(dst, &buf, (dst_off + pos) as u64)?;
-        pos += n;
-        remaining -= n;
-    }
-    Ok(())
 }
 
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {

@@ -387,7 +387,7 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     }
 
     // Flip an arbitrary payload byte after the 10-byte header (magic+version+crc).
-    let index_path = data_dir(&store_dir).join("ivf_seg_0000000000.bin");
+    let index_path = data_dir(&store_dir).join("segments/0000000000/ivf_seg_0000000000.bin");
     let mut bytes = std::fs::read(&index_path).unwrap();
     assert!(bytes.len() > 12, "segment IVF file must contain payload");
     // Payload starts at byte 10; flipping byte 10 must break CRC.
@@ -437,7 +437,7 @@ fn test_segment_hnsw_payload_bitflip_triggers_crc_fallback() {
         assert!(store.has_index());
     }
 
-    let hnsw_path = data_dir(&store_dir).join("hnsw_seg_0000000000.bin");
+    let hnsw_path = data_dir(&store_dir).join("segments/0000000000/hnsw_seg_0000000000.bin");
     let mut bytes = std::fs::read(&hnsw_path).unwrap();
     assert!(bytes.len() > 12, "segment graph must contain payload");
     // Flip a payload byte (header is 10 bytes).

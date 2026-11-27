@@ -47,6 +47,7 @@ mod queue;
 mod search;
 mod segment_hnsw;
 mod segment_ivf;
+pub(crate) mod segment_payloads;
 pub(crate) mod segments;
 pub(crate) mod snapshot;
 mod tombstones;
@@ -73,7 +74,7 @@ use parking_lot::{Mutex, RwLock};
 pub(crate) use generation::{CollectionLock, Generation};
 pub(crate) use meta::Meta;
 pub(crate) use payload_index::PayloadIndexManager;
-pub(crate) use payload_store::PayloadStore;
+pub(crate) use segment_payloads::SegmentPayloadStore;
 pub use snapshot::{verify_snapshot, SnapshotInfo};
 pub(crate) use tombstones::TombstoneBits;
 pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
@@ -327,7 +328,7 @@ pub(super) struct DataFiles {
     vectors: Vectors,
     keys: Keys,
     tombstones: ArcSwap<TombstoneBits>,
-    payload_store: ArcSwap<Option<PayloadStore>>,
+    payload_store: ArcSwap<Option<SegmentPayloadStore>>,
     quant: RwLock<Option<QuantStore>>,
     /// One HNSW graph per completed dense segment.
     hnsw_segments: ArcSwap<Vec<segment_hnsw::SegmentHnsw>>,
@@ -347,18 +348,24 @@ impl DataFiles {
     ) -> Result<Self> {
         let dir = dir.to_path_buf();
         let vectors = Vectors::open(
-            &dir.join("vectors.bin"),
+            &dir,
             meta.vector_size,
             meta.segment_slots,
             meta.slot_capacity,
         )?;
-        let keys = Keys::open(&dir.join("keys.bin"))?;
+        let keys = Keys::open(&dir, meta.segment_slots, meta.slot_capacity)?;
         let segments = segments::read_or_derive(&dir, meta.segment_slots, meta.next_slot)?;
-        let tombstones =
-            TombstoneBits::load(&dir, meta.slot_capacity as usize, meta.tombstone_count)?
-                .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
-        let payload_store = PayloadStore::open_with_repair(
-            &dir.join("payloads_store"),
+        let tombstones = TombstoneBits::load_segments(
+            &dir,
+            meta.segment_slots,
+            meta.slot_capacity as usize,
+            meta.tombstone_count,
+        )?
+        .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
+        let payload_store = SegmentPayloadStore::open_with_repair(
+            &dir,
+            meta.segment_slots,
+            meta.slot_capacity,
             replay_floor,
             storage.payload_store_config(),
         )?;
@@ -439,6 +446,9 @@ pub struct CollectionStore {
     /// uses it to detect that no write raced its temp-file rewrite phase, so
     /// the commit can swap the files without re-validating every slot.
     mutations: AtomicU64,
+    /// Last failed maintenance flush. Reads and writes continue; the WAL
+    /// watermark stays put until a later flush succeeds.
+    maintenance_error: Mutex<Option<String>>,
     /// Transactions since the last meta.bin save. Used to amortize fsync
     /// cost; the WAL guarantees crash safety independently.
     txns_since_last_save: AtomicU64,
@@ -569,6 +579,31 @@ impl CollectionStore {
             )));
         }
         Ok(())
+    }
+
+    /// Last maintenance failure, used by the public maintenance status.
+    pub fn maintenance_error(&self) -> Option<String> {
+        self.maintenance_error.lock().clone()
+    }
+
+    pub(crate) fn record_maintenance_error(&self, error: &str) {
+        *self.maintenance_error.lock() = Some(error.to_string());
+        tracing::warn!(error, collection_dir = %self.dir.display(), "segment flush failed");
+    }
+
+    pub(crate) fn clear_maintenance_error(&self) {
+        *self.maintenance_error.lock() = None;
+    }
+
+    /// Durable segment water marks and the last maintenance failure.
+    pub fn maintenance_status(&self) -> crate::types::MaintenanceStatus {
+        let inner = self.inner.read();
+        let error = self.maintenance_error();
+        crate::types::MaintenanceStatus {
+            healthy: error.is_none(),
+            persisted_lsn: inner.min_persisted(inner.meta.last_applied_txn),
+            error,
+        }
     }
 
     /// Pin the WAL acknowledge at `version` for the lifetime of the guard.

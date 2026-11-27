@@ -64,6 +64,16 @@ pub struct CollectionInfo {
     pub memory_bytes: u64,
 }
 
+/// Durability state of the per-segment flush worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceStatus {
+    pub healthy: bool,
+    /// Lowest LSN durable in every segment.
+    pub persisted_lsn: u64,
+    /// Last flush failure, cleared by the next successful checkpoint.
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollectionStatus {
     Green,

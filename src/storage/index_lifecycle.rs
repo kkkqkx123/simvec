@@ -669,14 +669,14 @@ impl CollectionStore {
         let _guard = self.compact_mutex.lock();
         files.hnsw_segments.store(Arc::new(Vec::new()));
         files.ivf_segments.store(Arc::new(Vec::new()));
-        if let Ok(entries) = std::fs::read_dir(files.dir()) {
-            for entry in entries.flatten() {
+        for dir in segments::segment_dirs(files.dir()) {
+            for entry in std::fs::read_dir(dir)?.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if segment_hnsw::is_segment_file(&name)
                     || segment_ivf::is_segment_file(&name)
                     || super::quant::is_segment_file(&name)
                 {
-                    let _ = std::fs::remove_file(entry.path());
+                    std::fs::remove_file(entry.path())?;
                 }
             }
         }

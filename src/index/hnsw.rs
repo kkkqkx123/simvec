@@ -211,6 +211,11 @@ struct Node {
     level: u8,
     /// Adjacency per layer; one locked list per layer `0..=level`.
     neighbors: Vec<RwLock<Vec<u32>>>,
+    /// Inbound edges per layer, derived from `neighbors` at load time and
+    /// maintained alongside every forward-list mutation. Deletion uses it
+    /// to reach every node pointing at the removed slot, not just the ones
+    /// reachable from the removed node's own adjacency.
+    reverse: Vec<RwLock<Vec<u32>>>,
     /// Monotonic counter (wrapping, 4-bit effective range 1–15) incremented
     /// every time any layer's adjacency list is mutated. Readers snapshot this
     /// before and after loading neighbors to detect concurrent modifications.
@@ -222,6 +227,7 @@ impl Node {
         Self {
             level,
             neighbors: (0..=level).map(|_| RwLock::new(Vec::new())).collect(),
+            reverse: (0..=level).map(|_| RwLock::new(Vec::new())).collect(),
             version: std::sync::atomic::AtomicU8::new(1),
         }
     }
@@ -231,6 +237,13 @@ impl Node {
     /// a corrupted link from panicking.
     fn layer(&self, lc: u8) -> &RwLock<Vec<u32>> {
         &self.neighbors[(lc as usize).min(self.neighbors.len() - 1)]
+    }
+
+    /// Inbound edges of `lc`. Locked separately from `layer`: the mutation
+    /// order is always forward lock first, then reverse lock, while search
+    /// never touches the reverse lists.
+    fn reverse(&self, lc: u8) -> &RwLock<Vec<u32>> {
+        &self.reverse[(lc as usize).min(self.reverse.len() - 1)]
     }
 
     /// Snapshot the current version. Callers comparing before/after versions
@@ -350,6 +363,10 @@ pub(crate) struct HnswIndex {
     /// waiting for a segment rebuild. Diagnostic counters only.
     healed_nodes: AtomicU64,
     healed_edges: AtomicU64,
+    /// Number of times inbound lists were rebuilt from forward adjacency.
+    /// Load always derives inbound edges from the persisted forward lists;
+    /// the counter makes that degradation visible.
+    reverse_rebuilds: AtomicU64,
 }
 
 impl HnswIndex {
@@ -378,6 +395,7 @@ impl HnswIndex {
             lock_metrics: None,
             healed_nodes: AtomicU64::new(0),
             healed_edges: AtomicU64::new(0),
+            reverse_rebuilds: AtomicU64::new(0),
         }
     }
 
@@ -419,6 +437,66 @@ impl HnswIndex {
         }
         self.overwrites_distance_delta
             .fetch_add(delta_fixed, Ordering::Relaxed);
+    }
+
+    /// Reflect inbound edges after a forward adjacency replacement. The
+    /// caller has already published `new` into the forward list; this keeps
+    /// the reverse sets in sync and bumps the version only once both sides
+    /// of the adjacency change are complete.
+    pub(super) fn record_neighbor_change(&self, from: u32, layer: u8, old: &[u32], new: &[u32]) {
+        if old == new {
+            return;
+        }
+        for &target in old {
+            if new.contains(&target) {
+                continue;
+            }
+            if let Some(node) = self.node(target) {
+                let mut inbound = node.reverse(layer).write();
+                inbound.retain(|&source| source != from);
+            }
+        }
+        for &target in new {
+            if old.contains(&target) {
+                continue;
+            }
+            if let Some(node) = self.node(target) {
+                let mut inbound = node.reverse(layer).write();
+                if !inbound.contains(&from) {
+                    inbound.push(from);
+                }
+            }
+        }
+        if let Some(node) = self.node(from) {
+            node.bump_version();
+        }
+    }
+
+    /// Derive every inbound list from persisted forward adjacency. Forward
+    /// links are the authority; an inconsistent stored inbound set is never
+    /// trusted.
+    pub(super) fn rebuild_reverse(&self) {
+        let nodes = self.nodes.read();
+        for node in nodes.iter().flatten() {
+            for list in &node.reverse {
+                list.write().clear();
+            }
+        }
+        for (slot, node) in nodes.iter().enumerate() {
+            let Some(node) = node else { continue };
+            for (layer, list) in node.neighbors.iter().enumerate() {
+                for &target in list.read().iter() {
+                    if let Some(peer) = nodes.get(target as usize).and_then(|n| n.as_ref()) {
+                        let mut inbound = peer.reverse(layer as u8).write();
+                        if !inbound.contains(&(slot as u32)) {
+                            inbound.push(slot as u32);
+                        }
+                    }
+                }
+            }
+        }
+        self.reverse_rebuilds.fetch_add(1, Ordering::Relaxed);
+        drop(nodes);
     }
 
     pub(crate) fn default_ef(&self) -> usize {

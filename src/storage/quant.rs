@@ -31,7 +31,7 @@ mod rebuild;
 
 pub(crate) use self::codec::QuantQuery;
 
-const QUANT_MAGIC: [u8; 4] = *b"VQMT";
+const QUANT_MAGIC: [u8; 4] = *b"VQMC";
 const QUANT_VERSION: u16 = 1;
 const QUANT_FILE: &str = "quant.bin";
 const QUANT_META_FILE: &str = "quant_meta.bin";
@@ -395,7 +395,7 @@ impl QuantStore {
 
 /// File holding quantized codes for the segment starting at `start`.
 pub(crate) fn segment_file_path(dir: &Path, start: u32) -> PathBuf {
-    dir.join(format!("{QUANT_SEGMENT_PREFIX}{start:010}.bin"))
+    super::segments::segment_dir(dir, start).join(format!("{QUANT_SEGMENT_PREFIX}{start:010}.bin"))
 }
 
 pub(crate) fn is_segment_file(name: &str) -> bool {
@@ -440,7 +440,7 @@ fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
 
 fn save_meta(path: &Path, meta: &QuantMeta) -> Result<()> {
     let bytes = postcard::to_stdvec(meta)?;
-    let crc = crc32fast::hash(&bytes);
+    let crc = crate::checksum::hash(&bytes);
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(&QUANT_MAGIC)?;
@@ -475,7 +475,7 @@ fn read_tagged<T: serde::de::DeserializeOwned>(
     }
     let expected_crc = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
     let payload = &bytes[10..];
-    if crc32fast::hash(payload) != expected_crc {
+    if crate::checksum::hash(payload) != expected_crc {
         return Err(VectorSearchError::CorruptData(
             "quant crc mismatch".to_string(),
         ));

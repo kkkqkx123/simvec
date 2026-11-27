@@ -3,6 +3,7 @@
 //! HNSW-first ANN search with exact-scan fallback. Leaf crate: does not depend on any
 //! host project crate and does not pull in the qdrant networking stack.
 
+pub mod checksum;
 pub mod distance;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;

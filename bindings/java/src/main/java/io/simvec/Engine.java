@@ -173,6 +173,34 @@ public final class Engine implements AutoCloseable {
         return readList(out[0]);
     }
 
+    public synchronized Map<String, Object> snapshotCollection(String collection, String dest) {
+        long h = requireOpen();
+        byte[][] out = new byte[1][];
+        check(NativeLib.nSnapshotCollection(h, utf8(collection), utf8(dest), out), h);
+        return readMap(out[0]);
+    }
+
+    public synchronized Map<String, Object> snapshotCollectionIncremental(
+            String collection, String base, String dest) {
+        long h = requireOpen();
+        byte[][] out = new byte[1][];
+        check(NativeLib.nSnapshotCollectionIncremental(
+                h, utf8(collection), utf8(base), utf8(dest), out), h);
+        return readMap(out[0]);
+    }
+
+    public synchronized Map<String, Object> verifySnapshot(String src) {
+        long h = requireOpen();
+        byte[][] out = new byte[1][];
+        check(NativeLib.nVerifySnapshot(h, utf8(src), out), h);
+        return readMap(out[0]);
+    }
+
+    public synchronized void restoreSnapshot(String src, String dest) {
+        long h = requireOpen();
+        check(NativeLib.nRestoreSnapshot(h, utf8(src), utf8(dest)), h);
+    }
+
     // -- writes --
 
     public synchronized void upsert(String collection, String id, float[] vector, Object payload) {

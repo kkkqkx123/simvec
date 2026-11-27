@@ -797,3 +797,42 @@ fn test_healing_removes_deleted_neighbor_without_rebuild() {
     assert!(hits.iter().any(|(_, slot)| *slot != removed));
     assert!(!hits.iter().any(|(_, slot)| *slot == removed));
 }
+
+#[test]
+fn test_healing_removes_inbound_edges_absent_from_deleted_adjacency() {
+    let data = blobs(10);
+    let vectors: Vec<Vec<f32>> = data.iter().map(|(v, _)| v.clone()).collect();
+    let (_dir, mmaps) = mmap_from(&vectors);
+    let slots: Vec<u32> = (0..data.len() as u32).collect();
+    let index = HnswIndex::build(
+        &IndexBuildParams::new("col", DIM, DistanceMetric::Euclid, &slots, &mmaps, 256),
+        &config(),
+    )
+    .unwrap();
+
+    let removed = 4u32;
+    // Asymmetric state: node 0 points at the removed slot, but the removed
+    // node's own adjacency does not mention node 0. A traversal of the
+    // removed node's lists alone would miss this inbound edge.
+    let source = index.node(0).unwrap();
+    let target = index.node(removed).unwrap();
+    source.layer(0).write().push(removed);
+    target.reverse(0).write().push(0);
+    let mut bits = bitvec::bitvec![0; data.len()];
+    bits.set(removed as usize, true);
+    let tombstones = TombstoneBits::from_bits(bits);
+
+    index.heal_deleted(removed, &mmaps, 256, 0, |slot| {
+        tombstones.bit(slot as usize)
+    });
+
+    for slot in &slots {
+        let Some(node) = index.node(*slot) else {
+            continue;
+        };
+        for layer in 0..node.neighbors.len() {
+            assert!(!node.layer(layer as u8).read().contains(&removed));
+            assert!(!node.reverse(layer as u8).read().contains(&removed));
+        }
+    }
+}

@@ -22,7 +22,7 @@ pub(super) fn file_name(start: u32) -> String {
 }
 
 pub(super) fn file_path(dir: &Path, start: u32) -> PathBuf {
-    dir.join(file_name(start))
+    super::segments::segment_dir(dir, start).join(file_name(start))
 }
 
 pub(super) fn is_segment_file(name: &str) -> bool {

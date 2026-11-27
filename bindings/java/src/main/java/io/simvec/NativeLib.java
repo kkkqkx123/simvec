@@ -186,6 +186,15 @@ final class NativeLib {
 
     static native int nListOldBackups(long handle, byte[] live, byte[][] out);
 
+    static native int nSnapshotCollection(long handle, byte[] collection, byte[] dest, byte[][] out);
+
+    static native int nSnapshotCollectionIncremental(
+            long handle, byte[] collection, byte[] base, byte[] dest, byte[][] out);
+
+    static native int nVerifySnapshot(long handle, byte[] src, byte[][] out);
+
+    static native int nRestoreSnapshot(long handle, byte[] src, byte[] dest);
+
     static native int nSetDefaultHnswConfig(long handle, byte[] configJson);
 
     static native int nGetDefaultHnswConfig(long handle, byte[][] out);

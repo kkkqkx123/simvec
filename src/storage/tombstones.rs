@@ -29,10 +29,12 @@ use bitvec::prelude::*;
 
 use crate::error::{Result, VectorSearchError};
 
+use super::segments::segment_dir;
+
 /// File name of the persisted tombstone table.
 pub(crate) const TOMBSTONE_FILE: &str = "tombstones.bin";
 
-const TOMBSTONE_MAGIC: [u8; 4] = *b"VSTB";
+const TOMBSTONE_MAGIC: [u8; 4] = *b"VSTC";
 const TOMBSTONE_VERSION: u32 = 1;
 const TOMBSTONE_HEADER_LEN: usize = 20;
 
@@ -137,7 +139,7 @@ impl TombstoneBits {
         let mut payload = Vec::with_capacity(TOMBSTONE_HEADER_LEN + bytes.len());
         payload.extend_from_slice(&TOMBSTONE_MAGIC);
         payload.extend_from_slice(&TOMBSTONE_VERSION.to_le_bytes());
-        payload.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+        payload.extend_from_slice(&crate::checksum::hash(&bytes).to_le_bytes());
         payload.extend_from_slice(&slot_capacity.to_le_bytes());
         payload.extend_from_slice(&bytes);
 
@@ -151,6 +153,87 @@ impl TombstoneBits {
         let parent = dir.parent().unwrap_or(dir);
         File::open(parent)?.sync_all()?;
         Ok(())
+    }
+
+    /// Persist one tombstone bitmap per physical segment.
+    pub(super) fn save_segments(
+        &self,
+        dir: &Path,
+        segment_slots: u32,
+        slot_capacity: u64,
+    ) -> Result<()> {
+        if segment_slots == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "segment_slots must be positive".to_string(),
+            ));
+        }
+        let mut start = 0u64;
+        while start < slot_capacity {
+            self.save_segment(dir, start as u32, segment_slots, slot_capacity)?;
+            start += segment_slots as u64;
+        }
+        Ok(())
+    }
+
+    /// Persist the bits of one physical segment.
+    pub(super) fn save_segment(
+        &self,
+        dir: &Path,
+        start: u32,
+        segment_slots: u32,
+        slot_capacity: u64,
+    ) -> Result<()> {
+        let bits = self.to_bits();
+        let begin = start as usize;
+        let end = (begin + segment_slots as usize).min(slot_capacity as usize);
+        let mut segment = BitVec::new();
+        for bit in bits[begin..end].iter().by_vals() {
+            segment.push(bit);
+        }
+        TombstoneBits::from_bits(segment)
+            .resized(end - begin)
+            .save(&segment_dir(dir, start), (end - begin) as u64)?;
+        Ok(())
+    }
+
+    /// Load and concatenate the per-segment tombstone bitmaps.
+    pub(super) fn load_segments(
+        dir: &Path,
+        segment_slots: u32,
+        slot_capacity: usize,
+        expected_tombstones: u64,
+    ) -> Result<Option<Self>> {
+        if segment_slots == 0 {
+            return Err(VectorSearchError::InvalidConfig(
+                "segment_slots must be positive".to_string(),
+            ));
+        }
+        let mut bits = BitVec::new();
+        let mut found = false;
+        let mut start = 0usize;
+        while start < slot_capacity {
+            let end = (start + segment_slots as usize).min(slot_capacity);
+            if let Some(table) = Self::load(&segment_dir(dir, start as u32), end - start, 0)? {
+                found = true;
+                for index in 0..(end - start) {
+                    bits.push(table.bit(index));
+                }
+            } else {
+                bits.resize(bits.len() + (end - start), false);
+            }
+            start = end;
+        }
+        if !found && expected_tombstones == 0 {
+            return Ok(None);
+        }
+        if bits.count_ones() as u64 != expected_tombstones {
+            return Err(VectorSearchError::CorruptData(format!(
+                "tombstone segment files record {} deletes, meta records {expected_tombstones}",
+                bits.count_ones()
+            )));
+        }
+        bits.resize(slot_capacity, false);
+        Ok(Some(Self::from_bits(bits)))
     }
 
     /// Load `tombstones.bin` and resize it to the capacity declared by meta.
@@ -202,7 +285,7 @@ impl TombstoneBits {
         file.read_to_end(&mut bytes).map_err(|e| {
             VectorSearchError::CorruptData(format!("{} unreadable: {e}", TOMBSTONE_FILE))
         })?;
-        let actual_crc = crc32fast::hash(&bytes);
+        let actual_crc = crate::checksum::hash(&bytes);
         if actual_crc != expected_crc {
             return Err(VectorSearchError::CorruptData(format!(
                 "{} checksum mismatch: stored {expected_crc:#x}, computed {actual_crc:#x}",

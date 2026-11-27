@@ -100,7 +100,7 @@ fn encode_payload_value(json: &[u8], codec: crate::types::PayloadCompression) ->
     let mut framed = Vec::with_capacity(PAYLOAD_CODEC_LEN + data.len());
     framed.push(marker);
     framed.extend_from_slice(&data);
-    let crc = crc32fast::hash(&framed);
+    let crc = crate::checksum::hash(&framed);
     let mut out = Vec::with_capacity(PAYLOAD_HEADER_LEN + data.len());
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&framed);
@@ -117,7 +117,7 @@ fn decode_payload_json(stored: &[u8]) -> Result<Vec<u8>> {
     }
     let (crc_bytes, body) = stored.split_at(PAYLOAD_CRC_LEN);
     let expected = u32::from_le_bytes(crc_bytes.try_into().expect("crc slice"));
-    if crc32fast::hash(body) != expected {
+    if crate::checksum::hash(body) != expected {
         return Err(VectorSearchError::CorruptData(
             "payload blob failed its checksum".to_string(),
         ));
@@ -463,25 +463,6 @@ impl PayloadStore {
         self.put_at(slot, Some(&merged), lsn)
     }
 
-    /// Compact the store: rebuild it with only the live slots specified
-    /// by `live_slots`. Returns a new compacted PayloadStore at `dest_path`.
-    ///
-    /// The rebuilt store is fully checkpointed before it is returned, so the
-    /// caller can swap the directory in without extra persistence steps.
-    pub fn compact_to(
-        &self,
-        dest_path: &Path,
-        live_slots: &[(u32, u32)], // (old_slot, new_slot)
-    ) -> Result<PayloadStore> {
-        let new_store = PayloadStore::create(dest_path, self.config.clone())?;
-        for &(old_slot, new_slot) in live_slots {
-            let payload = self.get(old_slot)?;
-            new_store.put(new_slot, payload.as_ref())?;
-        }
-        new_store.checkpoint()?;
-        Ok(new_store)
-    }
-
     /// Number of blocks needed for a given byte length.
     fn blocks_needed(&self, len: usize) -> u32 {
         len.div_ceil(self.config.block_size) as u32
@@ -787,7 +768,7 @@ mod tests {
     fn test_missing_codec_is_rejected() {
         let json = serde_json::to_vec(&payload(&[("legacy", json!(true))])).unwrap();
         let mut blob = Vec::with_capacity(PAYLOAD_CRC_LEN + json.len());
-        blob.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
+        blob.extend_from_slice(&crate::checksum::hash(&json).to_le_bytes());
         blob.extend_from_slice(&json);
         assert!(decode_payload_json(&blob).is_err());
     }

@@ -708,6 +708,60 @@ JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nListOldBackups(JNIEnv *env, jcl
     return rc;
 }
 
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nSnapshotCollection(
+        JNIEnv *env, jclass cls, jlong handle, jbyteArray collection, jbyteArray dest,
+        jobjectArray out) {
+    (void)cls;
+    ACQUIRE(c_collection, collection);
+    ACQUIRE(c_dest, dest);
+    char *s = NULL;
+    int rc = simvec_snapshot_collection(to_engine(handle), c_collection, c_dest, &s);
+    RELEASE(c_collection);
+    RELEASE(c_dest);
+    emit_bytes(env, out, s);
+    return rc;
+}
+
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nSnapshotCollectionIncremental(
+        JNIEnv *env, jclass cls, jlong handle, jbyteArray collection, jbyteArray base,
+        jbyteArray dest, jobjectArray out) {
+    (void)cls;
+    ACQUIRE(c_collection, collection);
+    ACQUIRE(c_base, base);
+    ACQUIRE(c_dest, dest);
+    char *s = NULL;
+    int rc = simvec_snapshot_collection_incremental(
+            to_engine(handle), c_collection, c_base, c_dest, &s);
+    RELEASE(c_collection);
+    RELEASE(c_base);
+    RELEASE(c_dest);
+    emit_bytes(env, out, s);
+    return rc;
+}
+
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nVerifySnapshot(
+        JNIEnv *env, jclass cls, jlong handle, jbyteArray src, jobjectArray out) {
+    (void)cls;
+    ACQUIRE(c_src, src);
+    char *s = NULL;
+    int rc = simvec_verify_snapshot(to_engine(handle), c_src, &s);
+    RELEASE(c_src);
+    emit_bytes(env, out, s);
+    return rc;
+}
+
+JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nRestoreSnapshot(
+        JNIEnv *env, jclass cls, jlong handle, jbyteArray src, jbyteArray dest) {
+    (void)env;
+    (void)cls;
+    ACQUIRE(c_src, src);
+    ACQUIRE(c_dest, dest);
+    int rc = simvec_restore_snapshot(to_engine(handle), c_src, c_dest);
+    RELEASE(c_src);
+    RELEASE(c_dest);
+    return rc;
+}
+
 JNIEXPORT jint JNICALL Java_io_simvec_NativeLib_nSetDefaultHnswConfig(JNIEnv *env, jclass cls,
                                                                        jlong handle,
                                                                        jbyteArray config) {

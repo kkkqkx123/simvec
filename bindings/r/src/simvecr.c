@@ -845,6 +845,75 @@ SEXP C_simvec_list_old_backups(SEXP r_handle, SEXP r_live) {
     RETURN3(0, json_payload(text), NULL);
 }
 
+SEXP C_simvec_snapshot_collection(SEXP r_handle, SEXP r_collection, SEXP r_dest) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(collection, r_collection);
+    NEED_STR(dest, r_dest);
+    char *text = NULL;
+    int rc = simvec_snapshot_collection(handle, collection, dest, &text);
+    if (rc) {
+        if (text) {
+            simvec_free_string(text);
+        }
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, json_payload(text), NULL);
+}
+
+SEXP C_simvec_snapshot_collection_incremental(SEXP r_handle, SEXP r_collection,
+                                               SEXP r_base, SEXP r_dest) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(collection, r_collection);
+    NEED_STR(base, r_base);
+    NEED_STR(dest, r_dest);
+    char *text = NULL;
+    int rc = simvec_snapshot_collection_incremental(handle, collection, base, dest, &text);
+    if (rc) {
+        if (text) {
+            simvec_free_string(text);
+        }
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, json_payload(text), NULL);
+}
+
+SEXP C_simvec_verify_snapshot(SEXP r_handle, SEXP r_src) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(src, r_src);
+    char *text = NULL;
+    int rc = simvec_verify_snapshot(handle, src, &text);
+    if (rc) {
+        if (text) {
+            simvec_free_string(text);
+        }
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, json_payload(text), NULL);
+}
+
+SEXP C_simvec_restore_snapshot(SEXP r_handle, SEXP r_src, SEXP r_dest) {
+    engine_t *handle = engine_ptr(r_handle);
+    if (!handle) {
+        RETURN3(20, R_NilValue, "engine is closed");
+    }
+    NEED_STR(src, r_src);
+    NEED_STR(dest, r_dest);
+    int rc = simvec_restore_snapshot(handle, src, dest);
+    if (rc) {
+        FAIL_WITH_MESSAGE(handle, rc);
+    }
+    RETURN3(0, R_NilValue, NULL);
+}
+
 SEXP C_simvec_set_default_hnsw_config(SEXP r_handle, SEXP r_config) {
     engine_t *handle = engine_ptr(r_handle);
     if (!handle) {

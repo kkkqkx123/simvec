@@ -518,6 +518,46 @@ class Engine:
         )
         return _take_json(out)
 
+    def snapshot_collection(self, collection, dest):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_snapshot_collection(
+                self._handle, _encode_str(collection), _encode_str(dest), ctypes.byref(out)
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def snapshot_collection_incremental(self, collection, base, dest):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_snapshot_collection_incremental(
+                self._handle,
+                _encode_str(collection),
+                _encode_str(base),
+                _encode_str(dest),
+                ctypes.byref(out),
+            ),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def verify_snapshot(self, src):
+        out = ctypes.c_void_p()
+        _check(
+            _lib.simvec_verify_snapshot(self._handle, _encode_str(src), ctypes.byref(out)),
+            self._handle,
+        )
+        return _take_json(out)
+
+    def restore_snapshot(self, src, dest):
+        _check(
+            _lib.simvec_restore_snapshot(
+                self._handle, _encode_str(src), _encode_str(dest)
+            ),
+            self._handle,
+        )
+
     def set_default_hnsw_config(self, config):
         _check(
             _lib.simvec_set_default_hnsw_config(self._handle, _encode_json(config)),

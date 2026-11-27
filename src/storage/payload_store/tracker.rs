@@ -117,7 +117,7 @@ impl Tracker {
                     .try_into()
                     .expect("journal crc slice"),
             );
-            if crc32fast::hash(payload) != expected {
+            if crate::checksum::hash(payload) != expected {
                 break;
             }
             let version = u64::from_le_bytes(payload[0..8].try_into().expect("journal version"));
@@ -196,7 +196,7 @@ impl Tracker {
         record.extend_from_slice(&pointer.page_id.to_le_bytes());
         record.extend_from_slice(&pointer.block_offset.to_le_bytes());
         record.extend_from_slice(&pointer.length.to_le_bytes());
-        let crc = crc32fast::hash(&record);
+        let crc = crate::checksum::hash(&record);
         record.extend_from_slice(&crc.to_le_bytes());
         debug_assert_eq!(record.len(), JOURNAL_RECORD_LEN);
 
@@ -406,7 +406,7 @@ mod tests {
                 bytes.extend_from_slice(&pointer.page_id.to_le_bytes());
                 bytes.extend_from_slice(&pointer.block_offset.to_le_bytes());
                 bytes.extend_from_slice(&pointer.length.to_le_bytes());
-                let crc = crc32fast::hash(&bytes);
+                let crc = crate::checksum::hash(&bytes);
                 bytes.extend_from_slice(&crc.to_le_bytes());
                 bytes
             };

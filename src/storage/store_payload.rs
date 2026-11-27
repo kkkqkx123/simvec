@@ -119,7 +119,7 @@ impl CollectionStore {
     fn current_payload_locked(
         &self,
         inner: &StoreInner,
-        ps: &super::PayloadStore,
+        ps: &super::SegmentPayloadStore,
         working: &HashMap<PointId, Option<Payload>>,
         id: &PointId,
     ) -> Result<Option<Payload>> {

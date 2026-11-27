@@ -188,7 +188,9 @@ fn test_payload_store_rebuilds_before_first_checkpoint() {
     let mut payload = HashMap::new();
     payload.insert("k".to_string(), serde_json::json!("v"));
     upsert_logged(&store, &point_with_payload(7, 2, payload.clone()));
-    let page = store.data_dir().join("payloads_store/pages/page_0000.bin");
+    let page = store
+        .data_dir()
+        .join("segments/0000000000/payloads_store/pages/page_0000.bin");
     assert!(page.exists());
     // Publish the derived pointer without advancing the generation: this is
     // the crash window where the page bytes may not be durable yet. The WAL
@@ -315,7 +317,7 @@ fn test_snapshot_verification_rejects_bit_rot() {
         .unwrap()
         .unwrap()
         .path()
-        .join("vectors.bin");
+        .join("segments/0000000000/vectors.bin");
     let mut bytes = std::fs::read(&generation).unwrap();
     bytes[0] ^= 0x01;
     std::fs::write(&generation, bytes).unwrap();
@@ -727,14 +729,14 @@ fn test_short_vectors_file_is_repaired_on_open() {
 
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .open(data_dir.join("vectors.bin"))
+        .open(data_dir.join("segments/0000000000/vectors.bin"))
         .unwrap();
     file.set_len(16).unwrap();
     drop(file);
 
     let store = CollectionStore::open(&store_dir).expect("open must repair the length");
     assert_eq!(store.meta().slot_capacity, capacity);
-    let len = std::fs::metadata(data_dir.join("vectors.bin"))
+    let len = std::fs::metadata(data_dir.join("segments/0000000000/vectors.bin"))
         .unwrap()
         .len();
     assert_eq!(len, capacity * 4 * 4);
@@ -757,7 +759,7 @@ fn test_oversized_vectors_file_is_accepted() {
 
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .open(data_dir.join("vectors.bin"))
+        .open(data_dir.join("segments/0000000000/vectors.bin"))
         .unwrap();
     file.set_len(capacity * 4 * 4 + 4096).unwrap();
     drop(file);
@@ -1139,7 +1141,7 @@ fn test_wide_vectors_get_smaller_segments() {
     // One segment, sized by the target rather than by a fixed slot count.
     let expected = meta.slot_capacity * 768 * 4;
     assert_eq!(
-        std::fs::metadata(store.data_dir().join("vectors.bin"))
+        std::fs::metadata(store.data_dir().join("segments/0000000000/vectors.bin"))
             .unwrap()
             .len(),
         expected
@@ -1215,7 +1217,7 @@ fn test_dense_snapshot_restores_id_directory() {
         1
     );
 
-    let keys = data.join("keys.bin");
+    let keys = data.join("segments/0000000000/keys.bin");
     let mut bytes = std::fs::read(&keys).unwrap();
     let match_at = bytes
         .windows(4)
@@ -1546,4 +1548,55 @@ fn test_lz4_payloads_round_trip_through_collection() {
     let body = got.payload.as_ref().unwrap().get("body").unwrap();
     assert_eq!(body.as_str().unwrap(), &big);
     assert_eq!(reopened.count(), 2);
+}
+
+#[test]
+fn test_physical_segments_own_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_physical");
+    {
+        let store = CollectionStore::create_with_segment_slots(
+            &store_dir,
+            "col_physical",
+            &config(2),
+            4,
+        )
+        .unwrap();
+        for id in 0..6u64 {
+            upsert_logged(&store, &point(id, 2));
+        }
+        store.checkpoint().unwrap();
+        let generation = store.data_dir();
+        let first = generation.join("segments/0000000000");
+        let second = generation.join("segments/0000000004");
+        for file in ["vectors.bin", "keys.bin", "tombstones.bin", "id_tracker.bin"] {
+            assert!(first.join(file).exists(), "{file} must be segment-local");
+            assert!(second.join(file).exists(), "{file} must be segment-local");
+        }
+        assert!(first.join("payloads_store/config.json").exists());
+        assert!(second.join("payloads_store/config.json").exists());
+        assert!(!generation.join("vectors.bin").exists());
+        assert!(!generation.join("keys.bin").exists());
+        assert!(!generation.join("tombstones.bin").exists());
+        assert!(!generation.join("payloads_store").exists());
+    }
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 6);
+}
+
+#[test]
+fn test_segment_wal_ack_stops_at_a_live_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_ack_pin");
+    let store = CollectionStore::create(&store_dir, "col_ack_pin", &config(2)).unwrap();
+    let pin = store.pin_wal_ack(store.meta().last_applied_txn.max(1));
+    for id in 0..4u64 {
+        upsert_logged(&store, &point(id, 2));
+    }
+    store.checkpoint().unwrap();
+    let held = store.durable_wal_floor();
+    assert!(held <= pin.version(), "pin must hold the ack back");
+    drop(pin);
+    store.checkpoint().unwrap();
+    assert!(store.durable_wal_floor() > held, "ack resumes after release");
 }

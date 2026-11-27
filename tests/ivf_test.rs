@@ -236,8 +236,8 @@ fn corrupt_segment_ivf_falls_back_to_exact_scan() {
         .find(|path| path.is_dir())
         .expect("published generation");
     std::fs::write(
-        data_dir.join("ivf_seg_0000000000.bin"),
-        b"VIVFgarbage-not-parseable",
+        data_dir.join("segments/0000000000/ivf_seg_0000000000.bin"),
+        b"VICFgarbage-not-parseable",
     )
     .unwrap();
 
@@ -252,7 +252,7 @@ fn corrupt_segment_ivf_falls_back_to_exact_scan() {
         .unwrap();
     assert_eq!(results.len(), 3);
     // The corrupt file is cleaned up so a later save starts fresh.
-    assert!(!data_dir.join("ivf_seg_0000000000.bin").exists());
+    assert!(!data_dir.join("segments/0000000000/ivf_seg_0000000000.bin").exists());
 }
 
 #[test]

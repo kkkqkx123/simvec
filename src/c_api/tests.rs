@@ -504,3 +504,75 @@ fn named_patch_round_trip() {
         close_engine(handle);
     }
 }
+
+#[test]
+fn snapshot_c_abi_roundtrip() {
+    unsafe {
+        let handle = open_engine();
+        let name = cstr("snap_col");
+        let config = cstr(r#"{"vector_size":2,"distance":"Cosine","index":"Flat"}"#);
+        assert_eq!(
+            collections::simvec_create_collection(handle, name.as_ptr(), config.as_ptr()),
+            OK
+        );
+        let vector = [1.0f32, 0.0];
+        assert_eq!(
+            write::simvec_upsert(
+                handle,
+                name.as_ptr(),
+                cstr("1").as_ptr(),
+                vector.as_ptr(),
+                vector.len(),
+                ptr::null(),
+            ),
+            OK
+        );
+        let root = std::env::temp_dir().join(format!(
+            "simvec-c-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let snapshot = cstr(&root.join("snapshot").to_string_lossy());
+        let restored_root = root.join("restored");
+        let restored = cstr(&restored_root.join("snap_col").to_string_lossy());
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            super::snapshots::simvec_snapshot_collection(
+                handle,
+                name.as_ptr(),
+                snapshot.as_ptr(),
+                &mut out,
+            ),
+            OK
+        );
+        let info: serde_json::Value =
+            serde_json::from_str(&take_string(out)).expect("snapshot info JSON");
+        assert!(info.get("generation").is_some());
+        assert_eq!(
+            super::snapshots::simvec_verify_snapshot(handle, snapshot.as_ptr(), &mut out),
+            OK
+        );
+        engine::simvec_free_string(out);
+        assert_eq!(
+            super::snapshots::simvec_restore_snapshot(handle, snapshot.as_ptr(), restored.as_ptr()),
+            OK
+        );
+        let mut restored_engine: *mut simvec_engine_t = ptr::null_mut();
+        assert_eq!(
+            engine::simvec_open(cstr(&restored_root.to_string_lossy()).as_ptr(), &mut restored_engine),
+            OK
+        );
+        let mut count = 0u64;
+        assert_eq!(
+            read::simvec_count(restored_engine, name.as_ptr(), &mut count),
+            OK
+        );
+        assert_eq!(count, 1);
+        close_engine(restored_engine);
+        close_engine(handle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

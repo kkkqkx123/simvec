@@ -83,7 +83,7 @@ const SPARE_NAME: &str = ".spare";
 /// segments are unlinked, so a segment that reappears after a crash cannot
 /// replay stale operations over newer data.
 const ACK_FILE: &str = "acked-lsn";
-const ACK_MAGIC: [u8; 4] = *b"SVAK";
+const ACK_MAGIC: [u8; 4] = *b"SVAC";
 const ACK_VERSION: u32 = 1;
 const ACK_HEADER_LEN: usize = 28;
 
@@ -94,7 +94,7 @@ pub const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Segment format version written into every header.
 const SEG_VERSION: u32 = 2;
 /// Segment magic: `SVWL`.
-const SEG_MAGIC: [u8; 4] = *b"SVWL";
+const SEG_MAGIC: [u8; 4] = *b"SVWC";
 /// Segment header length in bytes.
 const SEG_HEADER_LEN: u64 = 32;
 /// Record alignment in bytes.
@@ -847,7 +847,7 @@ fn random_seed() -> u32 {
 /// Chained CRC: `prev` is the previous record's CRC (or the segment seed),
 /// covering the length prefix, the payload and the zero padding.
 fn chain_crc(prev: u32, len_le: &[u8; 4], data: &[u8], pad: usize) -> u32 {
-    let mut hasher = crc32fast::Hasher::new_with_initial(prev);
+    let mut hasher = crate::checksum::Hasher::new_with_initial(prev);
     hasher.update(len_le);
     hasher.update(data);
     if pad > 0 {
@@ -1162,7 +1162,7 @@ fn write_ack(dir: &Path, generation: u64, lsn: u64) -> Result<()> {
     let mut checked = Vec::with_capacity(16);
     checked.extend_from_slice(&generation.to_le_bytes());
     checked.extend_from_slice(&lsn.to_le_bytes());
-    bytes.extend_from_slice(&crc32fast::hash(&checked).to_le_bytes());
+    bytes.extend_from_slice(&crate::checksum::hash(&checked).to_le_bytes());
 
     let mut file = File::create(&tmp)?;
     file.write_all(&bytes)?;
@@ -1188,7 +1188,7 @@ fn read_ack(dir: &Path) -> (u64, u64) {
     let mut checked = Vec::with_capacity(16);
     checked.extend_from_slice(&generation_bytes);
     checked.extend_from_slice(&lsn_bytes);
-    if crc32fast::hash(&checked) != expected {
+    if crate::checksum::hash(&checked) != expected {
         return (0, 0);
     }
     (

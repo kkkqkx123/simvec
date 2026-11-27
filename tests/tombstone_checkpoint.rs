@@ -48,7 +48,7 @@ fn deleted_point_stays_deleted_after_checkpoint_and_reopen() {
         assert_eq!(store.count(), 2, "live count right after delete");
         store.checkpoint().expect("checkpoint");
         data_dir = store.data_dir();
-        assert!(data_dir.join("tombstones.bin").exists());
+        assert!(data_dir.join("segments/0000000000/tombstones.bin").exists());
         drop(store);
     }
 

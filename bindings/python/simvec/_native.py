@@ -178,6 +178,16 @@ _lib.simvec_list_temp_collections.argtypes = [_engine_p, _c_out_str]
 _lib.simvec_list_temp_collections.restype = ctypes.c_int
 _lib.simvec_list_old_backups.argtypes = [_engine_p, _c_str, _c_out_str]
 _lib.simvec_list_old_backups.restype = ctypes.c_int
+_lib.simvec_snapshot_collection.argtypes = [_engine_p, _c_str, _c_str, _c_out_str]
+_lib.simvec_snapshot_collection.restype = ctypes.c_int
+_lib.simvec_snapshot_collection_incremental.argtypes = [
+    _engine_p, _c_str, _c_str, _c_str, _c_out_str
+]
+_lib.simvec_snapshot_collection_incremental.restype = ctypes.c_int
+_lib.simvec_verify_snapshot.argtypes = [_engine_p, _c_str, _c_out_str]
+_lib.simvec_verify_snapshot.restype = ctypes.c_int
+_lib.simvec_restore_snapshot.argtypes = [_engine_p, _c_str, _c_str]
+_lib.simvec_restore_snapshot.restype = ctypes.c_int
 _lib.simvec_set_default_hnsw_config.argtypes = [_engine_p, _c_str]
 _lib.simvec_set_default_hnsw_config.restype = ctypes.c_int
 _lib.simvec_get_default_hnsw_config.argtypes = [_engine_p, _c_out_str]
