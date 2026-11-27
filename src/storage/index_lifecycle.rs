@@ -23,6 +23,8 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::segment_hnsw::{self, SegmentHnsw};
+use super::segment_ivf::{self, SegmentIvf};
 use super::segments;
 use super::vectors::Vectors;
 use super::CollectionStore;
@@ -54,6 +56,75 @@ impl CollectionStore {
         pending * 2 >= nodes
     }
 
+    /// Rebuild one completed segment's HNSW graph from its live rows.
+    ///
+    /// Local node ids are `0..end-start`; vectors are read from the global
+    /// slot range so the graph file stays independent of the generation's
+    /// slot numbering.
+    pub(super) fn rebuild_segment_hnsw(
+        &self,
+        start: u32,
+        end: u32,
+        name: &str,
+        dim: usize,
+        metric: crate::types::DistanceMetric,
+        segment_slots: u32,
+        config: &HnswConfig,
+    ) -> Result<Option<SegmentHnsw>> {
+        let files = self.data_arc();
+        let tombstones = files.tombstones.load();
+        let vsnap = files.vectors.snapshot();
+        let local: Vec<u32> = (start..end)
+            .filter(|slot| !tombstones.bit(*slot as usize))
+            .map(|slot| slot - start)
+            .collect();
+        if local.is_empty() {
+            return Ok(None);
+        }
+        let built = HnswIndex::build(
+            &IndexBuildParams::new(name, dim, metric, &local, &vsnap, segment_slots)
+                .with_slot_base(start),
+            config,
+        )?;
+        let mut built = built;
+        built.set_metrics(self.metrics_arc());
+        persist::save_hnsw_at(
+            &segment_hnsw::file_path(&files.dir(), start),
+            &built.to_persisted(),
+        )?;
+        let quant = {
+            let guard = files.quant.read();
+            match guard.as_ref() {
+                Some(q) if q.is_ready() => q.write_segment_file(
+                    &super::quant::segment_file_path(&files.dir(), start),
+                    &vsnap,
+                    segment_slots,
+                    start,
+                    end - start,
+                )?,
+                _ => false,
+            }
+        };
+        let quant = if quant {
+            let guard = files.quant.read();
+            guard.as_ref().map(|q| {
+                super::quant::QuantStore::load_segment_file(
+                    &super::quant::segment_file_path(&files.dir(), start),
+                    segment_slots,
+                    q.bytes_per_vector(),
+                )
+            })
+        } else {
+            None
+        };
+        Ok(Some(SegmentHnsw {
+            start,
+            end,
+            index: Arc::new(built),
+            quant: quant.transpose()?.flatten(),
+        }))
+    }
+
     /// Supply the IVF configuration after open. Collections persist their
     /// effective config, but the engine-provided
     /// runtime configuration takes precedence. Applies both to future builds
@@ -77,6 +148,9 @@ impl CollectionStore {
             }
         }
         drop(inner);
+        for segment in files.ivf_segments.load().iter() {
+            segment.index.set_config(config.clone());
+        }
         if let Some(PublishedIndex::Ivf(index)) = files.index.load().as_ref() {
             index.set_config(config);
         }
@@ -116,111 +190,190 @@ impl CollectionStore {
 
     fn load_ivf(&self) -> Result<()> {
         let files = self.data_arc();
-        let index_path = self.data_dir().join("index.bin");
-        let existed = index_path.exists();
-        let Some(data) = persist::load(&self.data_dir())? else {
-            if existed {
-                tracing::info!("vector index.bin corrupt; falling back to exact scan");
-                self.metrics.record_index_load_fallback();
-            }
-            return Ok(());
-        };
-        let (dim, distance, next_slot, capacity) = {
+        let (dim, distance, next_slot, segment_slots) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
                 inner.meta.distance,
                 inner.meta.next_slot,
-                inner.meta.slot_capacity as usize,
+                inner.meta.segment_slots,
             )
         };
-        if !data.valid_for(dim, distance, next_slot) {
-            tracing::info!("vector index.bin inconsistent with meta; falling back to exact scan");
-            self.metrics.record_index_load_fallback();
-            return Ok(());
-        }
         let config = self.inner.read().ivf_config.clone().unwrap_or_default();
-        let covered = data.slot_list.len();
-        let mut index = IvfIndex::from_persisted(data, config);
-        index.set_metrics(self.metrics_arc());
-        let index = Arc::new(index);
+        let boundary = segments::immutable_end(next_slot, segment_slots);
+        let step = segment_slots.max(1);
+        let mut loaded = Vec::new();
+        let mut missing = false;
+        let mut uncovered: Vec<u32> = Vec::new();
+        for start in (0..boundary).step_by(step as usize) {
+            let end = (start + step).min(boundary);
+            let Some(data) = persist::load_at(&segment_ivf::file_path(&files.dir(), start))? else {
+                missing = true;
+                uncovered.extend(start..end);
+                continue;
+            };
+            let covered = data.slot_list.len() as u32;
+            if data.dim != dim || data.distance != distance || covered == 0 || covered > end - start
+            {
+                missing = true;
+                uncovered.extend(start..end);
+                continue;
+            }
+            if covered < end - start {
+                missing = true;
+                uncovered.extend(start + covered..end);
+            }
+            let mut index = IvfIndex::from_persisted(data, config.clone());
+            index.set_metrics(self.metrics_arc());
+            loaded.push(SegmentIvf {
+                start,
+                end: start + covered,
+                index: Arc::new(index),
+            });
+        }
         {
             let tombstones = files.tombstones.load();
             let mut p = self.pending.lock();
-            for slot in covered..next_slot as usize {
-                if slot < capacity && !tombstones.bit(slot) {
-                    p.push(slot as u32);
-                }
-            }
+            p.extend(
+                uncovered
+                    .into_iter()
+                    .chain(boundary..next_slot as u32)
+                    .filter(|slot| !tombstones.bit(*slot as usize)),
+            );
         }
-        files.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
+        if missing {
+            self.metrics.record_index_load_fallback();
+        }
+        files.ivf_segments.store(Arc::new(loaded));
         Ok(())
+    }
+
+    /// Build one IVF file per completed dense segment. Each segment owns its
+    /// own centroids and segment-local assignments.
+    fn rebuild_segment_ivf(
+        &self,
+        start: u32,
+        end: u32,
+        name: &str,
+        dim: usize,
+        metric: crate::types::DistanceMetric,
+        segment_slots: u32,
+        config: &IvfConfig,
+    ) -> Result<Option<SegmentIvf>> {
+        let files = self.data_arc();
+        let tombstones = files.tombstones.load();
+        let vsnap = files.vectors.snapshot();
+        let local: Vec<u32> = (start..end)
+            .filter(|slot| !tombstones.bit(*slot as usize))
+            .map(|slot| slot - start)
+            .collect();
+        if local.is_empty() {
+            return Ok(None);
+        }
+        let mut index = IvfIndex::build(
+            &IndexBuildParams::new(name, dim, metric, &local, &vsnap, segment_slots)
+                .with_slot_base(start),
+            config,
+        )?;
+        index.set_metrics(self.metrics_arc());
+        persist::save_at(
+            &segment_ivf::file_path(&files.dir(), start),
+            &index.to_persisted(),
+        )?;
+        Ok(Some(SegmentIvf {
+            start,
+            end,
+            index: Arc::new(index),
+        }))
     }
 
     fn load_hnsw(&self) -> Result<()> {
         let files = self.data_arc();
-        let hnsw_path = self.data_dir().join("hnsw.bin");
-        let existed = hnsw_path.exists();
-        let Some(data) = persist::load_hnsw(&self.data_dir())? else {
-            if existed {
-                tracing::info!("vector hnsw.bin corrupt; falling back to exact scan");
-                self.metrics.record_index_load_fallback();
-            }
-            return Ok(());
-        };
-        let (dim, distance, next_slot, capacity, segment_slots) = {
+        let (dim, distance, next_slot, segment_slots) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
                 inner.meta.distance,
                 inner.meta.next_slot,
-                inner.meta.slot_capacity as usize,
                 inner.meta.segment_slots,
             )
         };
-        if !data.valid_for(dim, distance, next_slot) {
-            tracing::info!("vector hnsw.bin inconsistent with meta; falling back to exact scan");
-            self.metrics.record_index_load_fallback();
-            return Ok(());
-        }
         let config = match &self.inner.read().meta.index {
             IndexConfig::Hnsw(cfg) => cfg.clone(),
             _ => HnswConfig::default(),
         };
-        let covered = data.nodes.len();
-        let index = match HnswIndex::from_persisted(data, &config) {
-            Ok(mut index) => {
-                index.set_metrics(self.metrics_arc());
-                Arc::new(index)
+        let boundary = segments::immutable_end(next_slot, segment_slots);
+        let mut loaded = Vec::new();
+        let mut missing = false;
+        let mut uncovered: Vec<u32> = Vec::new();
+        let step = segment_slots.max(1);
+        for start in (0..boundary).step_by(step as usize) {
+            let end = (start + step).min(boundary);
+            let Some(data) = persist::load_hnsw_at(&segment_hnsw::file_path(&files.dir(), start))?
+            else {
+                missing = true;
+                uncovered.extend(start..end);
+                continue;
+            };
+            let covered = data.nodes.len() as u32;
+            if data.dim != dim || data.distance != distance || covered == 0 || covered > end - start
+            {
+                missing = true;
+                uncovered.extend(start..end);
+                continue;
             }
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "vector hnsw.bin failed structural validation; falling back to exact scan"
-                );
-                self.metrics.record_index_load_fallback();
-                return Ok(());
+            if covered < end - start {
+                // A graph published before later writes can legitimately be
+                // shorter than the current segment. Keep it and exact-scan
+                // the rest instead of discarding the whole segment.
+                missing = true;
+                uncovered.extend(start + covered..end);
             }
-        };
+            match HnswIndex::from_persisted(data, &config) {
+                Ok(mut index) => {
+                    index.set_metrics(self.metrics_arc());
+                    let quant = {
+                        let guard = files.quant.read();
+                        match guard.as_ref() {
+                            Some(q) => super::quant::QuantStore::load_segment_file(
+                                &super::quant::segment_file_path(&files.dir(), start),
+                                segment_slots,
+                                q.bytes_per_vector(),
+                            )?,
+                            None => None,
+                        }
+                    };
+                    loaded.push(SegmentHnsw {
+                        start,
+                        end: start + covered,
+                        index: Arc::new(index),
+                        quant,
+                    });
+                }
+                Err(_) => {
+                    missing = true;
+                    uncovered.extend(start..end);
+                }
+            }
+        }
+        files.hnsw_segments.store(Arc::new(loaded));
+
         {
             let tombstones = files.tombstones.load();
             let mut p = self.pending.lock();
-            for slot in covered..next_slot as usize {
-                if slot < capacity && !tombstones.bit(slot) {
-                    p.push(slot as u32);
+            p.extend(uncovered);
+            for slot in boundary..next_slot as u32 {
+                if !tombstones.bit(slot as usize) {
+                    p.push(slot);
                 }
             }
-            // Slots appended after the persisted build are handled by the
-            // incremental drain; only a backlog large enough to dwarf the
-            // graph justifies a full rebuild.
-            if Self::pending_warrants_rebuild(p.len(), covered)
-                || p.len() >= segment_slots.max(1) as usize
-            {
+            if missing || p.len() >= segment_slots.max(1) as usize {
                 self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
             }
         }
-        files.index
-            .store(Arc::new(Some(PublishedIndex::Hnsw(index))));
+        if missing {
+            self.metrics.record_index_load_fallback();
+        }
         Ok(())
     }
 
@@ -250,6 +403,83 @@ impl CollectionStore {
         }
 
         let files = self.data_arc();
+        let segmented = files.hnsw_segments.load();
+        if !segmented.is_empty() {
+            // Frozen segments are immutable; only rows past the last built
+            // segment need the exact-scan fallback.
+            let covered = segmented
+                .iter()
+                .map(|segment| segment.end)
+                .max()
+                .unwrap_or(0);
+            if slot < covered {
+                // Overwrites keep their graph position but must still be
+                // counted so staleness-based rebuilding can see them.
+                let vsnap = files.vectors.snapshot();
+                if let Some(target) = segmented.iter().find(|s| slot >= s.start && slot < s.end) {
+                    target.index.insert(
+                        slot - target.start,
+                        vector,
+                        &vsnap,
+                        segment_slots,
+                        target.start,
+                    );
+                }
+                return;
+            }
+            {
+                self.pending.lock().push(slot);
+                // Before the first segment fills, the single growing graph
+                // still takes incremental inserts. Pending remains authoritative
+                // for search, but the concurrent adjacency edits keep the
+                // version-based torn-read recovery path exercised.
+                if (slot as u64) < segment_slots as u64 {
+                    let vsnap = files.vectors.snapshot();
+                    let mut graphs = (**segmented).clone();
+                    if let Some(target) = graphs.iter_mut().find(|s| s.start == 0) {
+                        target.index.insert(
+                            slot - target.start,
+                            vector,
+                            &vsnap,
+                            segment_slots,
+                            target.start,
+                        );
+                        target.end = slot + 1;
+                        files.hnsw_segments.store(Arc::new(graphs));
+                    }
+                }
+            }
+            return;
+        }
+        let ivf_segments = files.ivf_segments.load();
+        if !ivf_segments.is_empty() {
+            let covered = ivf_segments
+                .iter()
+                .map(|segment| segment.end)
+                .max()
+                .unwrap_or(0);
+            if slot < covered {
+                if let Some(target) = ivf_segments
+                    .iter()
+                    .find(|s| slot >= s.start && slot < s.end)
+                {
+                    target.index.assign_slot(slot - target.start, vector);
+                    target.index.note_upsert();
+                }
+                return;
+            }
+            self.pending.lock().push(slot);
+            if (slot as u64) < segment_slots as u64 {
+                let mut segments = (**ivf_segments).clone();
+                if let Some(target) = segments.iter_mut().find(|s| s.start == 0) {
+                    target.index.assign_slot(slot, vector);
+                    target.index.note_upsert();
+                    target.end = slot + 1;
+                    files.ivf_segments.store(Arc::new(segments));
+                }
+            }
+            return;
+        }
         let published = files.index.load();
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => {
@@ -323,19 +553,15 @@ impl CollectionStore {
         }
     }
 
-    /// Build and publish an HNSW index from the current live set.
+    /// Build one HNSW file per completed segment.
     ///
-    /// Heavy work runs off the store lock under the `build_mutex`, so
-    /// compaction cannot interleave and slot numbers stay stable. Slots
-    /// appended while building are adopted through incremental inserts under
-    /// the store write lock before publication, so approximate search never
-    /// misses a point.
+    /// Each graph is independent: a rebuild of one segment never touches the
+    /// others, and the appendable tail is left to exact scan.
     fn build_hnsw_index(&self, config: HnswConfig) -> Result<bool> {
-        let files = self.data_arc();
         let _compact_guard = self.compact_mutex.lock();
         let _guard = self.build_mutex.lock();
 
-        let (dim, metric, segment_slots, snapshot_next_slot, name) = {
+        let (dim, metric, segment_slots, next_slot, name) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
@@ -345,113 +571,52 @@ impl CollectionStore {
                 inner.meta.collection.clone(),
             )
         };
-        let build_end = segments::immutable_end(snapshot_next_slot, segment_slots);
-        let live: Vec<u32> = {
-            let tombstones = files.tombstones.load();
-            (0..build_end)
-                .filter(|&s| !tombstones.bit(s as usize))
-                .collect()
-        };
-        if live.is_empty() {
+        let boundary = segments::immutable_end(next_slot, segment_slots);
+        if boundary == 0 {
             return Ok(false);
         }
-
         self.building.store(true, AtomicOrdering::Relaxed);
-        self.build_points_total
-            .store(live.len() as u64, AtomicOrdering::Relaxed);
-        self.build_inserted.store(0, AtomicOrdering::Relaxed);
-        tracing::info!(
-            collection = %name,
-            points = live.len(),
-            "building HNSW index"
-        );
         let build_started = Instant::now();
-        let built = {
-            let vsnap = files.vectors.snapshot();
-            HnswIndex::build(
-                &IndexBuildParams::new(&name, dim, metric, &live, &vsnap, segment_slots)
-                    .with_progress(&self.build_inserted),
-                &config,
-            )
-        };
+        let step = segment_slots.max(1);
+        let tombstones = self.data_arc().tombstones.load();
+        let total = (0..boundary)
+            .filter(|slot| !tombstones.bit(*slot as usize))
+            .count();
+        drop(tombstones);
+        self.build_points_total
+            .store(total as u64, AtomicOrdering::Relaxed);
+        self.build_inserted.store(0, AtomicOrdering::Relaxed);
 
-        let index = match built {
-            Ok(mut index) => {
-                index.set_metrics(self.metrics_arc());
-                Arc::new(index)
+        let mut built = Vec::with_capacity((boundary / step) as usize + 1);
+        for start in (0..boundary).step_by(step as usize) {
+            let end = (start + step).min(boundary);
+            let live = {
+                let tombstones = self.data_arc().tombstones.load();
+                (start..end)
+                    .filter(|slot| !tombstones.bit(*slot as usize))
+                    .count()
+            };
+            if let Some(segment) =
+                self.rebuild_segment_hnsw(start, end, &name, dim, metric, segment_slots, &config)?
+            {
+                built.push(segment);
             }
-            Err(e) => {
-                self.building.store(false, AtomicOrdering::Relaxed);
-                tracing::warn!(collection = %name, error = %e, "HNSW build failed");
-                return Err(e);
-            }
-        };
-
-        // Fold the slots that completed a segment during the build into the
-        // graph and leave the new appendable tail in `pending` for exact
-        // scanning. The range pass and the pending drain are disjoint, so
-        // each node is inserted exactly once.
-        let pending_after = {
-            let inner = self.inner.write();
-            let mut p = self.pending.lock();
-            let tombstones = files.tombstones.load();
-            let vsnap = files.vectors.snapshot();
-            let publish_end = segments::immutable_end(inner.meta.next_slot, segment_slots);
-            for slot in build_end..publish_end {
-                if tombstones.bit(slot as usize) {
-                    continue;
-                }
-                if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
-                    index.insert(slot, v, &vsnap, segment_slots);
-                }
-            }
-            let mut retained = Vec::new();
-            for slot in p.drain(..) {
-                if (slot as u64) >= publish_end as u64 || tombstones.bit(slot as usize) {
-                    retained.push(slot);
-                    continue;
-                }
-                if slot >= build_end {
-                    // Already inserted by the range pass above.
-                    continue;
-                }
-                if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
-                    index.insert(slot, v, &vsnap, segment_slots);
-                }
-            }
-            let pending_after = retained.len();
-            *p = retained;
-            pending_after
-        };
-        let persisted = index.to_persisted();
-        // Publish before clearing the building flag: an upsert that loaded
-        // `index == None` and then observed `building == false` would record
-        // its slot nowhere and go missing from approximate searches. With
-        // this order such an upsert still sees `building == true` and lands
-        // in `pending`, which every published-index adoption path drains.
-        files.index
-            .store(Arc::new(Some(PublishedIndex::Hnsw(index))));
-        self.build_inserted.store(
-            self.build_points_total.load(AtomicOrdering::Relaxed),
-            AtomicOrdering::Relaxed,
-        );
+            self.build_inserted
+                .fetch_add(live as u64, AtomicOrdering::Relaxed);
+        }
+        let published = !built.is_empty();
+        self.data_arc().hnsw_segments.store(Arc::new(built));
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(
-            pending_after >= segment_slots.max(1) as usize,
+            self.pending_len() >= segment_slots.max(1) as usize,
             AtomicOrdering::Relaxed,
         );
-
-        if let Err(e) = persist::save_hnsw(&self.data_dir(), &persisted) {
-            tracing::warn!(collection = %name, error = %e, "hnsw.bin save failed");
+        if published {
+            self.metrics
+                .record_index_build(IndexTier::Hnsw, build_started.elapsed());
+            tracing::info!(collection = %name, points = total, "HNSW segment graphs published");
         }
-        self.metrics
-            .record_index_build(IndexTier::Hnsw, build_started.elapsed());
-        tracing::info!(
-            collection = %name,
-            nodes = persisted.nodes.len(),
-            "HNSW index published"
-        );
-        Ok(true)
+        Ok(published)
     }
 
     /// Build and publish an IVF index from the current live set.
@@ -467,7 +632,7 @@ impl CollectionStore {
         let _compact_guard = self.compact_mutex.lock();
         let _guard = self.build_mutex.lock();
 
-        let (dim, metric, segment_slots, snapshot_next_slot, name) = {
+        let (dim, metric, segment_slots, next_slot, name) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
@@ -477,106 +642,56 @@ impl CollectionStore {
                 inner.meta.collection.clone(),
             )
         };
-        let build_end = segments::immutable_end(snapshot_next_slot, segment_slots);
-        let live: Vec<u32> = {
-            let tombstones = files.tombstones.load();
-            (0..build_end)
-                .filter(|&s| !tombstones.bit(s as usize))
-                .collect()
-        };
-        if (live.len() as u64) < config.min_build_points.max(1) || live.is_empty() {
+        let boundary = segments::immutable_end(next_slot, segment_slots);
+        if boundary == 0 {
+            return Ok(false);
+        }
+        let step = segment_slots.max(1);
+        let tombstones = files.tombstones.load();
+        let total = (0..boundary)
+            .filter(|slot| !tombstones.bit(*slot as usize))
+            .count();
+        drop(tombstones);
+        if (total as u64) < config.min_build_points.max(1) {
             return Ok(false);
         }
 
         self.building.store(true, AtomicOrdering::Relaxed);
         self.build_points_total
-            .store(live.len() as u64, AtomicOrdering::Relaxed);
+            .store(total as u64, AtomicOrdering::Relaxed);
         self.build_inserted.store(0, AtomicOrdering::Relaxed);
-        tracing::info!(
-            collection = %name,
-            points = live.len(),
-            "building IVF index"
-        );
-
         let build_started = Instant::now();
-        let built = {
-            let vsnap = files.vectors.snapshot();
-            IvfIndex::build(
-                &IndexBuildParams::new(&name, dim, metric, &live, &vsnap, segment_slots)
-                    .with_progress(&self.build_inserted),
-                &config,
-            )
-        };
-
-        let index = match built {
-            Ok(mut index) => {
-                index.set_metrics(self.metrics_arc());
-                Arc::new(index)
+        let mut built = Vec::new();
+        for start in (0..boundary).step_by(step as usize) {
+            let end = (start + step).min(boundary);
+            let live = {
+                let tombstones = files.tombstones.load();
+                (start..end)
+                    .filter(|slot| !tombstones.bit(*slot as usize))
+                    .count()
+            };
+            if let Some(segment) =
+                self.rebuild_segment_ivf(start, end, &name, dim, metric, segment_slots, &config)?
+            {
+                built.push(segment);
             }
-            Err(e) => {
-                self.building.store(false, AtomicOrdering::Relaxed);
-                tracing::warn!(collection = %name, error = %e, "IVF build failed");
-                return Err(e);
-            }
-        };
-
-        // Publish atomically with respect to writers: everything below holds
-        // the store write lock (acquired before the pending lock, matching
-        // `register_slot`'s order) so concurrent upserts either ran before
-        // (and their slots are adopted/drained here) or run after (and see
-        // the published index directly).
-        let (persisted, pending_after) = {
-            let inner = self.inner.write();
-            let mut p = self.pending.lock();
-            let tombstones = files.tombstones.load();
-            let vsnap = files.vectors.snapshot();
-            let publish_end = segments::immutable_end(inner.meta.next_slot, segment_slots);
-            index.adopt_range(build_end, publish_end, &tombstones, &vsnap, segment_slots);
-            let mut retained = Vec::new();
-            for slot in p.drain(..) {
-                if (slot as u64) >= publish_end as u64 || tombstones.bit(slot as usize) {
-                    retained.push(slot);
-                    continue;
-                }
-                if slot >= build_end {
-                    // Already adopted by the range pass above.
-                    continue;
-                }
-                if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
-                    index.assign_slot(slot, v);
-                }
-            }
-            let pending_after = retained.len();
-            *p = retained;
-            (index.to_persisted(), pending_after)
-        };
-        // Publish before clearing the building flag: an upsert that loaded
-        // `index == None` and then observed `building == false` would record
-        // its slot nowhere and go missing from probe searches. With this
-        // order such an upsert still sees `building == true` and lands in
-        // `pending`, which every probe search scans unconditionally.
-        files.index.store(Arc::new(Some(PublishedIndex::Ivf(index))));
-        self.build_inserted.store(
-            self.build_points_total.load(AtomicOrdering::Relaxed),
-            AtomicOrdering::Relaxed,
-        );
-        self.building.store(false, AtomicOrdering::Relaxed);
-        self.needs_rebuild.store(
-            pending_after >= segment_slots.max(1) as usize,
-            AtomicOrdering::Relaxed,
-        );
-
-        if let Err(e) = persist::save(&self.data_dir(), &persisted) {
-            tracing::warn!(collection = %name, error = %e, "index.bin save failed");
+            self.build_inserted
+                .fetch_add(live as u64, AtomicOrdering::Relaxed);
         }
-        self.metrics
-            .record_index_build(IndexTier::Ivf, build_started.elapsed());
-        tracing::info!(
-            collection = %name,
-            lists = persisted.lists,
-            "IVF index published"
-        );
-        Ok(true)
+        let published = !built.is_empty();
+        files.ivf_segments.store(Arc::new(built));
+        files.index.store(Arc::new(None));
+        self.build_inserted
+            .store(total as u64, AtomicOrdering::Relaxed);
+        self.building.store(false, AtomicOrdering::Relaxed);
+        self.needs_rebuild
+            .store(self.pending_len() >= step as usize, AtomicOrdering::Relaxed);
+        if published {
+            self.metrics
+                .record_index_build(IndexTier::Ivf, build_started.elapsed());
+            tracing::info!(collection = %name, points = total, "IVF segment indexes published");
+        }
+        Ok(published)
     }
 
     /// Drop the published index and return to exact scan.
@@ -584,6 +699,19 @@ impl CollectionStore {
         let files = self.data_arc();
         let _guard = self.compact_mutex.lock();
         files.index.store(Arc::new(None));
+        files.hnsw_segments.store(Arc::new(Vec::new()));
+        files.ivf_segments.store(Arc::new(Vec::new()));
+        if let Ok(entries) = std::fs::read_dir(files.dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if segment_hnsw::is_segment_file(&name)
+                    || segment_ivf::is_segment_file(&name)
+                    || super::quant::is_segment_file(&name)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         self.pending.lock().clear();
         self.building.store(false, AtomicOrdering::Relaxed);
         self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
@@ -599,66 +727,207 @@ impl CollectionStore {
     /// left for the next tick.  If no HNSW index is published or pending
     /// is empty this is a no-op.
     pub(crate) fn drain_pending_hnsw(&self) {
-        let files = self.data_arc();
-        let published = files.index.load();
-        let Some(PublishedIndex::Hnsw(index)) = published.as_ref() else {
-            return;
+        let ivf_config = match &self.inner.read().meta.index {
+            IndexConfig::Ivf(Some(config)) => Some(config.clone()),
+            _ => None,
         };
+        if let Some(config) = ivf_config {
+            self.drain_pending_ivf(config);
+            return;
+        }
+        let files = self.data_arc();
+        let (dim, metric, segment_slots, next_slot, name, config) = {
+            let inner = self.inner.read();
+            (
+                inner.meta.vector_size,
+                inner.meta.distance,
+                inner.meta.segment_slots,
+                inner.meta.next_slot,
+                inner.meta.collection.clone(),
+                match &inner.meta.index {
+                    IndexConfig::Hnsw(cfg) => cfg.clone(),
+                    _ => HnswConfig::default(),
+                },
+            )
+        };
+        let boundary = segments::immutable_end(next_slot, segment_slots);
         let pending: Vec<u32> = {
             let mut p = self.pending.lock();
             if p.is_empty() {
                 return;
             }
-            // Take a snapshot and clear; new arrivals during drain go to
-            // the next tick.
             std::mem::take(&mut *p)
         };
-        // Hold build_mutex only — excludes compaction and build, so the
-        // graph structure is stable.  The store write lock is NOT held,
-        // so upserts and searches continue concurrently.
+        let step = segment_slots.max(1);
         let _guard = self.build_mutex.lock();
-        let (dim, segment_slots, next_slot) = {
+        let mut graphs = (**files.hnsw_segments.load()).clone();
+        let vsnap = files.vectors.snapshot();
+        let mut rebuild_starts: Vec<u32> = Vec::new();
+        let mut retained_on_failure: Vec<u32> = Vec::new();
+
+        for &slot in &pending {
+            if (slot as u64) >= boundary as u64 {
+                continue;
+            }
+            let local_segment = slot / step * step;
+            if local_segment == 0 && slot < step {
+                // The first segment is still growing: incremental adjacency
+                // edits keep the graph live under concurrent reads.
+                if let Some(target) = graphs.iter_mut().find(|s| s.start == 0) {
+                    if let Some(vector) =
+                        Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim)
+                    {
+                        target.index.insert(
+                            slot - target.start,
+                            vector,
+                            &vsnap,
+                            segment_slots,
+                            target.start,
+                        );
+                    }
+                    target.end = target.end.max(slot + 1);
+                    continue;
+                }
+            }
+            if !rebuild_starts.contains(&local_segment) {
+                rebuild_starts.push(local_segment);
+            }
+        }
+
+        for start in rebuild_starts {
+            let end = (start + step).min(boundary);
+            match self.rebuild_segment_hnsw(start, end, &name, dim, metric, segment_slots, &config)
+            {
+                Ok(Some(segment)) => {
+                    if let Some(existing) = graphs.iter_mut().find(|s| s.start == start) {
+                        *existing = segment;
+                    } else {
+                        graphs.push(segment);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "HNSW segment rebuild failed");
+                    retained_on_failure.extend(
+                        pending
+                            .iter()
+                            .copied()
+                            .filter(|slot| *slot >= start && *slot < end),
+                    );
+                }
+            }
+        }
+        graphs.sort_by_key(|segment| segment.start);
+        files.hnsw_segments.store(Arc::new(graphs));
+
+        let retained: Vec<u32> = pending
+            .into_iter()
+            .filter(|slot| (*slot as u64) >= boundary as u64 || retained_on_failure.contains(slot))
+            .collect();
+        let retained_len = retained.len();
+        self.pending.lock().extend(retained);
+        self.needs_rebuild
+            .store(retained_len >= step as usize, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            collection = %name,
+            retained_len,
+            "HNSW appendable tail retained for exact scan"
+        );
+    }
+
+    /// Incorporate pending slots into segment-local IVF indexes. Completed
+    /// segments are rebuilt; the still-growing first segment keeps taking
+    /// incremental assignments, matching the HNSW drain's visibility rules.
+    fn drain_pending_ivf(&self, config: IvfConfig) {
+        let files = self.data_arc();
+        let (dim, metric, segment_slots, next_slot, name) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
+                inner.meta.distance,
                 inner.meta.segment_slots,
                 inner.meta.next_slot,
+                inner.meta.collection.clone(),
             )
         };
         let boundary = segments::immutable_end(next_slot, segment_slots);
-        let tombstones = files.tombstones.load();
-        let vsnap = files.vectors.snapshot();
-        let mut drained = 0u64;
-        let mut retained = Vec::new();
-        for slot in pending {
+        let pending: Vec<u32> = {
+            let mut p = self.pending.lock();
+            if p.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *p)
+        };
+        let step = segment_slots.max(1);
+        let _guard = self.build_mutex.lock();
+        let mut segments = (**files.ivf_segments.load()).clone();
+        let mut rebuild_starts: Vec<u32> = Vec::new();
+        let mut failed: Vec<u32> = Vec::new();
+
+        for &slot in &pending {
             if (slot as u64) >= boundary as u64 {
-                retained.push(slot);
                 continue;
             }
-            if tombstones.bit(slot as usize) {
-                continue;
+            let local_segment = slot / step * step;
+            if local_segment == 0 && slot < step {
+                if let Some(target) = segments.iter_mut().find(|s| s.start == 0) {
+                    if let Some(v) = Vectors::read_slot(
+                        &files.vectors.snapshot(),
+                        slot as u64,
+                        segment_slots,
+                        dim,
+                    ) {
+                        target.index.assign_slot(slot - target.start, v);
+                        target.index.note_upsert();
+                    }
+                    target.end = target.end.max(slot + 1);
+                    continue;
+                }
             }
-            if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
-                index.insert(slot, v, &vsnap, segment_slots);
-                drained += 1;
+            if !rebuild_starts.contains(&local_segment) {
+                rebuild_starts.push(local_segment);
             }
         }
-        if !retained.is_empty() {
-            self.pending.lock().extend(retained);
+        for start in rebuild_starts {
+            let end = (start + step).min(boundary);
+            match self.rebuild_segment_ivf(start, end, &name, dim, metric, segment_slots, &config) {
+                Ok(Some(segment)) => {
+                    if let Some(existing) = segments.iter_mut().find(|s| s.start == start) {
+                        *existing = segment;
+                    } else {
+                        segments.push(segment);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "IVF segment rebuild failed");
+                    failed.extend(
+                        pending
+                            .iter()
+                            .copied()
+                            .filter(|slot| *slot >= start && *slot < end),
+                    );
+                }
+            }
         }
-        if drained > 0 {
-            tracing::debug!(
-                collection = %self.inner.read().meta.collection,
-                drained,
-                "HNSW pending slots drained"
-            );
-        }
+        segments.sort_by_key(|segment| segment.start);
+        files.ivf_segments.store(Arc::new(segments));
+        let retained: Vec<u32> = pending
+            .into_iter()
+            .filter(|slot| (*slot as u64) >= boundary as u64 || failed.contains(slot))
+            .collect();
+        let retained_len = retained.len();
+        self.pending.lock().extend(retained);
+        self.needs_rebuild
+            .store(retained_len >= step as usize, AtomicOrdering::Relaxed);
     }
 
     /// Whether an index is published.
     pub fn has_index(&self) -> bool {
         let files = self.data_arc();
         files.index.load().is_some()
+            || !files.hnsw_segments.load().is_empty()
+            || !files.ivf_segments.load().is_empty()
     }
 
     /// Number of slots waiting in the pending queue (not yet incorporated
@@ -704,7 +973,7 @@ impl CollectionStore {
         }
         let tombstones = files.tombstones.load();
         let vsnap = files.vectors.snapshot();
-        index.drift_ratio(&samples, &tombstones, &vsnap, segment_slots)
+        index.drift_ratio(&samples, &tombstones, &vsnap, segment_slots, 0)
     }
 
     /// Published IVF index plus its configuration, for the maintenance
@@ -712,12 +981,12 @@ impl CollectionStore {
     /// training state to drift away from.
     pub(crate) fn ivf_state(&self) -> Option<(Arc<IvfIndex>, IvfConfig)> {
         let files = self.data_arc();
-        let published = files.index.load();
-        let Some(PublishedIndex::Ivf(index)) = published.as_ref() else {
+        let segments = files.ivf_segments.load();
+        let Some(segment) = segments.first() else {
             return None;
         };
         let config = self.inner.read().ivf_config.clone()?;
-        Some((Arc::clone(index), config))
+        Some((Arc::clone(&segment.index), config))
     }
 
     pub(crate) fn record_drift(&self, ratio: f64) {
@@ -728,6 +997,63 @@ impl CollectionStore {
     pub fn index_info(&self) -> Option<IndexInfo> {
         let files = self.data_arc();
         let (building, build_inserted, build_points_total) = self.build_progress();
+        let hnsw_segments = files.hnsw_segments.load();
+        if !hnsw_segments.is_empty() {
+            let nodes: u64 = hnsw_segments
+                .iter()
+                .map(|segment| segment.index.built_at_live_count())
+                .sum();
+            let overwrites: u64 = hnsw_segments
+                .iter()
+                .map(|segment| segment.index.overwrites_since_build())
+                .sum();
+            let stale = hnsw_segments
+                .iter()
+                .map(|segment| segment.index.stale_ratio())
+                .fold(0.0f64, f64::max);
+            let first = &hnsw_segments[0].index;
+            return Some(IndexInfo {
+                index_kind: IndexKind::Hnsw,
+                lists: 0,
+                nprobe_default: 0,
+                m: first.m(),
+                ef_construct: first.ef_construct(),
+                ef_search_default: first.default_ef(),
+                built_at_live_count: nodes,
+                stale_overwrite_count: overwrites,
+                stale_ratio: Some(stale),
+                last_drift_ratio: None,
+                building,
+                build_inserted,
+                build_points_total,
+            });
+        }
+        let ivf_segments = files.ivf_segments.load();
+        if !ivf_segments.is_empty() {
+            let first = &ivf_segments[0].index;
+            let lists: usize = ivf_segments
+                .iter()
+                .map(|segment| segment.index.list_count())
+                .sum();
+            return Some(IndexInfo {
+                index_kind: IndexKind::Ivf,
+                lists: lists as u32,
+                nprobe_default: first.default_nprobe(),
+                m: 0,
+                ef_construct: 0,
+                ef_search_default: 0,
+                built_at_live_count: ivf_segments
+                    .iter()
+                    .map(|segment| segment.index.built_at_live_count())
+                    .sum(),
+                stale_overwrite_count: 0,
+                stale_ratio: None,
+                last_drift_ratio: self.inner.read().last_drift_ratio,
+                building,
+                build_inserted,
+                build_points_total,
+            });
+        }
         let published = files.index.load();
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => Some(IndexInfo {

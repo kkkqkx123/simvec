@@ -49,6 +49,9 @@ pub(crate) struct IndexBuildParams<'a> {
     pub vectors: &'a [Arc<Mmap>],
     /// Slots per `vectors.bin` segment.
     pub segment_slots: u32,
+    /// Base added to the local slots above when reading vectors. Segment-local
+    /// graphs index `0..len` but read rows starting at this global slot.
+    pub slot_base: u32,
     /// Optional per-slot progress sink, incremented once per processed slot.
     pub progress: Option<&'a AtomicU64>,
 }
@@ -70,8 +73,15 @@ impl<'a> IndexBuildParams<'a> {
             slots,
             vectors,
             segment_slots,
+            slot_base: 0,
             progress: None,
         }
+    }
+
+    /// Read vectors from `base + slot` instead of slot 0.
+    pub(crate) fn with_slot_base(mut self, base: u32) -> Self {
+        self.slot_base = base;
+        self
     }
 
     /// Attach a per-slot progress sink for long builds.
@@ -114,6 +124,8 @@ pub(crate) struct IvfSearchContext<'a> {
     pub tombstones: &'a crate::storage::TombstoneBits,
     pub vectors: &'a [Arc<Mmap>],
     pub segment_slots: u32,
+    /// Global slot base for segment-local assignments.
+    pub slot_base: u32,
     pub filter_mask: Option<&'a BitVec>,
 }
 
@@ -178,7 +190,12 @@ impl IvfIndex {
         let sample: Vec<&[f32]> = sample_slots
             .iter()
             .filter_map(|&s| {
-                Vectors::read_slot(params.vectors, s as u64, params.segment_slots, params.dim)
+                Vectors::read_slot(
+                    params.vectors,
+                    (s + params.slot_base) as u64,
+                    params.segment_slots,
+                    params.dim,
+                )
             })
             .collect();
 
@@ -210,7 +227,7 @@ impl IvfIndex {
         for &slot in slots.iter() {
             if let Some(v) = Vectors::read_slot(
                 params.vectors,
-                slot as u64,
+                (slot + params.slot_base) as u64,
                 params.segment_slots,
                 params.dim,
             ) {
@@ -381,12 +398,15 @@ impl IvfIndex {
         tombstones: &crate::storage::TombstoneBits,
         vectors: &[Arc<Mmap>],
         segment_slots: u32,
+        slot_base: u32,
     ) {
         for slot in start..end {
-            if tombstones.bit(slot as usize) {
+            if tombstones.bit((slot + slot_base) as usize) {
                 continue;
             }
-            if let Some(v) = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim) {
+            if let Some(v) =
+                Vectors::read_slot(vectors, (slot + slot_base) as u64, segment_slots, self.dim)
+            {
                 self.assign_slot(slot, v);
             }
         }
@@ -418,8 +438,9 @@ impl IvfIndex {
         let probed = &ranked[..nprobe.min(ranked.len())];
 
         let matches_mask = |s: u32| {
+            let global = s + ctx.slot_base;
             ctx.filter_mask
-                .is_none_or(|m| (s as usize) < m.len() && m[s as usize])
+                .is_none_or(|m| (global as usize) < m.len() && m[global as usize])
         };
 
         // 2. Gather candidate slots (short lock hold per list).
@@ -429,15 +450,22 @@ impl IvfIndex {
         }
         candidates.extend_from_slice(extra_slots);
 
-        // 3. Score live candidates in parallel.
+        // 3. Score live candidates in parallel. Lists store segment-local
+        // slots; returned slots are global so the shared finish path can
+        // resolve keys and payloads.
         let scored: Vec<(f32, u32)> = candidates
             .par_iter()
             .copied()
-            .filter(|&s| !ctx.tombstones.bit(s as usize) && matches_mask(s))
+            .filter(|&s| {
+                let global = s + ctx.slot_base;
+                !ctx.tombstones.bit(global as usize) && matches_mask(s)
+            })
             .filter_map(|s| {
-                let v = Vectors::read_slot(ctx.vectors, s as u64, ctx.segment_slots, self.dim)?;
+                let global = s + ctx.slot_base;
+                let v =
+                    Vectors::read_slot(ctx.vectors, global as u64, ctx.segment_slots, self.dim)?;
                 let dist = crate::distance::distance(self.metric, query, v);
-                Some((crate::distance::to_score(self.metric, dist), s))
+                Some((crate::distance::to_score(self.metric, dist), global))
             })
             .collect();
         Ok(scored)
@@ -454,13 +482,15 @@ impl IvfIndex {
         tombstones: &crate::storage::TombstoneBits,
         vectors: &[Arc<Mmap>],
         segment_slots: u32,
+        slot_base: u32,
     ) -> f64 {
         let is_spherical = matches!(self.metric, DistanceMetric::Cosine | DistanceMetric::Dot);
         let slot_map = self.slot_list.read();
         let mut total = 0f64;
         let mut counted = 0usize;
         for &slot in sample_slots {
-            if tombstones.bit(slot as usize) {
+            let global = slot + slot_base;
+            if tombstones.bit(global as usize) {
                 continue;
             }
             let Some(&list) = slot_map.get(slot as usize) else {
@@ -469,7 +499,8 @@ impl IvfIndex {
             if list == UNASSIGNED || list as usize >= self.centroids.len() {
                 continue;
             }
-            let Some(v) = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim) else {
+            let Some(v) = Vectors::read_slot(vectors, global as u64, segment_slots, self.dim)
+            else {
                 continue;
             };
             let q = if is_spherical {

@@ -231,7 +231,7 @@ fn test_hnsw_pending_slots_visible_after_restart() {
         assert!(store.build_index().unwrap(), "index published");
 
         // Late writes after publication land in the pending queue and are
-        // not part of hnsw.bin's coverage.
+        // not part of the segment graph's coverage.
         for l in 0..5u64 {
             let v = vec![-100.0 - l as f32, 0.0, 0.0, 0.0];
             let p = VectorPoint::new(format!("late{l}"), v);
@@ -243,11 +243,11 @@ fn test_hnsw_pending_slots_visible_after_restart() {
         }
     }
 
-    // Reopen: hnsw.bin covers only the first 60 slots; WAL replay restores
+    // Reopen: the segment graph covers only the first 60 slots; WAL replay restores
     // the late ones into pending, and approximate search must still see
     // them via the exact-scored pending path.
     let reopened = CollectionStore::open(&store_dir).unwrap();
-    assert!(reopened.has_index(), "hnsw.bin rehydrated");
+    assert!(reopened.has_index(), "segment graph rehydrated");
     assert_eq!(reopened.count(), 65);
     for l in 0..5u64 {
         let q = vec![-100.0 - l as f32, 0.0, 0.0, 0.0];
@@ -377,9 +377,9 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     }
 
     // Flip an arbitrary payload byte after the 10-byte header (magic+version+crc).
-    let index_path = data_dir(&store_dir).join("index.bin");
+    let index_path = data_dir(&store_dir).join("ivf_seg_0000000000.bin");
     let mut bytes = std::fs::read(&index_path).unwrap();
-    assert!(bytes.len() > 12, "index.bin must contain payload");
+    assert!(bytes.len() > 12, "segment IVF file must contain payload");
     // Payload starts at byte 10; flipping byte 10 must break CRC.
     bytes[10] ^= 0xFF;
     std::fs::write(&index_path, &bytes).unwrap();
@@ -387,12 +387,12 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert!(
         !reopened.has_index(),
-        "corrupt index.bin payload must fall back to exact scan"
+        "corrupt segment IVF payload must fall back to exact scan"
     );
     assert_eq!(reopened.count(), 20, "live count must survive fallback");
     assert!(
         !index_path.exists(),
-        "corrupt index.bin must be deleted on load, so next save starts clean"
+        "corrupt segment IVF file must be deleted on load, so next save starts clean"
     );
     assert!(
         reopened.metrics().snapshot().index_load_fallbacks >= 1,
@@ -406,7 +406,7 @@ fn test_index_bin_payload_bitflip_triggers_crc_fallback() {
 }
 
 #[test]
-fn test_hnsw_bin_payload_bitflip_triggers_crc_fallback() {
+fn test_segment_hnsw_payload_bitflip_triggers_crc_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_hnsw");
     let cfg = CollectionConfig::new(4, DistanceMetric::Euclid);
@@ -427,9 +427,9 @@ fn test_hnsw_bin_payload_bitflip_triggers_crc_fallback() {
         assert!(store.has_index());
     }
 
-    let hnsw_path = data_dir(&store_dir).join("hnsw.bin");
+    let hnsw_path = data_dir(&store_dir).join("hnsw_seg_0000000000.bin");
     let mut bytes = std::fs::read(&hnsw_path).unwrap();
-    assert!(bytes.len() > 12, "hnsw.bin must contain payload");
+    assert!(bytes.len() > 12, "segment graph must contain payload");
     // Flip a payload byte (header is 10 bytes).
     let flip_off = 11.min(bytes.len() - 1);
     bytes[flip_off] ^= 0xA5;
@@ -438,12 +438,12 @@ fn test_hnsw_bin_payload_bitflip_triggers_crc_fallback() {
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert!(
         !reopened.has_index(),
-        "corrupt hnsw.bin payload must fall back to exact scan"
+        "corrupt segment graph payload must fall back to exact scan"
     );
     assert_eq!(reopened.count(), 20);
     assert!(
         !hnsw_path.exists(),
-        "corrupt hnsw.bin must be deleted on load"
+        "corrupt segment graph must be deleted on load"
     );
     assert!(
         reopened.metrics().snapshot().index_load_fallbacks >= 1,

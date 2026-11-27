@@ -23,11 +23,13 @@ impl HnswIndex {
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
         slot: u32,
+        slot_base: u32,
     ) -> Option<f32> {
+        let global = slot + slot_base;
         if let Some(q) = qctx {
             let code = crate::storage::quant::QuantStore::read_slot(
                 q.snapshot,
-                slot as u64,
+                (slot + q.slot_base) as u64,
                 segment_slots,
                 q.bytes_per_vector,
             )?;
@@ -35,7 +37,7 @@ impl HnswIndex {
                 crate::storage::quant::QuantStore::distance_quantized_for_query(q.query, code),
             );
         }
-        let v = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim)?;
+        let v = Vectors::read_slot(vectors, global as u64, segment_slots, self.dim)?;
         Some(self.distance(query, v))
     }
 
@@ -50,6 +52,7 @@ impl HnswIndex {
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
         qctx: Option<&HnswQuantCtx<'_>>,
+        slot_base: u32,
     ) -> Cand {
         let mut best = start;
         loop {
@@ -65,7 +68,8 @@ impl HnswIndex {
                 buf.extend_from_slice(&node.layer(layer).read());
                 let mut improved = false;
                 for &slot in buf.iter() {
-                    let Some(dist) = self.cand_dist(query, qctx, vectors, segment_slots, slot)
+                    let Some(dist) =
+                        self.cand_dist(query, qctx, vectors, segment_slots, slot, slot_base)
                     else {
                         continue;
                     };
@@ -131,13 +135,13 @@ impl HnswIndex {
     ) -> SearchLayerResult {
         let live = |slot: u32| -> bool {
             match ctx.tombstones {
-                Some(t) => !t.bit(slot as usize),
+                Some(t) => !t.bit((slot + ctx.slot_base) as usize),
                 None => true,
             }
         };
         let matches_filter = |slot: u32| -> bool {
-            ctx.filter_mask
-                .is_none_or(|m| (slot as usize) < m.len() && m[slot as usize])
+            let slot = (slot + ctx.slot_base) as usize;
+            ctx.filter_mask.is_none_or(|m| slot < m.len() && m[slot])
         };
 
         // Working sets reuse the per-thread capacity: the generation array
@@ -218,6 +222,7 @@ impl HnswIndex {
                     ctx.vectors,
                     ctx.segment_slots,
                     slot,
+                    ctx.slot_base,
                 ) else {
                     continue;
                 };
@@ -272,6 +277,7 @@ impl HnswIndex {
             ctx.vectors,
             ctx.segment_slots,
             entry.slot,
+            ctx.slot_base,
         ) else {
             return Ok(Vec::new());
         };
@@ -289,6 +295,7 @@ impl HnswIndex {
                 ctx.vectors,
                 ctx.segment_slots,
                 ctx.quant.as_ref(),
+                ctx.slot_base,
             );
             lc -= 1;
         }
@@ -296,7 +303,12 @@ impl HnswIndex {
         let w = self.search_layer(query, &[best], ef.max(k), 0, ctx);
         Ok(w.live
             .into_iter()
-            .map(|c| (crate::distance::to_score(self.metric, c.dist), c.slot))
+            .map(|c| {
+                (
+                    crate::distance::to_score(self.metric, c.dist),
+                    c.slot + ctx.slot_base,
+                )
+            })
             .collect())
     }
 
@@ -329,6 +341,7 @@ impl HnswIndex {
             ctx.vectors,
             ctx.segment_slots,
             entry.slot,
+            ctx.slot_base,
         ) else {
             return Ok(Vec::new());
         };
@@ -346,6 +359,7 @@ impl HnswIndex {
                 ctx.vectors,
                 ctx.segment_slots,
                 ctx.quant.as_ref(),
+                ctx.slot_base,
             );
             lc -= 1;
         }
@@ -386,7 +400,12 @@ impl HnswIndex {
         Ok(all_results
             .into_iter()
             .take(k)
-            .map(|c| (crate::distance::to_score(self.metric, c.dist), c.slot))
+            .map(|c| {
+                (
+                    crate::distance::to_score(self.metric, c.dist),
+                    c.slot + ctx.slot_base,
+                )
+            })
             .collect())
     }
 }

@@ -46,36 +46,46 @@ impl CollectionStore {
     }
 
     /// Write a payload for a slot to PayloadStore.
-    pub(super) fn write_payload_at(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
+    pub(super) fn write_payload_at(
+        &self,
+        slot: u32,
+        payload: Option<&Payload>,
+        lsn: u64,
+    ) -> Result<()> {
         let data = self.data_arc();
         let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        ps.put(slot, payload)
+        ps.put_at(slot, payload, lsn)
     }
 
     /// Delete specific keys from a slot's payload in PayloadStore.
-    pub(super) fn delete_keys_at(&self, slot: u32, keys: &[&str]) -> Result<()> {
+    pub(super) fn delete_keys_at(&self, slot: u32, keys: &[&str], lsn: u64) -> Result<()> {
         let data = self.data_arc();
         let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        ps.delete_keys(slot, keys)
+        ps.delete_keys_at(slot, keys, lsn)
     }
 
     /// Merge the given fields into a slot's payload in PayloadStore.
-    pub(super) fn merge_payload_at(&self, slot: u32, partial: &Payload) -> Result<()> {
+    pub(super) fn merge_payload_at(
+        &self,
+        slot: u32,
+        partial: &Payload,
+        lsn: u64,
+    ) -> Result<()> {
         let data = self.data_arc();
         let ps_guard = data.payload_store.load();
         let ps = ps_guard
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        ps.merge(slot, partial.iter().map(|(k, v)| (k.clone(), v.clone())))
+        ps.merge_at(slot, partial.iter().map(|(k, v)| (k.clone(), v.clone())), lsn)
     }
 
     /// Re-index a slot's pre-filter structures after a non-upsert payload

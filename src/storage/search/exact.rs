@@ -49,6 +49,8 @@ impl CollectionStore {
                             keysnap: snap.keysnap,
                             filter_mask: snap.filter_mask,
                             payload_view: snap.payload_view,
+                            hnsw_segments: &[],
+                            ivf_segments: &[],
                         },
                     );
                     acc
@@ -90,6 +92,8 @@ impl CollectionStore {
                 keysnap: snap.keysnap,
                 filter_mask: None,
                 payload_view: snap.payload_view,
+                hnsw_segments: &[],
+                ivf_segments: &[],
             },
         )
     }

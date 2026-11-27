@@ -79,6 +79,7 @@ pub(super) fn test_insert_and_probe_finds_blobs() {
                     tombstones: Some(&all_live(data.len())),
                     vectors: &mmaps,
                     segment_slots: 128,
+                    slot_base: 0,
                     filter_mask: None,
                     quant: None,
                 },
@@ -119,6 +120,7 @@ pub(super) fn test_probe_respects_tombstones() {
                 tombstones: Some(&tombstones),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -137,6 +139,7 @@ pub(super) fn test_probe_respects_tombstones() {
                 tombstones: Some(&all_live(data.len())),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -162,7 +165,7 @@ pub(super) fn test_incremental_insert_reaches_graph() {
     let (_dir2, mmaps2) = mmap_from(&vectors);
     let new_slot = data.len() as u32;
     let v = vec![-100.0f32; DIM];
-    index.insert(new_slot, &v, &mmaps2, 256);
+    index.insert(new_slot, &v, &mmaps2, 256, 0);
     assert_eq!(index.node_count(), data.len() + 1);
 
     let hits = index
@@ -174,6 +177,7 @@ pub(super) fn test_incremental_insert_reaches_graph() {
                 tombstones: Some(&all_live(vectors.len())),
                 vectors: &mmaps2,
                 segment_slots: 256,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -200,7 +204,7 @@ pub(super) fn test_overwrite_insert_counts_staleness() {
 
     let before = index.node_count();
     for _ in 0..3 {
-        index.insert(0, &vectors[0], &mmaps, 64);
+        index.insert(0, &vectors[0], &mmaps, 64, 0);
     }
     assert_eq!(index.node_count(), before, "overwrite keeps the position");
     assert_eq!(
@@ -248,6 +252,7 @@ pub(super) fn test_search_layer_result_never_exceeds_ef_with_dead_nodes() {
             tombstones: Some(&tombstones),
             vectors: &mmaps,
             segment_slots: 128,
+            slot_base: 0,
             filter_mask: None,
             quant: None,
         },
@@ -352,6 +357,7 @@ pub(super) fn test_multiworker_build_registers_all_and_keeps_recall() {
                 tombstones: Some(&all_live(n)),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -420,6 +426,7 @@ pub(super) fn test_persisted_roundtrip_preserves_topology() {
                 tombstones: Some(&all_live(data.len())),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -434,6 +441,7 @@ pub(super) fn test_persisted_roundtrip_preserves_topology() {
                 tombstones: Some(&all_live(data.len())),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -512,6 +520,7 @@ pub(super) fn test_recall_against_exact_scan() {
                 tombstones: Some(&all_live(n)),
                 vectors: &mmaps,
                 segment_slots: 128,
+                slot_base: 0,
                 filter_mask: None,
                 quant: None,
             },
@@ -561,6 +570,7 @@ pub(super) fn test_iterative_scan_improves_recall() {
         tombstones: Some(&all_live(n)),
         vectors: &mmaps,
         segment_slots: 128,
+        slot_base: 0,
         filter_mask: None,
         quant: None,
     };
@@ -606,12 +616,12 @@ pub(super) fn test_stale_ratio_combines_count_and_delta() {
     assert_eq!(index.stale_ratio(), 0.0);
 
     // Overwrite with the same vector: count increases, delta stays ~0.
-    index.insert(0, &vectors[0], &mmaps, 64);
+    index.insert(0, &vectors[0], &mmaps, 64, 0);
     assert!(index.stale_ratio() > 0.0, "count-based ratio should be > 0");
 
     // Overwrite with a very different vector: delta should dominate.
     let far = vec![1000.0; DIM];
-    index.insert(1, &far, &mmaps, 64);
+    index.insert(1, &far, &mmaps, 64, 0);
     let ratio = index.stale_ratio();
     assert!(ratio > 0.1, "delta should push ratio up, got {ratio}");
 }
@@ -640,6 +650,7 @@ pub(super) fn test_iterative_scan_tuple_budget_truncates() {
         tombstones: Some(&all_live(n)),
         vectors: &mmaps,
         segment_slots: 128,
+        slot_base: 0,
         filter_mask: None,
         quant: None,
     };
@@ -697,7 +708,7 @@ pub(super) fn test_concurrent_insert_and_probe_exercises_version_reload() {
     let writer_index = Arc::clone(&index);
     let writer = std::thread::spawn(move || {
         for i in 0..extra.len() as u32 {
-            writer_index.insert(first_extra + i, &extra[i as usize], &writer_mmaps, 256);
+            writer_index.insert(first_extra + i, &extra[i as usize], &writer_mmaps, 256, 0);
         }
     });
 
@@ -715,6 +726,7 @@ pub(super) fn test_concurrent_insert_and_probe_exercises_version_reload() {
                         tombstones: Some(&all_live(total_slots)),
                         vectors: &mmaps,
                         segment_slots: 256,
+                        slot_base: 0,
                         filter_mask: None,
                         quant: None,
                     },

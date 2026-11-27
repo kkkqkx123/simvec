@@ -189,7 +189,7 @@ impl CollectionStore {
                         continue;
                     }
                     let point = point.to_point()?;
-                    self.apply_upsert_locked(inner, &point)?;
+                    self.apply_upsert_locked(inner, &point, lsn)?;
                     touched.push(id);
                 }
                 WalRecord::Delete { point_id } => {
@@ -215,18 +215,18 @@ impl CollectionStore {
                         Some(s) => Some(serde_json::from_str::<Payload>(s)?),
                         None => None,
                     };
-                    self.write_payload_at(*slot, parsed.as_ref())?;
+                    self.write_payload_at(*slot, parsed.as_ref(), lsn)?;
                     self.refresh_filter_bitmap_locked(inner, *slot);
                 }
                 WalRecord::DeletePayloadKeys { slot, keys } => {
                     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                    self.delete_keys_at(*slot, &key_refs)?;
+                    self.delete_keys_at(*slot, &key_refs, lsn)?;
                     self.refresh_filter_bitmap_locked(inner, *slot);
                 }
                 WalRecord::SetPayloadField { slot, key, value } => {
                     let parsed: serde_json::Value = serde_json::from_str(value)?;
                     let partial = Payload::from([(key.clone(), parsed)]);
-                    self.merge_payload_at(*slot, &partial)?;
+                    self.merge_payload_at(*slot, &partial, lsn)?;
                     self.refresh_filter_bitmap_locked(inner, *slot);
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
@@ -249,6 +249,7 @@ impl CollectionStore {
         &self,
         inner: &mut StoreInner,
         point: &VectorPoint,
+        lsn: u64,
     ) -> Result<()> {
         validate_point(&inner.meta, point)?;
         let data = self.data_arc();
@@ -281,7 +282,7 @@ impl CollectionStore {
                 }
             }
         }
-        self.write_payload_at(slot as u32, point.payload.as_ref())?;
+        self.write_payload_at(slot as u32, point.payload.as_ref(), lsn)?;
         self.register_slot(slot as u32, point.vector(), inner.meta.segment_slots);
         inner
             .filter_bitmap

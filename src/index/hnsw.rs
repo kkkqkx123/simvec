@@ -49,6 +49,8 @@ pub(crate) const DEFAULT_ITERATIVE_MAX_ROUNDS: usize = 3;
 /// read lock across the graph walk and rebuilds are never blocked.
 pub(crate) struct HnswQuantCtx<'a> {
     pub bytes_per_vector: usize,
+    /// Base added to local graph ids when indexing this code snapshot.
+    pub slot_base: u32,
     pub snapshot: &'a [Arc<memmap2::Mmap>],
     pub query: &'a crate::storage::quant::QuantQuery<'a>,
 }
@@ -57,6 +59,8 @@ pub(crate) struct HnswSearchContext<'a> {
     pub tombstones: Option<&'a TombstoneBits>,
     pub vectors: &'a [Arc<memmap2::Mmap>],
     pub segment_slots: u32,
+    /// Global slot added to this graph's local node ids.
+    pub slot_base: u32,
     pub filter_mask: Option<&'a BitVec>,
     pub quant: Option<HnswQuantCtx<'a>>,
 }

@@ -118,6 +118,7 @@ fn test_probe_candidates_skips_tombstones_and_scores_all() {
                 tombstones: &tombstones,
                 vectors: &mmaps,
                 segment_slots: 16,
+                slot_base: 0,
                 filter_mask: None,
             },
         )
@@ -135,6 +136,7 @@ fn test_probe_candidates_skips_tombstones_and_scores_all() {
                 tombstones: &tombstones,
                 vectors: &mmaps,
                 segment_slots: 16,
+                slot_base: 0,
                 filter_mask: None,
             },
         )
@@ -168,6 +170,7 @@ fn test_pending_slots_are_probed() {
                 tombstones: &tombstones,
                 vectors: &mmaps,
                 segment_slots: 16,
+                slot_base: 0,
                 filter_mask: None,
             },
         )
@@ -189,6 +192,7 @@ fn test_pending_slots_are_probed() {
                 tombstones: &tombstones,
                 vectors: &mmaps,
                 segment_slots: 16,
+                slot_base: 0,
                 filter_mask: None,
             },
         )
@@ -210,7 +214,7 @@ fn test_adopt_range_covers_new_slots() {
     .unwrap();
 
     let tombstones = crate::storage::TombstoneBits::from_bits(bitvec::bitvec![0; vectors.len()]);
-    index.adopt_range(4, vectors.len() as u32, &tombstones, &mmaps, 16);
+    index.adopt_range(4, vectors.len() as u32, &tombstones, &mmaps, 16, 0);
     let total: usize = index.lists.iter().map(|l| l.read().len()).sum();
     assert_eq!(total, vectors.len());
 }
@@ -228,7 +232,7 @@ fn test_drift_ratio_detects_moved_points() {
 
     let samples = IvfIndex::sample_plan(1024, vectors.len() as u32);
     let tombstones = crate::storage::TombstoneBits::from_bits(bitvec::bitvec![0; vectors.len()]);
-    let clean = index.drift_ratio(&samples, &tombstones, &mmaps, 16);
+    let clean = index.drift_ratio(&samples, &tombstones, &mmaps, 16, 0);
     assert_eq!(clean, 0.0, "assignments straight after build have no drift");
 
     // Re-point half the slots as if their vectors had moved to a
@@ -239,7 +243,7 @@ fn test_drift_ratio_detects_moved_points() {
     for slot in 0..vectors.len() / 2 {
         index.assign_slot(slot as u32, &far);
     }
-    let dirty = index.drift_ratio(&samples, &tombstones, &mmaps, 16);
+    let dirty = index.drift_ratio(&samples, &tombstones, &mmaps, 16, 0);
     assert!(dirty > 1.0, "expected substantial drift, got {dirty}");
 }
 

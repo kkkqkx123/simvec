@@ -85,6 +85,14 @@ generation 目录的 `segments.json` 记录段几何，`DataFiles` 持有 `Segme
 
 HNSW/IVF 只覆盖 `SegmentSet::immutable_end` 之前的完整段；部分段留在 `pending` 中精确扫描。`register_slot`、build 发布和 drain 共用同一边界，pending 达到一个段大小即请求重建。小集合尚未填满首段时仍整体入图。新增部分段搜索回归测试。
 
+### 每段独立 HNSW 图
+
+HNSW 按段发布 `hnsw_seg_<start>.bin`，段内局部节点通过 `slot_base` 读取全局向量。查询按段取候选后统一做过滤、打分和 top-k；损坏的段文件被删除并只让该段回退精确扫描。段冻结与空洞修复触发该段单独重建，首个未填满的段仍做增量插入以保持并发图变更语义。压实阶段直接为新段建图。
+
+### 每段 IVF 与段量化
+
+IVF 的 centroid、assignment 和量化码都按 immutable 段发布。文件内槽位为段内局部编号，`slot_base` 映射到生成内全局槽位；查询对每段单独探测，再与 appendable tail 的 pending 结果合并。量化查询编码一次复用，段图遍历使用段文件里的码，返回前统一精确 rescore。任何段文件损坏只让该段回退 exact scan。
+
 ### 单写者与发布 poison
 
 生命周期模块提供 `CollectionLock`：Unix 上对集合根目录的 `.lock` 文件做 `LOCK_EX | LOCK_NB`，按规范化路径引用计数；同进程内第二个句柄共享同一把锁，其他进程打开同一目录会被拒绝。最后一个句柄释放时解锁。dense、kind、named 的 create/open 都持有该锁。
@@ -101,16 +109,15 @@ HNSW/IVF 只覆盖 `SegmentSet::immutable_end` 之前的完整段；部分段留
 
 ## 剩余修改方案
 
-本节按改动面从小到大列出细化方案。已落地：首个 checkpoint 前的 payload 自愈、tracker journal 与 bitmask 自愈、`must_not` / `should` / `min_should` 集合运算、集合快照 pin 与原生恢复、段边界清单与有界压实、冻结段 ANN 加追加段精确扫描。仍未落地的是物理文件按段拆分、每段独立图与 WAL mmap 化，它们同时改变文件协议、恢复水位和索引发布边界，必须分阶段验证。
+本节按改动面从小到大列出细化方案。已落地：首个 checkpoint 前的 payload 自愈、tracker journal 与 bitmask 自愈、`must_not` / `should` / `min_should` 集合运算、集合快照 pin 与原生恢复、段边界清单与有界压实、每段独立 HNSW/IVF 图与段级量化文件、journal floor 回滚。仍未落地的是 dense 物理文件拆分与 WAL mmap 化，它们同时改变文件协议、恢复水位和索引发布边界，必须分阶段验证。
 
 ### 派生文件自愈
 
-**已完成部分。** `DataFiles::open` 把 generation 的 replay floor 传给 `PayloadStore::open_with_repair`；floor 为 0 时，任何无法通过指针/CRC 校验的派生状态都直接重建为空 store，后续 WAL 回放负责恢复。零长度页面在打开时恢复固定 extent；`open` 会校验每个持久化 blob 的 CRC。`tracker.journal.bin` 已落地：`put` 只追加带版本和 CRC 的变更记录，checkpoint 先发布紧凑 `tracker.bin` 再清空 journal；打开时只重放版本更高的完整记录，并截断 torn tail。bitmask 改为 `open_or_rebuild`：tracker 是 live 块的权威，损坏的 `bitmask.bin` 或任何落在 live 指针上的空闲位都会触发从指针表精确重建，孤儿已分配块允许保留。
+**已完成部分。** `DataFiles::open` 把 generation 的 replay floor 传给 `PayloadStore::open_with_repair`；floor 为 0 时，任何无法通过指针/CRC 校验的派生状态都直接重建为空 store，后续 WAL 回放负责恢复。零长度页面在打开时恢复固定 extent；`open` 会校验每个持久化 blob 的 CRC。`tracker.journal.bin` 已落地：`put` 只追加带版本、lsn 和 CRC 的变更记录，checkpoint 先发布紧凑 `tracker.bin` 再清空 journal；打开时只重放版本更高的完整记录，并截断 torn tail。bitmask 改为 `open_or_rebuild`：tracker 是 live 块的权威，损坏的 `bitmask.bin` 或任何落在 live 指针上的空闲位都会触发从指针表精确重建，孤儿已分配块允许保留。
 
-**剩余步骤。**
+**已落地。** `tracker.journal.bin` 每条记录增加 8 字节 lsn。`floor == 0` 时仍整体重建派生 store；`floor > 0` 时打开 compact `tracker.bin` 后重放 journal，并把 lsn 大于 floor 的记录覆盖的槽位重置为空指针，随后 WAL 从 floor 精确恢复这些槽位。已提交到 checkpoint 的记录（lsn 不超过 floor）不会被回滚，避免 WAL 截断后误删 payload。测试覆盖 floor 两侧的记录选择与 torn tail 截断。
 
-1. 在 `PayloadStore::open_with_repair` 中把 floor 分成两段：`floor == 0` 时保持现在的整体重建；`floor > 0` 但存在未完成 journal 时，只回滚 journal 覆盖的槽位，再从 floor 之后的 WAL 重放。当前 journal 回放对所有 floor 生效，但不做槽位级回滚。
-2. 验证：构造 tracker 半写、页面短文件两类崩溃注入；前者恢复，后者在 floor 大于 0 时保持 `CorruptData`。journal 半写与 stale-free 位图已分别由 `test_journal_replays_and_truncates_torn_tail` 和 `stale_free_bit_is_rebuilt_from_the_live_pointer` 覆盖。
+**验证。** 仍可补充 tracker 半写与页面短文件的崩溃注入；前者应恢复，后者在 floor 大于 0 时保持 `CorruptData`。
 
 ### segment 化与有界压实
 
@@ -129,15 +136,16 @@ HNSW/IVF 只覆盖 `SegmentSet::immutable_end` 之前的完整段；部分段留
 
 ### 按段 ANN
 
-**已完成部分。** ANN 只建在 `SegmentSet::immutable_end` 之前的完整段上；最后一个部分段不进图，写入留在 `pending` 中由搜索精确扫描。`register_slot`、build 发布和 `drain_pending_hnsw` 共用同一边界；pending 达到一个段的大小会置 `needs_rebuild`，drain 也不会把 appendable tail 塞进图。小集合在没有完整段之前仍整体入图，保持原有召回。
+**已完成部分。** HNSW 按 immutable 段发布独立图文件 `hnsw_seg_<start>.bin`，节点 id 为段内局部编号，查询与构建通过 `slot_base` 映射到全局向量。最后一个部分段不进图，写入留在 `pending` 中精确扫描。`register_slot`、build 发布、`drain_pending_hnsw` 共用段边界；drain 只重建被推进的段，首个尚未填满的段仍做增量插入。`repair_hnsw` 对存在空洞或墓碑的段单独重建；段图文件损坏只让该段回退精确扫描，其他段继续提供 ANN。压实直接在 staging 为新段建图，不再跨代 remap HNSW 邻接。
 
 **剩余步骤。**
 
-1. 图文件按 immutable 段发布，文件名包含段 id；每个段独立建图，而不是一张覆盖全部冻结段的图。
-2. 段冻结时一次性建图并修复删除留下的图空洞；不再依赖跨代 remap 保持邻居关系。
-3. 超限重建按段进行：只重建触发阈值的段，不重建整个集合。
-4. 查询先按段取候选（图搜索或精确扫描），合并后统一做 payload 过滤、打分和 top-k；每段的 pre-mask 由同一份 `FilterPlan` 语义生成，保持保守。
-5. 量化码随段发布，appendable 段继续用原始向量；段切换后旧量化文件引用计数归零才删除。
+**已落地。** IVF 与 HNSW 一样按段发布：`ivf_seg_<start>.bin` 保存段内局部槽位的 centroid 与 assignment，查询通过 `slot_base` 读全局向量；搜索逐段探测后统一走共享过滤/打分。量化码写入 `quant_seg_<start>.bin`，与段图一起发布和 rehydrate；段图遍历用段内码、候选统一精确 rescore。压实直接在 staging 按新段重建 IVF/HNSW 与段量化文件。
+
+**剩余步骤。**
+
+1. 图空洞修复目前以段重建实现，尚未做只修补受影响邻接的局部修复。
+2. dense 物理文件仍以单个 `vectors.bin` 分段，尚未拆成每段独立文件。
 
 **不变量。** 任何时刻可见点都在“已发布图”或“段内精确扫描集合”之一中；召回率不得低于当前集合级基线的 1e-4 容差；图重建失败只影响该段。
 
@@ -199,6 +207,11 @@ HNSW/IVF 只覆盖 `SegmentSet::immutable_end` 之前的完整段；部分段留
 - live 指针上的空闲位在打开时 rebuild，已分配块不会被再次交给另一个 payload；
 - 段边界清单在写入跨段和 checkpoint 后保持同步；
 - 部分段保持在 `pending` 中精确扫描，drain 不把它塞进图；
+- 单段图文件损坏只让该段回退精确扫描，其他段仍走 ANN；
+- 单段 IVF 文件损坏只让该段回退精确扫描，其他段仍走 ANN；
+- 段量化文件随图 rehydrate，段查询走量化遍历并精确 rescore；
+- journal 记录带 lsn，floor 之后的槽位被回滚后由 WAL 恢复；
+- 段内有墓碑或空洞时 `repair_hnsw` 只重建该段；
 - `must_not` / `should` / `min_should` 的索引掩码与后置过滤结果一致；
 - 快照复制后可在独立目录恢复 checkpoint 后仅存在于 WAL 的点，位翻转和穿越路径被拒绝；
 - 同进程多个句柄共享目录锁，最后一个句柄释放后可重开；
@@ -206,4 +219,4 @@ HNSW/IVF 只覆盖 `SegmentSet::immutable_end` 之前的完整段；部分段留
 - payload-only 写入后 dense snapshot 仍可用于打开；
 - 既有 checkpoint、WAL、压实、量化和恢复测试保持通过。
 
-后续结构性修改需要补充：物理分段文件的压实重启一致性、每段独立图的召回对比、字段索引选择性规划、新 WAL 段格式的 torn tail 与 ACK 回归，以及快照的 C ABI 暴露与 kind/named 快照。目录锁的跨进程互斥仍需在独立进程测试中验证；当前单元测试覆盖同进程共享与释放。
+后续结构性修改需要补充：物理分段文件的压实重启一致性、字段索引选择性规划、新 WAL 段格式的 torn tail 与 ACK 回归，以及快照的 C ABI 暴露与 kind/named 快照。目录锁的跨进程互斥仍需在独立进程测试中验证；当前单元测试覆盖同进程共享与释放。

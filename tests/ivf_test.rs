@@ -112,7 +112,7 @@ fn promote_search_rebuild_roundtrip() {
         );
     }
 
-    // Reopen: index.bin was dropped together with drop_index -> exact scan.
+    // Reopen: segment IVF file was dropped together with drop_index -> exact scan.
     let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
     assert!(!reopened.has_index("col"));
     assert_eq!(reopened.count("col").unwrap(), 40);
@@ -128,7 +128,7 @@ fn index_persists_across_restart() {
     let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
     assert!(
         reopened.has_index("col"),
-        "published index must survive restart via index.bin"
+        "published segment IVF file must survive restart"
     );
     let info = reopened.collection_info("col").unwrap();
     assert_eq!(info.index.unwrap().index_kind, IndexKind::Ivf);
@@ -222,7 +222,7 @@ fn compaction_remaps_the_published_index() {
 }
 
 #[test]
-fn corrupt_index_bin_falls_back_to_exact_scan() {
+fn corrupt_segment_ivf_falls_back_to_exact_scan() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = engine_with_blobs(&dir.path().join("vec"), 20);
@@ -235,12 +235,16 @@ fn corrupt_index_bin_falls_back_to_exact_scan() {
         .map(|entry| entry.path())
         .find(|path| path.is_dir())
         .expect("published generation");
-    std::fs::write(data_dir.join("index.bin"), b"VIVFgarbage-not-parseable").unwrap();
+    std::fs::write(
+        data_dir.join("ivf_seg_0000000000.bin"),
+        b"VIVFgarbage-not-parseable",
+    )
+    .unwrap();
 
     let reopened = LocalVectorEngine::open(dir.path().join("vec")).unwrap();
     assert!(
         !reopened.has_index("col"),
-        "corrupt index.bin must fall back to exact scan"
+        "corrupt segment IVF file must fall back to exact scan"
     );
     assert_eq!(reopened.count("col").unwrap(), 40);
     let results = reopened
@@ -248,7 +252,7 @@ fn corrupt_index_bin_falls_back_to_exact_scan() {
         .unwrap();
     assert_eq!(results.len(), 3);
     // The corrupt file is cleaned up so a later save starts fresh.
-    assert!(!data_dir.join("index.bin").exists());
+    assert!(!data_dir.join("ivf_seg_0000000000.bin").exists());
 }
 
 #[test]

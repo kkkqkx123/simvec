@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use super::dense_snapshot::DenseSnapshot;
-use super::index_lifecycle::PublishedIndex;
 use super::quant::QuantStore;
 use super::WalRecord;
 use super::{CollectionStore, StoreInner};
@@ -225,19 +224,50 @@ impl CollectionStore {
     /// or 0 if no index is published or no repair was needed.
     pub fn repair_hnsw(&self) -> Result<usize> {
         let data = self.data_arc();
-        let index = data.index.load();
-        let Some(published) = index.as_ref() else {
+        let segments = data.hnsw_segments.load();
+        if segments.is_empty() {
             return Ok(0);
+        }
+        let (dim, metric, segment_slots, name, config) = {
+            let inner = self.inner.read();
+            (
+                inner.meta.vector_size,
+                inner.meta.distance,
+                inner.meta.segment_slots,
+                inner.meta.collection.clone(),
+                match &inner.meta.index {
+                    IndexConfig::Hnsw(cfg) => cfg.clone(),
+                    _ => crate::types::HnswConfig::default(),
+                },
+            )
         };
-        let PublishedIndex::Hnsw(hnsw) = published else {
-            return Ok(0);
-        };
-
         let tombstones = data.tombstones.load();
-        let vsnap = data.vectors.snapshot();
-        let segment_slots = self.inner.read().meta.segment_slots;
-
-        Ok(hnsw.repair(&tombstones, &vsnap, segment_slots))
+        let _guard = self.build_mutex.lock();
+        let mut repaired = 0usize;
+        let mut graphs = Vec::with_capacity(segments.len());
+        for segment in segments.iter() {
+            let len = (segment.end - segment.start) as usize;
+            let has_tombstone =
+                (segment.start..segment.end).any(|slot| tombstones.bit(slot as usize));
+            if !segment.index.covers_all(len) || has_tombstone {
+                if let Some(rebuilt) = self.rebuild_segment_hnsw(
+                    segment.start,
+                    segment.end,
+                    &name,
+                    dim,
+                    metric,
+                    segment_slots,
+                    &config,
+                )? {
+                    graphs.push(rebuilt);
+                    repaired += len;
+                    continue;
+                }
+            }
+            graphs.push(segment.clone());
+        }
+        data.hnsw_segments.store(Arc::new(graphs));
+        Ok(repaired)
     }
 
     /// Grow storage to accommodate `needed_slots` slots (0-indexed high water).

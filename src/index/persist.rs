@@ -104,6 +104,31 @@ pub(crate) fn save(dir: &Path, data: &PersistedIvf) -> Result<()> {
     Ok(())
 }
 
+/// Write a single segment's IVF state to an explicit path.
+pub(crate) fn save_at(path: &Path, data: &PersistedIvf) -> Result<()> {
+    let tmp = path.with_extension("tmp.bin");
+    write_tagged(&tmp, &INDEX_MAGIC, INDEX_VERSION, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Load one segment's IVF state. Derived-file failures become `None` so the
+/// affected segment falls back to exact scan without blocking open.
+pub(crate) fn load_at(path: &Path) -> Result<Option<PersistedIvf>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match read_tagged::<PersistedIvf>(&bytes, &INDEX_MAGIC, INDEX_VERSION) {
+        Ok(data) if data.structurally_valid() => Ok(Some(data)),
+        _ => {
+            discard(path);
+            Ok(None)
+        }
+    }
+}
+
 /// Load `<dir>/index.bin`. Returns `Ok(None)` when the file is absent or
 /// fails any structural check; a failing check also deletes the file so the
 /// next save starts clean.
@@ -254,6 +279,31 @@ impl PersistedHnsw {
             nodes,
             ..self.clone()
         })
+    }
+}
+
+/// Write one segment graph to its own atomic file.
+pub(crate) fn save_hnsw_at(path: &Path, data: &PersistedHnsw) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    write_tagged(&tmp, &HNSW_MAGIC, HNSW_VERSION, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Load one segment graph. Damage is reported as absent so that only the
+/// affected segment falls back to exact scan.
+pub(crate) fn load_hnsw_at(path: &Path) -> Result<Option<PersistedHnsw>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match read_tagged::<PersistedHnsw>(&bytes, &HNSW_MAGIC, HNSW_VERSION) {
+        Ok(data) if data.structurally_valid() => Ok(Some(data)),
+        _ => {
+            discard(path);
+            Ok(None)
+        }
     }
 }
 

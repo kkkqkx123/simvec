@@ -29,16 +29,19 @@ use std::time::Duration;
 
 use memmap2::Mmap;
 
-use super::directory::KEY_REC_SIZE;
 use super::dense_snapshot::{DenseSnapshot, SnapshotPoint};
+use super::directory::KEY_REC_SIZE;
 use super::generation::StagedGeneration;
-use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
+use super::segment_hnsw::{self, SegmentHnsw};
+use super::segment_ivf::{self, SegmentIvf};
+use super::segments;
 use super::tombstones::TombstoneBits;
+use super::vectors::Vectors;
 use super::{CollectionStore, DataFiles, Meta, WalRecord, WalTxn};
 use crate::error::{Result, VectorSearchError};
-use crate::index::{persist, HnswIndex, IvfIndex};
-use crate::types::{HnswConfig, IndexConfig, PointId};
+use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
+use crate::types::{HnswConfig, IndexConfig, IvfConfig, PointId};
 
 const HEADER_LEN: usize = 32;
 const FILE_VERSION: u32 = 2;
@@ -85,6 +88,12 @@ fn build_plan(
         live_count,
         points: DenseSnapshot::capture_points(&inner.reverse, &inner.versions),
     }
+}
+
+/// ANN artifacts built into the staged generation.
+struct StagedIndex {
+    ivf: Vec<SegmentIvf>,
+    hnsw: Vec<SegmentHnsw>,
 }
 
 /// One entry of a rebuilt directory file: blob for `slot` with `flags`.
@@ -206,6 +215,84 @@ pub(crate) fn write_vectors_file(
     }
     file.sync_all()?;
     Ok(())
+}
+
+/// Build one HNSW file per completed segment of the staged generation.
+fn stage_hnsw_segments(
+    store: &CollectionStore,
+    dir: &Path,
+    meta: &Meta,
+    config: &HnswConfig,
+) -> Result<Vec<SegmentHnsw>> {
+    let boundary = segments::immutable_end(meta.next_slot, meta.segment_slots);
+    if boundary == 0 {
+        return Ok(Vec::new());
+    }
+    let vectors = Vectors::open(
+        &dir.join("vectors.bin"),
+        meta.vector_size,
+        meta.segment_slots,
+        meta.slot_capacity,
+    )?;
+    let snapshot = vectors.snapshot();
+    let step = meta.segment_slots.max(1);
+    let name = meta.collection.as_str();
+    let mut graphs = Vec::new();
+    for start in (0..boundary).step_by(step as usize) {
+        let end = (start + step).min(boundary);
+        let local: Vec<u32> = (0..end - start).collect();
+        let index = HnswIndex::build(
+            &IndexBuildParams::new(
+                name,
+                meta.vector_size,
+                meta.distance,
+                &local,
+                &snapshot,
+                meta.segment_slots,
+            )
+            .with_slot_base(start),
+            config,
+        )?;
+        persist::save_hnsw_at(&segment_hnsw::file_path(dir, start), &index.to_persisted())?;
+        let quant = {
+            let data = store.data_arc();
+            let guard = data.quant.read();
+            match guard.as_ref() {
+                Some(q) if q.is_ready() => q.write_segment_file(
+                    &crate::storage::quant::segment_file_path(dir, start),
+                    &snapshot,
+                    meta.segment_slots,
+                    start,
+                    end - start,
+                )?,
+                _ => false,
+            }
+        };
+        let quant = if quant {
+            let data = store.data_arc();
+            let guard = data.quant.read();
+            guard
+                .as_ref()
+                .map(|q| {
+                    crate::storage::quant::QuantStore::load_segment_file(
+                        &crate::storage::quant::segment_file_path(dir, start),
+                        meta.segment_slots,
+                        q.bytes_per_vector(),
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        graphs.push(SegmentHnsw {
+            start,
+            end,
+            index: Arc::new(index),
+            quant,
+        });
+    }
+    Ok(graphs)
 }
 
 #[cfg(unix)]
@@ -409,12 +496,12 @@ impl CollectionStore {
     /// Requires no store locks: every input is either an `ArcSwap` snapshot or
     /// captured in `plan`. Callers validate via the mutation counter that no
     /// write raced the reads before publishing this generation. The returned
-    /// index is the remapped ANN tier, already persisted into the staging dir.
+    /// ANN artifacts are already persisted into the staging dir.
     fn stage_generation(
         &self,
         plan: &CompactionPlan,
         staged: &StagedGeneration,
-    ) -> Result<Option<PublishedIndex>> {
+    ) -> Result<StagedIndex> {
         let dir = staged.path();
         let files = self.data_arc();
         let mut meta = plan.meta.clone();
@@ -510,10 +597,18 @@ impl CollectionStore {
             tombstones: Vec::new(),
         };
         DenseSnapshot::write(dir, &snapshot)?;
-        super::segments::write(dir, meta.segment_slots, meta.next_slot)?;
+        segments::write(dir, meta.segment_slots, meta.next_slot)?;
         meta.save(dir)?;
 
-        Ok(self.remapped_index(plan, dir))
+        let hnsw = match &meta.index {
+            IndexConfig::Hnsw(config) => stage_hnsw_segments(self, dir, &meta, config)?,
+            _ => Vec::new(),
+        };
+        let ivf = match &meta.index {
+            IndexConfig::Ivf(Some(config)) => self.stage_ivf_segments(dir, &meta, config)?,
+            _ => Vec::new(),
+        };
+        Ok(StagedIndex { ivf, hnsw })
     }
 
     /// Publish a validated generation and switch every in-memory file handle
@@ -524,7 +619,7 @@ impl CollectionStore {
         inner: &mut super::StoreInner,
         plan: &CompactionPlan,
         staged: StagedGeneration,
-        remapped: Option<PublishedIndex>,
+        staged_index: StagedIndex,
     ) -> Result<u64> {
         let mut meta = plan.meta.clone();
         meta.slot_capacity = plan.new_capacity;
@@ -538,7 +633,11 @@ impl CollectionStore {
         let staged_files =
             DataFiles::open(staged.path(), &meta, &self.storage, meta.last_applied_txn)?;
         drop(staged_files);
-        let had_index = self.data_arc().index.load().is_some();
+        let old_files_view = self.data_arc();
+        let had_index = old_files_view.index.load().is_some()
+            || !old_files_view.hnsw_segments.load().is_empty()
+            || !old_files_view.ivf_segments.load().is_empty();
+        drop(old_files_view);
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, watermark)?;
         // From here on the disk manifest already names the new generation.
@@ -553,10 +652,11 @@ impl CollectionStore {
         // Reopen from the published path so every handle's path stays valid
         // for later growth and checkpoint writes.
         let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage, watermark)?;
-        if let Some(index) = remapped {
-            new_files.index.store(Arc::new(Some(index)));
-        }
-        let has_new_index = new_files.index.load().is_some();
+        new_files.index.store(Arc::new(None));
+        new_files.ivf_segments.store(Arc::new(staged_index.ivf));
+        new_files.hnsw_segments.store(Arc::new(staged_index.hnsw));
+        let has_new_index =
+            !new_files.hnsw_segments.load().is_empty() || !new_files.ivf_segments.load().is_empty();
         let old_files = self.files.swap(Arc::new(new_files));
         *self.generation.write() = next_generation;
 
@@ -634,75 +734,50 @@ impl CollectionStore {
         Ok(plan.live_count)
     }
 
-    /// Carry the published ANN index across a compaction by renumbering it.
-    ///
-    /// Compaction renumbers live slots densely in their existing order, so a
-    /// surviving point keeps its neighbours and only its id moves. Remapping
-    /// the persisted form and rebuilding the in-memory index from it is
-    /// O(nodes · degree), far cheaper than a full rebuild and keeps the ANN
-    /// tier available throughout compaction.
-    ///
-    /// `None` means there was no usable graph to carry over; the staged
-    /// generation then contains no index files and the maintenance worker
-    /// schedules a rebuild after the swap.
-    fn remapped_index(
+    /// Build one IVF file per completed segment of the staged generation.
+    /// Centroids and assignments are recalculated for the compacted slots, so
+    /// no cross-generation remap is needed.
+    fn stage_ivf_segments(
         &self,
-        plan: &CompactionPlan,
-        target_dir: &Path,
-    ) -> Option<PublishedIndex> {
-        enum Next {
-            Hnsw(crate::index::persist::PersistedHnsw),
-            Ivf(crate::index::persist::PersistedIvf),
+        dir: &Path,
+        meta: &Meta,
+        config: &IvfConfig,
+    ) -> Result<Vec<SegmentIvf>> {
+        let boundary = segments::immutable_end(meta.next_slot, meta.segment_slots);
+        if boundary == 0 {
+            return Ok(Vec::new());
         }
-
-        let next = {
-            let files = self.data_arc();
-            let published = files.index.load();
-            match published.as_ref() {
-                Some(PublishedIndex::Hnsw(index)) => {
-                    if !index.covers_all(plan.map.len()) {
-                        return None;
-                    }
-                    index.to_persisted().remap(&plan.map).map(Next::Hnsw)
-                }
-                Some(PublishedIndex::Ivf(index)) => {
-                    Some(Next::Ivf(index.to_persisted().remap(&plan.map)))
-                }
-                None => None,
-            }
-        };
-
-        match next {
-            Some(Next::Hnsw(remapped)) => {
-                let config = match &plan.meta.index {
-                    IndexConfig::Hnsw(config) => config.clone(),
-                    _ => HnswConfig::default(),
-                };
-                let Ok(mut index) = HnswIndex::from_persisted(remapped.clone(), &config) else {
-                    return None;
-                };
-                index.set_metrics(self.metrics_arc());
-                if let Err(e) = persist::save_hnsw(target_dir, &remapped) {
-                    tracing::warn!(error = %e, "remapped hnsw.bin save failed");
-                    return None;
-                }
-                Some(PublishedIndex::Hnsw(Arc::new(index)))
-            }
-            Some(Next::Ivf(remapped)) => {
-                let config = match &plan.meta.index {
-                    IndexConfig::Ivf(Some(config)) => config.clone(),
-                    _ => Default::default(),
-                };
-                let mut index = IvfIndex::from_persisted(remapped.clone(), config);
-                index.set_metrics(self.metrics_arc());
-                if let Err(e) = persist::save(target_dir, &remapped) {
-                    tracing::warn!(error = %e, "remapped index.bin save failed");
-                    return None;
-                }
-                Some(PublishedIndex::Ivf(Arc::new(index)))
-            }
-            None => None,
+        let vectors = Vectors::open(
+            &dir.join("vectors.bin"),
+            meta.vector_size,
+            meta.segment_slots,
+            meta.slot_capacity,
+        )?;
+        let snapshot = vectors.snapshot();
+        let step = meta.segment_slots.max(1);
+        let mut indexes = Vec::new();
+        for start in (0..boundary).step_by(step as usize) {
+            let end = (start + step).min(boundary);
+            let local: Vec<u32> = (0..end - start).collect();
+            let index = IvfIndex::build(
+                &IndexBuildParams::new(
+                    meta.collection.as_str(),
+                    meta.vector_size,
+                    meta.distance,
+                    &local,
+                    &snapshot,
+                    meta.segment_slots,
+                )
+                .with_slot_base(start),
+                config,
+            )?;
+            persist::save_at(&segment_ivf::file_path(dir, start), &index.to_persisted())?;
+            indexes.push(SegmentIvf {
+                start,
+                end,
+                index: Arc::new(index),
+            });
         }
+        Ok(indexes)
     }
-
 }

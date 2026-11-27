@@ -22,8 +22,8 @@ const TRACKER_HEADER_LEN: usize = 28;
 /// Append-only changes since the last published `tracker.bin`.
 const TRACKER_JOURNAL_FILE: &str = "tracker.journal.bin";
 
-/// One record: version(8) + slot(4) + pointer(12) + crc32(4).
-const JOURNAL_RECORD_LEN: usize = 28;
+/// One record: version(8) + lsn(8) + slot(4) + pointer(12) + crc32(4).
+const JOURNAL_RECORD_LEN: usize = 36;
 const JOURNAL_CRC_LEN: usize = 4;
 
 /// A pointer to a contiguous range of blocks within a data page.
@@ -90,12 +90,25 @@ impl Tracker {
     /// since the last checkpoint, so losing a derived record can never lose
     /// committed data.
     pub fn open(path: &Path, config: &StoreConfig) -> Result<Self> {
+        Self::open_inner(path, config, None)
+    }
+
+    /// Open with journal rollback for a generation whose replay floor is
+    /// already known. Changes newer than the floor are uncheckpointed: the
+    /// compact tracker may contain half of them, so those slots are reset and
+    /// the WAL replay that follows this call restores them exactly.
+    pub fn open_at_floor(path: &Path, config: &StoreConfig, floor: u64) -> Result<Self> {
+        Self::open_inner(path, config, Some(floor))
+    }
+
+    fn open_inner(path: &Path, config: &StoreConfig, floor: Option<u64>) -> Result<Self> {
         let mut tracker = Self::open_base(path, config)?;
         let journal = path.join(TRACKER_JOURNAL_FILE);
         let Ok(data) = std::fs::read(&journal) else {
             return Ok(tracker);
         };
         let mut valid_len = 0usize;
+        let mut rolled_back = Vec::new();
         while valid_len + JOURNAL_RECORD_LEN <= data.len() {
             let record = &data[valid_len..valid_len + JOURNAL_RECORD_LEN];
             let payload = &record[..JOURNAL_RECORD_LEN - JOURNAL_CRC_LEN];
@@ -108,18 +121,25 @@ impl Tracker {
                 break;
             }
             let version = u64::from_le_bytes(payload[0..8].try_into().expect("journal version"));
-            let slot = u32::from_le_bytes(payload[8..12].try_into().expect("journal slot"));
+            let lsn = u64::from_le_bytes(payload[8..16].try_into().expect("journal lsn"));
+            let slot = u32::from_le_bytes(payload[16..20].try_into().expect("journal slot"));
             let pointer = ValuePointer {
-                page_id: u32::from_le_bytes(payload[12..16].try_into().expect("journal page")),
+                page_id: u32::from_le_bytes(payload[20..24].try_into().expect("journal page")),
                 block_offset: u32::from_le_bytes(
-                    payload[16..20].try_into().expect("journal block"),
+                    payload[24..28].try_into().expect("journal block"),
                 ),
-                length: u32::from_le_bytes(payload[20..24].try_into().expect("journal length")),
+                length: u32::from_le_bytes(payload[28..32].try_into().expect("journal length")),
             };
             if version > tracker.version {
                 tracker.set(slot, pointer);
             }
+            if floor.is_some_and(|f| lsn > f) {
+                rolled_back.push(slot);
+            }
             valid_len += JOURNAL_RECORD_LEN;
+        }
+        for slot in rolled_back {
+            tracker.set(slot, ValuePointer::empty());
         }
         if valid_len != data.len() {
             // Drop only the unusable tail before the next append; otherwise a
@@ -161,10 +181,17 @@ impl Tracker {
 
     /// Update a slot and append the change to the journal before it becomes
     /// visible in memory.
-    pub fn set_and_record(&mut self, path: &Path, slot: u32, pointer: ValuePointer) -> Result<()> {
+    pub fn set_and_record(
+        &mut self,
+        path: &Path,
+        slot: u32,
+        pointer: ValuePointer,
+        lsn: u64,
+    ) -> Result<()> {
         let version = self.version.wrapping_add(1);
         let mut record = Vec::with_capacity(JOURNAL_RECORD_LEN);
         record.extend_from_slice(&version.to_le_bytes());
+        record.extend_from_slice(&lsn.to_le_bytes());
         record.extend_from_slice(&slot.to_le_bytes());
         record.extend_from_slice(&pointer.page_id.to_le_bytes());
         record.extend_from_slice(&pointer.block_offset.to_le_bytes());
@@ -341,10 +368,10 @@ mod tests {
         {
             let mut tracker = Tracker::create(dir.path(), &config).unwrap();
             tracker
-                .set_and_record(dir.path(), 0, ValuePointer::new(0, 1, 64))
+                .set_and_record(dir.path(), 0, ValuePointer::new(0, 1, 64), 10)
                 .unwrap();
             tracker
-                .set_and_record(dir.path(), 3, ValuePointer::new(1, 2, 96))
+                .set_and_record(dir.path(), 3, ValuePointer::new(1, 2, 96), 11)
                 .unwrap();
             let mut journal = OpenOptions::new()
                 .append(true)
@@ -359,6 +386,43 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(len, (2 * JOURNAL_RECORD_LEN) as u64);
+    }
+
+    #[test]
+    fn test_journal_rolls_back_slots_newer_than_the_replay_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        {
+            let mut tracker = Tracker::create(dir.path(), &config).unwrap();
+            tracker.set(0, ValuePointer::new(0, 0, 64));
+            tracker.save(dir.path(), &config).unwrap();
+
+            let record = |version: u64, lsn: u64, slot: u32, pointer: ValuePointer| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&version.to_le_bytes());
+                bytes.extend_from_slice(&lsn.to_le_bytes());
+                bytes.extend_from_slice(&slot.to_le_bytes());
+                bytes.extend_from_slice(&pointer.page_id.to_le_bytes());
+                bytes.extend_from_slice(&pointer.block_offset.to_le_bytes());
+                bytes.extend_from_slice(&pointer.length.to_le_bytes());
+                let crc = crc32fast::hash(&bytes);
+                bytes.extend_from_slice(&crc.to_le_bytes());
+                bytes
+            };
+            let mut journal = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(TRACKER_JOURNAL_FILE))
+                .unwrap();
+            journal
+                .write_all(&record(1, 5, 0, ValuePointer::new(0, 2, 64)))
+                .unwrap();
+            journal
+                .write_all(&record(2, 7, 1, ValuePointer::new(1, 0, 96)))
+                .unwrap();
+        }
+        let tracker = Tracker::open_at_floor(dir.path(), &config, 6).unwrap();
+        assert_eq!(tracker.get(0), Some(ValuePointer::new(0, 0, 64)));
+        assert_eq!(tracker.get(1), Some(ValuePointer::empty()));
     }
 
     #[test]

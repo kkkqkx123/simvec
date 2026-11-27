@@ -157,6 +157,9 @@ impl PayloadStore {
     /// a generation has published an lsn the log may no longer carry those
     /// bytes, so the same damage stays `CorruptData`.
     pub fn open_with_repair(path: &Path, replay_floor: u64, config: StoreConfig) -> Result<Self> {
+        if replay_floor > 0 {
+            return Self::open_at(path, config, replay_floor);
+        }
         match Self::open(path) {
             Ok(store) => Ok(store),
             Err(err) if replay_floor == 0 => {
@@ -176,6 +179,14 @@ impl PayloadStore {
 
     /// Open an existing payload store at `path`.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    fn open_at(path: &Path, _config: StoreConfig, replay_floor: u64) -> Result<Self> {
+        Self::open_inner(path, Some(replay_floor))
+    }
+
+    fn open_inner(path: &Path, replay_floor: Option<u64>) -> Result<Self> {
         let config_path = path.join("config.json");
         let config_json = std::fs::read_to_string(&config_path)
             .map_err(|e| VectorSearchError::CorruptData(format!("cannot read config.json: {e}")))?;
@@ -184,7 +195,10 @@ impl PayloadStore {
         })?;
         config.validate()?;
 
-        let tracker = Tracker::open(path, &config)?;
+        let tracker = match replay_floor {
+            Some(floor) => Tracker::open_at_floor(path, &config, floor)?,
+            None => Tracker::open(path, &config)?,
+        };
         let pages = Pages::open(path, &config)?;
         // Unlike the in-memory tracker, on-disk pointers have no WAL attached
         // at this point: if a checkpoint already truncated the log, a pointer
@@ -273,6 +287,10 @@ impl PayloadStore {
     /// `write_value` serialize their own mutations through the inner page map,
     /// so a payload write never blocks a reader inspecting another page.
     pub fn put(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
+        self.put_at(slot, payload, 0)
+    }
+
+    pub(super) fn put_at(&self, slot: u32, payload: Option<&Payload>, lsn: u64) -> Result<()> {
         let stored = match payload {
             Some(p) => {
                 let bytes = serde_json::to_vec(p)?;
@@ -311,7 +329,7 @@ impl PayloadStore {
         }
 
         if stored.is_empty() {
-            tracker.set_and_record(&self.base_path, slot, ValuePointer::empty())?;
+            tracker.set_and_record(&self.base_path, slot, ValuePointer::empty(), lsn)?;
             return Ok(());
         }
 
@@ -330,7 +348,7 @@ impl PayloadStore {
         // The full table is still published only at checkpoint; the journal
         // records this change so a later open can recover it without waiting
         // for WAL replay to touch the slot again.
-        tracker.set_and_record(&self.base_path, slot, pointer)?;
+        tracker.set_and_record(&self.base_path, slot, pointer, lsn)?;
 
         Ok(())
     }
@@ -366,6 +384,10 @@ impl PayloadStore {
 
     /// Delete specific keys from a slot's payload.
     pub fn delete_keys(&self, slot: u32, keys: &[&str]) -> Result<()> {
+        self.delete_keys_at(slot, keys, 0)
+    }
+
+    pub(super) fn delete_keys_at(&self, slot: u32, keys: &[&str], lsn: u64) -> Result<()> {
         let mut current = match self.get(slot)? {
             Some(p) => p,
             None => return Ok(()),
@@ -373,7 +395,7 @@ impl PayloadStore {
         for key in keys {
             current.remove(*key);
         }
-        self.put(slot, Some(&current))
+        self.put_at(slot, Some(&current), lsn)
     }
 
     /// Merge a partial payload into a slot's payload (merge semantics):
@@ -387,11 +409,18 @@ impl PayloadStore {
     where
         I: IntoIterator<Item = (String, serde_json::Value)>,
     {
+        self.merge_at(slot, partial, 0)
+    }
+
+    pub(super) fn merge_at<I>(&self, slot: u32, partial: I, lsn: u64) -> Result<()>
+    where
+        I: IntoIterator<Item = (String, serde_json::Value)>,
+    {
         let mut merged = self.get(slot)?.unwrap_or_default();
         for (key, value) in partial {
             merged.insert(key, value);
         }
-        self.put(slot, Some(&merged))
+        self.put_at(slot, Some(&merged), lsn)
     }
 
     /// Compact the store: rebuild it with only the live slots specified

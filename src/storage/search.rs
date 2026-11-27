@@ -16,6 +16,8 @@ use bitvec::prelude::*;
 
 use super::directory::DirView;
 use super::index_lifecycle::PublishedIndex;
+use super::segment_hnsw::SegmentHnsw;
+use super::segment_ivf;
 use super::{CollectionStore, PayloadStore, TombstoneBits};
 use crate::error::{Result, VectorSearchError};
 use crate::metrics::SearchPath;
@@ -43,6 +45,8 @@ struct SearchSnapshot<'a> {
     /// duration so a concurrent compaction cannot swap the store (and renumber
     /// slots) while we are reading payloads.
     payload_view: Option<&'a PayloadStore>,
+    hnsw_segments: &'a [SegmentHnsw],
+    ivf_segments: &'a [segment_ivf::SegmentIvf],
 }
 
 impl CollectionStore {
@@ -81,6 +85,8 @@ impl CollectionStore {
             published,
             filter_mask,
             pending,
+            hnsw_segments,
+            ivf_segments,
         ) = {
             let inner = self.inner.read();
             if query.primary_vector().len() != inner.meta.vector_size {
@@ -111,6 +117,8 @@ impl CollectionStore {
                 data.index.load(),
                 mask,
                 self.pending.lock().clone(),
+                data.hnsw_segments.load(),
+                data.ivf_segments.load(),
             )
         };
         // Same generation guard as the vectors/keys/tombstones above.
@@ -125,7 +133,28 @@ impl CollectionStore {
             keysnap: &keysnap,
             filter_mask: filter_mask.as_ref(),
             payload_view,
+            hnsw_segments: &hnsw_segments,
+            ivf_segments: &ivf_segments,
         };
+        if !snap.hnsw_segments.is_empty() {
+            let selective = snap.filter_mask.as_ref().is_some_and(|m| {
+                m.count_ones() <= snap.hnsw_segments[0].index.default_ef()
+            });
+            let results = if selective {
+                self.search_exact(query, &snap, metric, next_slot, filtered, started)
+            } else {
+                self.search_segmented_hnsw(query, &snap, &pending, started)
+            };
+            drop(published);
+            return results;
+        }
+        if !snap.ivf_segments.is_empty() {
+            let results = self.search_segmented_ivf(query, &snap, &pending);
+            self.metrics
+                .record_search(SearchPath::Ivf, filtered, started.elapsed());
+            drop(published);
+            return results;
+        }
         match published.as_ref() {
             Some(PublishedIndex::Ivf(index)) => {
                 let results = self.search_ivf(index.as_ref(), query, &snap, &pending);

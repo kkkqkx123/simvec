@@ -35,6 +35,7 @@ const QUANT_MAGIC: [u8; 4] = *b"VQMT";
 const QUANT_VERSION: u16 = 1;
 const QUANT_FILE: &str = "quant.bin";
 const QUANT_META_FILE: &str = "quant_meta.bin";
+const QUANT_SEGMENT_PREFIX: &str = "quant_seg_";
 
 /// Serialized quantization metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +305,72 @@ impl QuantStore {
         Ok(())
     }
 
+    /// Write the codes for one segment to its own file. Slot ids inside the
+    /// file are local; vectors are read from `slot_base..slot_base + count`.
+    /// The file is sized for the whole segment so later appends in that range
+    /// are safe without relocating the mapping.
+    pub fn write_segment_file(
+        &self,
+        path: &Path,
+        vectors: &[Arc<Mmap>],
+        segment_slots: u32,
+        slot_base: u32,
+        count: u32,
+    ) -> Result<bool> {
+        if !self.is_ready() {
+            return Ok(false);
+        }
+        let total = segment_bytes(self.bytes_per_vector, segment_slots);
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.set_len(total)?;
+        for local in 0..count {
+            let global = slot_base + local;
+            let Some(vector) = crate::storage::vectors::Vectors::read_slot(
+                vectors,
+                global as u64,
+                segment_slots,
+                self.dim,
+            ) else {
+                continue;
+            };
+            let code = self.encode(vector)?;
+            if code.len() != self.bytes_per_vector {
+                return Err(VectorSearchError::Internal(format!(
+                    "quant code length {} != expected {}",
+                    code.len(),
+                    self.bytes_per_vector
+                )));
+            }
+            write_at(&file, &code, local as u64 * self.bytes_per_vector as u64)?;
+        }
+        file.sync_all()?;
+        Ok(true)
+    }
+
+    /// Map one segment's code file as a single-segment snapshot.
+    pub fn load_segment_file(
+        path: &Path,
+        segment_slots: u32,
+        bytes_per_vector: usize,
+    ) -> Result<Option<Arc<Vec<Arc<Mmap>>>>> {
+        if bytes_per_vector == 0 || !path.exists() {
+            return Ok(None);
+        }
+        let file = File::options().read(true).open(path)?;
+        let expected = segment_bytes(bytes_per_vector, segment_slots);
+        if file.metadata()?.len() < expected {
+            let _ = std::fs::remove_file(path);
+            return Ok(None);
+        }
+        let mmap = unsafe { MmapOptions::new().len(expected as usize).map(&file)? };
+        Ok(Some(Arc::new(vec![Arc::new(mmap)])))
+    }
+
     /// Read quantized code for a slot from snapshot.
     pub fn read_slot(
         snapshot: &[Arc<Mmap>],
@@ -324,6 +391,17 @@ impl QuantStore {
         }
         Some(&seg[offset..end])
     }
+}
+
+/// File holding quantized codes for the segment starting at `start`.
+pub(crate) fn segment_file_path(dir: &Path, start: u32) -> PathBuf {
+    dir.join(format!("{QUANT_SEGMENT_PREFIX}{start:010}.bin"))
+}
+
+pub(crate) fn is_segment_file(name: &str) -> bool {
+    name.strip_prefix(QUANT_SEGMENT_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".bin"))
+        .is_some_and(|digits| digits.len() == 10 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn segment_bytes(bytes_per_vector: usize, segment_slots: u32) -> u64 {

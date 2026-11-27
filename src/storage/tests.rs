@@ -710,6 +710,111 @@ fn test_appendable_segment_stays_exact_until_promoted() {
     assert_eq!(hits.len(), 7, "exact tail must stay searchable");
 }
 
+/// A corrupt segment graph only removes acceleration for that segment.
+#[test]
+fn test_segment_graph_corruption_is_isolated() {
+    use crate::types::{IndexType, SearchQuery};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_seg_iso");
+    let cfg = config(2).with_index_type(IndexType::HNSW);
+    {
+        let store =
+            CollectionStore::create_with_segment_slots(&store_dir, "col_seg_iso", &cfg, 4).unwrap();
+        for id in 0..9u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+        }
+        store.build_index().unwrap();
+        assert!(store.has_index());
+        let data = store.data_dir();
+        std::fs::write(super::segment_hnsw::file_path(&data, 0), b"broken").unwrap();
+    }
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert!(reopened.has_index(), "the intact segment still has a graph");
+    let hits = reopened
+        .search(&SearchQuery::new(vec![0.0, 1.0], 9))
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        9,
+        "the corrupt segment falls back to exact scan"
+    );
+}
+
+/// Per-segment IVF files are independent derived artifacts.
+#[test]
+fn test_segment_ivf_corruption_is_isolated() {
+    use crate::types::{IvfConfig, SearchQuery};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_seg_ivf_iso");
+    let cfg = config(2).with_ivf(IvfConfig {
+        min_build_points: 1,
+        ..IvfConfig::default()
+    });
+    {
+        let store =
+            CollectionStore::create_with_segment_slots(&store_dir, "col_seg_ivf_iso", &cfg, 4)
+                .unwrap();
+        for id in 0..9u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+        }
+        store.build_index().unwrap();
+        assert!(store.has_index());
+        let data = store.data_dir();
+        std::fs::write(super::segment_ivf::file_path(&data, 4), b"broken").unwrap();
+    }
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert!(reopened.has_index(), "the intact segment still has an IVF index");
+    let hits = reopened
+        .search(&SearchQuery::new(vec![0.0, 1.0], 9))
+        .unwrap();
+    assert_eq!(hits.len(), 9, "the corrupt segment falls back to exact scan");
+}
+
+/// Quantization codes are published with the segment graph.
+#[test]
+fn test_segment_quant_file_travels_with_the_graph() {
+    use crate::types::QuantizationConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_seg_quant");
+    let cfg = config(2).with_quantization(QuantizationConfig::scalar(0.99));
+    {
+        let store =
+            CollectionStore::create_with_segment_slots(&store_dir, "col_seg_quant", &cfg, 4)
+                .unwrap();
+        for id in 0..8u64 {
+            upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+        }
+        store.build_index().unwrap();
+        assert!(super::quant::segment_file_path(&store.data_dir(), 0).exists());
+    }
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    let segments = reopened.data_arc().hnsw_segments.load();
+    assert!(segments[0].quant.is_some(), "segment codes rehydrated");
+}
+
+/// Segment-local repair rebuilds only the affected graph.
+#[test]
+fn test_segment_hnsw_repair_rebuilds_affected_graph() {
+    use crate::types::IndexType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_seg_repair");
+    let cfg = config(2).with_index_type(IndexType::HNSW);
+    let store =
+        CollectionStore::create_with_segment_slots(&store_dir, "col_seg_repair", &cfg, 4).unwrap();
+    for id in 0..8u64 {
+        upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+    }
+    store.build_index().unwrap();
+    delete_logged(&store, &PointId::Num(1));
+
+    assert!(store.repair_hnsw().unwrap() > 0);
+    assert!(store.get(&PointId::Num(1)).unwrap().is_none());
+}
+
 /// A graph with no tombstone must not be walked: the repair reports no work
 /// and leaves the published structure untouched.
 #[test]

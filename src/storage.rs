@@ -46,6 +46,8 @@ pub(crate) mod quant;
 mod queue;
 mod segments;
 mod search;
+mod segment_hnsw;
+mod segment_ivf;
 pub(crate) mod snapshot;
 mod tombstones;
 pub(crate) mod vectors;
@@ -278,6 +280,10 @@ pub(super) struct DataFiles {
     payload_store: ArcSwap<Option<PayloadStore>>,
     quant: RwLock<Option<QuantStore>>,
     index: ArcSwap<Option<PublishedIndex>>,
+    /// One HNSW graph per completed dense segment.
+    hnsw_segments: ArcSwap<Vec<segment_hnsw::SegmentHnsw>>,
+    /// One IVF index per completed dense segment.
+    ivf_segments: ArcSwap<Vec<segment_ivf::SegmentIvf>>,
     /// Frozen/appendable boundary of this generation's segment set.
     segments: ArcSwap<segments::SegmentSet>,
 }
@@ -329,6 +335,8 @@ impl DataFiles {
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: RwLock::new(quant),
             index: ArcSwap::from(Arc::new(None)),
+            hnsw_segments: ArcSwap::from(Arc::new(Vec::new())),
+            ivf_segments: ArcSwap::from(Arc::new(Vec::new())),
             segments: ArcSwap::from(Arc::new(segments)),
         })
     }

@@ -40,11 +40,17 @@ impl HnswIndex {
         let insert_one = |index: &Self, slot: u32| {
             if let Some(v) = Vectors::read_slot(
                 params.vectors,
-                slot as u64,
+                (slot + params.slot_base) as u64,
                 params.segment_slots,
                 params.dim,
             ) {
-                index.insert(slot, v, params.vectors, params.segment_slots);
+                index.insert(
+                    slot,
+                    v,
+                    params.vectors,
+                    params.segment_slots,
+                    params.slot_base,
+                );
             }
             if let Some(progress) = params.progress {
                 let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -126,13 +132,16 @@ impl HnswIndex {
         vector: &[f32],
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
+        slot_base: u32,
     ) {
         if self.node(slot).is_some() {
             self.overwrites_since_build.fetch_add(1, Ordering::Relaxed);
             // Track the distance delta: how far the new vector is from the
             // old one. A large delta means the node's graph position is more
             // likely stale.
-            if let Some(old_v) = Vectors::read_slot(vectors, slot as u64, segment_slots, self.dim) {
+            if let Some(old_v) =
+                Vectors::read_slot(vectors, (slot + slot_base) as u64, segment_slots, self.dim)
+            {
                 let delta = (self.distance(vector, old_v) * 1e6) as u64;
                 self.overwrites_distance_delta
                     .fetch_add(delta, Ordering::Relaxed);
@@ -168,7 +177,12 @@ impl HnswIndex {
             return;
         };
 
-        let entry_vec = Vectors::read_slot(vectors, entry.slot as u64, segment_slots, self.dim);
+        let entry_vec = Vectors::read_slot(
+            vectors,
+            (entry.slot + slot_base) as u64,
+            segment_slots,
+            self.dim,
+        );
         let mut ep = match entry_vec {
             Some(ev) => vec![Cand {
                 dist: self.distance(vector, ev),
@@ -183,7 +197,7 @@ impl HnswIndex {
             let Some(&start) = ep.first() else {
                 return;
             };
-            let best = self.greedy_step(vector, start, lc, vectors, segment_slots, None);
+            let best = self.greedy_step(vector, start, lc, vectors, segment_slots, None, slot_base);
             ep = vec![best];
             lc -= 1;
         }
@@ -199,17 +213,31 @@ impl HnswIndex {
                     tombstones: None,
                     vectors,
                     segment_slots,
+                    slot_base,
                     filter_mask: None,
                     quant: None,
                 },
             );
-            let selected =
-                self.select_neighbors(&result.live, self.layer_cap(layer), vectors, segment_slots);
+            let selected = self.select_neighbors(
+                &result.live,
+                self.layer_cap(layer),
+                vectors,
+                segment_slots,
+                slot_base,
+            );
             *timed_write_lock(self.lock_metrics.as_deref(), node.layer(layer)) =
                 selected.iter().map(|c| c.slot).collect();
             node.bump_version();
             for cand in &selected {
-                self.link_neighbor(cand.slot, slot, cand.dist, layer, vectors, segment_slots);
+                self.link_neighbor(
+                    cand.slot,
+                    slot,
+                    cand.dist,
+                    layer,
+                    vectors,
+                    segment_slots,
+                    slot_base,
+                );
             }
             ep = result.live;
         }
@@ -238,9 +266,10 @@ impl HnswIndex {
         lm: usize,
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
+        slot_base: u32,
     ) -> Vec<Cand> {
         let mut out = Vec::with_capacity(lm);
-        self.select_neighbors_into(candidates, lm, vectors, segment_slots, &mut out);
+        self.select_neighbors_into(candidates, lm, vectors, segment_slots, slot_base, &mut out);
         out
     }
 
@@ -254,6 +283,7 @@ impl HnswIndex {
         lm: usize,
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
+        slot_base: u32,
         out: &mut Vec<Cand>,
     ) {
         SELECT_SCRATCH.with(|scratch| {
@@ -276,9 +306,12 @@ impl HnswIndex {
                 if out.len() == lm {
                     break;
                 }
-                let Some(cv) =
-                    Vectors::read_slot(vectors, cand.slot as u64, segment_slots, self.dim)
-                else {
+                let Some(cv) = Vectors::read_slot(
+                    vectors,
+                    (cand.slot + slot_base) as u64,
+                    segment_slots,
+                    self.dim,
+                ) else {
                     continue;
                 };
                 // Pairwise checks stay sequential: the fan-out is at most `lm`
@@ -289,9 +322,12 @@ impl HnswIndex {
                 // the multi-worker build path, not this inner loop.
                 let mut closer = true;
                 for s in out.iter() {
-                    let Some(rv) =
-                        Vectors::read_slot(vectors, s.slot as u64, segment_slots, self.dim)
-                    else {
+                    let Some(rv) = Vectors::read_slot(
+                        vectors,
+                        (s.slot + slot_base) as u64,
+                        segment_slots,
+                        self.dim,
+                    ) else {
                         closer = false;
                         break;
                     };
@@ -330,6 +366,7 @@ impl HnswIndex {
         layer: u8,
         vectors: &[Arc<memmap2::Mmap>],
         segment_slots: u32,
+        slot_base: u32,
     ) {
         let Some(node) = self.node(neighbor) else {
             return;
@@ -352,7 +389,12 @@ impl HnswIndex {
         // and the adjacency list is rewritten in place (it was full, so the
         // reselected set fits), which removes every per-overflow allocation
         // from this hot path.
-        let Some(nv) = Vectors::read_slot(vectors, neighbor as u64, segment_slots, self.dim) else {
+        let Some(nv) = Vectors::read_slot(
+            vectors,
+            (neighbor + slot_base) as u64,
+            segment_slots,
+            self.dim,
+        ) else {
             return;
         };
         LINK_SCRATCH.with(|link_cell| {
@@ -360,7 +402,8 @@ impl HnswIndex {
             let HnswLinkScratch { pool, selected } = &mut *link;
             pool.clear();
             pool.extend(adj.iter().filter_map(|&s| {
-                let v = Vectors::read_slot(vectors, s as u64, segment_slots, self.dim)?;
+                let v =
+                    Vectors::read_slot(vectors, (s + slot_base) as u64, segment_slots, self.dim)?;
                 Some(Cand {
                     dist: self.distance(nv, v),
                     slot: s,
@@ -370,7 +413,14 @@ impl HnswIndex {
                 dist: dist_to_neighbor,
                 slot,
             });
-            self.select_neighbors_into(pool.as_slice(), lm, vectors, segment_slots, selected);
+            self.select_neighbors_into(
+                pool.as_slice(),
+                lm,
+                vectors,
+                segment_slots,
+                slot_base,
+                selected,
+            );
             adj.clear();
             adj.extend(selected.iter().map(|c| c.slot));
         });
