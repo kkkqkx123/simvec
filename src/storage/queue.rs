@@ -3,23 +3,32 @@
 //! [`CollectionStore::apply_txn`](super::CollectionStore::apply_txn) is split
 //! into four steps so that the store write lock never covers an fsync:
 //!
-//! 1. **reserve** — one short `inner.write()` critical section assigns the
-//!    lsn, resolves the slot for every upsert and pushes the ticket;
-//! 2. **flush** — the worker drains the whole backlog into one WAL batch, so
-//!    concurrent writers share a single fsync (real group commit);
+//! 1. **reserve** — one short `inner.write()` critical section records the
+//!    new ids as a presence set and pushes the ticket (no LSN, no slot
+//!    number — both are assigned later in log order);
+//! 2. **flush** — the worker drains the whole backlog, assigns contiguous
+//!    LSNs in queue order under one short `inner.write()`, then appends the
+//!    batch to the WAL, so concurrent writers share a single fsync (real
+//!    group commit);
 //! 3. **apply** — the same worker applies the batch in lsn order under a short
 //!    `inner.write()`;
 //! 4. **complete** — the worker settles the ticket and wakes its caller.
 //!
-//! Two invariants depend on this shape:
+//! Three invariants depend on this shape:
 //!
-//! - **log order ≡ apply order.** The lsn, the slot reservations and the queue
-//!   position are decided in the same critical section, and the worker applies
-//!   strictly in lsn order. Replay walks the log in that same order, so the
-//!   slot numbers a reopened store rebuilds are identical to the live ones.
-//! - **apply after durable.** A batch is applied only once its fsync returned.
-//!   A failed batch is rolled back by the WAL and none of its transactions is
-//!   applied, so nothing exists in memory that the log could not restore.
+//! - **log order ≡ apply order ≡ reserve order.** Queue position is fixed at
+//!   reserve time; LSNs and slots are assigned in that same order at flush
+//!   and apply time. Replay walks the log in that order, so the slot numbers
+//!   a reopened store rebuilds are identical to the live ones by construction.
+//! - **no LSN holes.** The worker is the only bulk LSN assigner; a failed
+//!   batch rolls `next_lsn` back to the batch start (no checkpoint marker can
+//!   race it — markers are allocated under the queue gate or through this
+//!   same queue). Segment-name continuity (`next == prev_last + 1`) stays
+//!   sound because holes cannot occur.
+//! - **apply after durable.** A batch is applied only once its flush returned.
+//!   A failed batch is rolled back by the WAL, its LSNs are returned and its
+//!   reservations are cleared, so nothing exists in memory that the log could
+//!   not restore.
 //!
 //! One worker thread per collection, created on the first transaction. It is
 //! the only applier, which is what keeps the ordering invariant trivially
@@ -92,9 +101,10 @@ impl Completion {
 }
 
 /// One queued transaction: its lsn, its ops and the caller waiting on it.
-struct Ticket {
-    lsn: u64,
-    ops: Vec<WalRecord>,
+/// One queued transaction: its ops and the caller waiting on it. The LSN is
+/// assigned by the worker at flush time, in queue order.
+pub(super) struct Ticket {
+    pub(super) ops: Vec<WalRecord>,
     completion: Arc<Completion>,
 }
 
@@ -237,13 +247,12 @@ impl CommitQueue {
 
     /// Queue one transaction and return its completion slot.
     ///
-    /// The caller must hold the store write lock: the lsn and the queue
-    /// position have to be decided together with the slot reservations, or
-    /// the log order could disagree with the apply order.
+    /// The caller must hold the store write lock: the id reservations and the
+    /// queue position are decided together, so the worker's later LSN
+    /// assignment (in queue order) agrees with the reservation order.
     pub(crate) fn enqueue(
         queue: &Arc<Self>,
         store: &Weak<CollectionStore>,
-        lsn: u64,
         ops: Vec<WalRecord>,
     ) -> Result<Arc<Completion>> {
         let completion = Arc::new(Completion::new());
@@ -254,7 +263,6 @@ impl CommitQueue {
             ));
         }
         state.queue.push_back(Ticket {
-            lsn,
             ops,
             completion: Arc::clone(&completion),
         });
@@ -300,16 +308,25 @@ impl CommitQueue {
         }
     }
 
-    /// Flush `batch` with one WAL fsync, then apply it in lsn order.
+    /// Assign LSNs, flush `batch` with one WAL fsync, then apply it in order.
+    ///
+    /// LSNs are assigned here — in queue order, under one short write lock —
+    /// so reserve order and log order always agree. A failed batch rolls the
+    /// assignment back and clears its reservations: no holes, no residue.
     fn run_batch(&self, store: &CollectionStore, batch: Vec<Ticket>) {
         store.metrics().record_apply_queue_depth(batch.len() as u64);
+        let base = store.assign_batch_lsns(batch.len() as u64);
         let logged: Vec<(u64, &[WalRecord])> = batch
             .iter()
-            .map(|ticket| (ticket.lsn, ticket.ops.as_slice()))
+            .enumerate()
+            .map(|(index, ticket)| (base + index as u64, ticket.ops.as_slice()))
             .collect();
         if let Err(e) = store.wal().append_batch(&logged) {
             // Nothing in a batch that is not durable may be applied: it would
-            // exist in memory while the log could not restore it.
+            // exist in memory while the log could not restore it. Roll back
+            // the LSN assignment and drop the batch's reservations so live
+            // state and replay agree on every later transaction.
+            store.abort_unlogged_batch(base, &batch);
             let message = format!("wal group commit failed: {e}");
             for ticket in &batch {
                 self.settle(&ticket.completion, Err(internal(&message)));
@@ -317,8 +334,8 @@ impl CommitQueue {
             return;
         }
         store.metrics().record_wal_flush(batch.len());
-        for ticket in &batch {
-            let outcome = store.apply_queued_txn(ticket.lsn, &ticket.ops);
+        for (index, ticket) in batch.iter().enumerate() {
+            let outcome = store.apply_queued_txn(base + index as u64, &ticket.ops);
             let failure = outcome.as_ref().err().map(|e| e.to_string());
             self.settle(&ticket.completion, outcome);
             if let Some(message) = failure {

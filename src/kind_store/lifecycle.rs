@@ -461,8 +461,11 @@ impl KindStore {
                         }
                     }
                 }
-                WalRecord::SetPayload { slot, payload } => {
-                    if let Some(Some(point)) = inner.points.get_mut(*slot as usize) {
+                WalRecord::SetPayload { point_id, payload } => {
+                    let Some(slot) = inner.reverse.get_str(point_id) else {
+                        continue;
+                    };
+                    if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         let payload = payload
                             .as_ref()
                             .map(|p| serde_json::from_str(p))
@@ -470,8 +473,11 @@ impl KindStore {
                         point.replace_payload(payload);
                     }
                 }
-                WalRecord::DeletePayloadKeys { slot, keys } => {
-                    if let Some(Some(point)) = inner.points.get_mut(*slot as usize) {
+                WalRecord::DeletePayloadKeys { point_id, keys } => {
+                    let Some(slot) = inner.reverse.get_str(point_id) else {
+                        continue;
+                    };
+                    if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         if let Some(payload) = &mut point.payload {
                             for key in keys {
                                 payload.remove(key);
@@ -480,8 +486,15 @@ impl KindStore {
                         point.touch_payload();
                     }
                 }
-                WalRecord::SetPayloadField { slot, key, value } => {
-                    if let Some(Some(point)) = inner.points.get_mut(*slot as usize) {
+                WalRecord::SetPayloadField {
+                    point_id,
+                    key,
+                    value,
+                } => {
+                    let Some(slot) = inner.reverse.get_str(point_id) else {
+                        continue;
+                    };
+                    if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         let payload = point.payload.get_or_insert_with(Default::default);
                         let value: serde_json::Value = serde_json::from_str(value)?;
                         payload.insert(key.clone(), value);

@@ -22,15 +22,17 @@ fn stale_for_id(inner: &StoreInner, id: &PointId, lsn: u64) -> bool {
 impl CollectionStore {
     /// Apply a WAL-backed transaction.
     ///
-    /// Four steps, of which only two hold the store write lock:
+    /// Four steps, of which only the reserve and apply hold the store write
+    /// lock (never across an fsync):
     ///
     /// 1. **reserve** — validate every op (no invalid data may be logged) and
-    ///    resolve the slot for every upsert, in one short `inner.write()`
-    ///    critical section that also assigns the lsn and the queue position;
-    /// 2. **flush** — the commit-queue worker drains the whole backlog into
-    ///    one WAL batch, so concurrent writers share a single fsync;
+    ///    record new ids in the reservation set, in one short `inner.write()`
+    ///    critical section that also fixes the queue position;
+    /// 2. **flush** — the commit-queue worker assigns contiguous LSNs in
+    ///    queue order and drains the whole backlog into one WAL batch, so
+    ///    concurrent writers share a single fsync;
     /// 3. **apply** — the same worker applies the batch in lsn order under a
-    ///    short `inner.write()`;
+    ///    short `inner.write()`, assigning slot numbers in that same order;
     /// 4. **complete** — the worker settles the ticket and wakes this caller.
     ///
     /// Nothing is applied before its record is durable, and the call returns
@@ -57,10 +59,17 @@ impl CollectionStore {
                     } => {
                         self.validate_payload_len(json.len())?;
                     }
-                    WalRecord::SetPayloadField { slot, key, value } => {
+                    WalRecord::SetPayloadField {
+                        point_id, key, value,
+                    } => {
                         // Merging grows the existing payload; the merged shape
-                        // is what has to fit, not just the new value.
-                        let mut merged = self.read_payload_at(*slot)?.unwrap_or_default();
+                        // is what has to fit, not just the new value. The id is
+                        // resolved exactly like the apply path will resolve it.
+                        let mut merged = self
+                            .payload_slot_of(&PointId::from(point_id.as_str()))
+                            .and_then(|slot| self.read_payload_at(slot).ok())
+                            .flatten()
+                            .unwrap_or_default();
                         merged.insert(key.clone(), serde_json::from_str(value)?);
                         self.validate_payload_size(Some(&merged))?;
                     }
@@ -78,12 +87,10 @@ impl CollectionStore {
             let mut inner = self.inner.write();
             validate_admission_locked(&inner, ops)?;
             self.reserve_slots_locked(&mut inner, ops);
-            let lsn = inner.next_lsn;
-            inner.next_lsn = lsn + 1;
-            // The lsn, the slot reservations and the queue position are fixed
-            // in this one critical section: together they are the log order,
-            // and the worker applies in exactly that order.
-            CommitQueue::enqueue(&self.queue, &self.self_weak, lsn, ops.to_vec())?
+            // The id reservations and the queue position are fixed in this
+            // one critical section: together they are the log order. The
+            // worker assigns LSNs and slot numbers later, in that same order.
+            CommitQueue::enqueue(&self.queue, &self.self_weak, ops.to_vec())?
         };
         drop(permit);
         let outcome = completion.wait(APPLY_WAIT_TIMEOUT);
@@ -131,27 +138,64 @@ impl CollectionStore {
         Ok(())
     }
 
-    /// Reserve a slot for every upsert of a not-yet-applied id.
+    /// Reserve every upsert of a not-yet-applied id.
     ///
-    /// Reservations are pure in-memory bookkeeping: nothing durable is
-    /// written here, so a reservation that never becomes a committed
+    /// Reservations are pure in-memory presence bookkeeping: nothing durable
+    /// is written here, so a reservation that never becomes a committed
     /// transaction leaves no trace on disk. They exist so that two concurrent
     /// transactions upserting the same new id agree on one slot, and so that
-    /// `max_points` admission stays exact before anything is logged.
+    /// `max_points` admission stays exact before anything is logged. Slot
+    /// numbers are deliberately not assigned here: they are assigned at apply
+    /// time in log order, which is the only numbering live and replay can
+    /// both derive.
     pub(super) fn reserve_slots_locked(&self, inner: &mut StoreInner, ops: &[WalRecord]) {
         for op in ops {
             let WalRecord::Upsert { point } = op else {
                 continue;
             };
             let id = PointId::from(point.id.as_str());
-            if inner.reverse.contains_key(&id) || inner.reserved.contains_key(&id) {
+            if inner.reverse.contains_key(&id) || inner.reserved.contains_id(&id) {
                 continue;
             }
-            // Slots above the applied water mark are taken one per in-flight
-            // reservation, so the reserved numbers are exactly the ones replay
-            // assigns when it walks the same log order.
-            let slot = (inner.meta.next_slot + inner.reserved.len() as u64) as u32;
-            inner.reserved.insert(&id, slot);
+            inner.reserved.insert_value(&id, ());
+        }
+    }
+
+    /// Assign contiguous LSNs for one flushed batch, in queue order. The only
+    /// bulk assigner is the commit-queue worker, so the assignment is dense
+    /// by construction.
+    pub(super) fn assign_batch_lsns(&self, count: u64) -> u64 {
+        let mut inner = self.inner.write();
+        let base = inner.next_lsn;
+        inner.next_lsn += count;
+        base
+    }
+
+    /// Roll back a batch whose WAL append failed: return its LSNs and drop
+    /// its reservations. Safe because the worker is the only bulk assigner
+    /// and no marker can be allocated concurrently with a flushed batch.
+    pub(super) fn abort_unlogged_batch(
+        &self,
+        base: u64,
+        batch: &[super::queue::Ticket],
+    ) {
+        let mut inner = self.inner.write();
+        if inner.next_lsn == base + batch.len() as u64 {
+            inner.next_lsn = base;
+        } else {
+            debug_assert!(
+                false,
+                "wal batch abort raced an lsn assignment; holes are not allowed"
+            );
+        }
+        for ticket in batch {
+            for op in &ticket.ops {
+                if let WalRecord::Upsert { point } = op {
+                    inner
+                        .reserved
+                        .remove_value(&PointId::from(point.id.as_str()));
+                }
+            }
         }
     }
 
@@ -210,24 +254,40 @@ impl CollectionStore {
                         touched.push(id);
                     }
                 }
-                WalRecord::SetPayload { slot, payload } => {
+                WalRecord::SetPayload { point_id, payload } => {
+                    // Payload ops resolve the id exactly like the reserve-time
+                    // validation did; a missing or tombstoned id is a no-op so
+                    // replay and live can never disagree on a slot.
+                    let Some(slot) = self.payload_slot_of_locked(inner, point_id) else {
+                        continue;
+                    };
                     let parsed = match payload {
                         Some(s) => Some(serde_json::from_str::<Payload>(s)?),
                         None => None,
                     };
-                    self.write_payload_at(*slot, parsed.as_ref(), lsn)?;
-                    self.refresh_filter_bitmap_locked(inner, *slot);
+                    self.write_payload_at(slot, parsed.as_ref(), lsn)?;
+                    self.refresh_filter_bitmap_locked(inner, slot);
                 }
-                WalRecord::DeletePayloadKeys { slot, keys } => {
+                WalRecord::DeletePayloadKeys { point_id, keys } => {
+                    let Some(slot) = self.payload_slot_of_locked(inner, point_id) else {
+                        continue;
+                    };
                     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                    self.delete_keys_at(*slot, &key_refs, lsn)?;
-                    self.refresh_filter_bitmap_locked(inner, *slot);
+                    self.delete_keys_at(slot, &key_refs, lsn)?;
+                    self.refresh_filter_bitmap_locked(inner, slot);
                 }
-                WalRecord::SetPayloadField { slot, key, value } => {
+                WalRecord::SetPayloadField {
+                    point_id,
+                    key,
+                    value,
+                } => {
+                    let Some(slot) = self.payload_slot_of_locked(inner, point_id) else {
+                        continue;
+                    };
                     let parsed: serde_json::Value = serde_json::from_str(value)?;
                     let partial = Payload::from([(key.clone(), parsed)]);
-                    self.merge_payload_at(*slot, &partial, lsn)?;
-                    self.refresh_filter_bitmap_locked(inner, *slot);
+                    self.merge_payload_at(slot, &partial, lsn)?;
+                    self.refresh_filter_bitmap_locked(inner, slot);
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
                 WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
@@ -319,19 +379,40 @@ impl CollectionStore {
         index.note_overwrite_delta(slot, delta);
     }
 
+    /// Resolve the id a payload mutation targets. Shared by the pre-logging
+    /// validation and the log application, so both agree on the slot. A
+    /// missing or tombstoned id resolves to nothing and the mutation is a
+    /// no-op — exactly what replay must do with the same record.
+    fn payload_slot_of_locked(&self, inner: &StoreInner, point_id: &str) -> Option<u32> {
+        let id = PointId::from(point_id);
+        let slot = inner.reverse.get(&id)?;
+        if self.data_arc().tombstones.load().bit(slot as usize) {
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// Resolve the id a payload mutation targets (locking variant for the
+    /// pre-logging validation path).
+    fn payload_slot_of(&self, id: &PointId) -> Option<u32> {
+        let inner = self.inner.read();
+        self.payload_slot_of_locked(&inner, &id.to_string())
+    }
+
     /// Resolve the slot an upsert writes to.
     ///
-    /// A slot reserved by the commit queue's reserve step is filled in here:
-    /// the reservation fixed the number — so replay rebuilds the same one —
-    /// and this step writes the directory entry that makes the point visible.
-    /// Reads never observe an id before this point, because only `reverse`
-    /// publishes it.
+    /// Slot numbers are assigned here, in log order: a consumed reservation
+    /// takes the next free slot, an existing id reuses its slot, and anything
+    /// else (replay, or a reservation lost to a failed batch) takes the next
+    /// free slot as a new id. Reads never observe an id before this point,
+    /// because only `reverse` publishes it.
     pub(super) fn resolve_upsert_slot_locked(
         &self,
         inner: &mut StoreInner,
         id: &PointId,
     ) -> Result<u64> {
-        if let Some(slot) = inner.reserved.remove(id) {
+        if inner.reserved.remove_value(id).is_some() {
+            let slot = inner.meta.next_slot as u32;
             self.init_slot_locked(inner, id, slot)?;
             return Ok(slot as u64);
         }
@@ -354,9 +435,10 @@ impl CollectionStore {
         self.ensure_capacity(inner, slot as u64 + 1)?;
         self.data_arc().keys.append_key(slot as usize, &id.to_string())?;
         inner.reverse.insert(id, slot);
-        // A reserved slot can sit beyond the applied high-water mark; the mark
-        // only ever moves forward.
-        inner.meta.next_slot = inner.meta.next_slot.max(slot as u64 + 1);
+        // Slots are assigned in log order, so the new slot is always exactly
+        // the high-water mark; the mark only ever moves forward.
+        debug_assert_eq!(slot as u64, inner.meta.next_slot);
+        inner.meta.next_slot = slot as u64 + 1;
         inner.meta.live_count += 1;
         Ok(())
     }

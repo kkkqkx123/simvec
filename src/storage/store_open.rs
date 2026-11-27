@@ -444,7 +444,7 @@ pub(super) fn validate_admission_locked(inner: &StoreInner, ops: &[WalRecord]) -
             continue;
         };
         let id = PointId::from(point.id.as_str());
-        if inner.reverse.contains_key(&id) || inner.reserved.contains_key(&id) {
+        if inner.reverse.contains_key(&id) || inner.reserved.contains_id(&id) {
             continue;
         }
         if !new_ids.insert(point.id.as_str()) {

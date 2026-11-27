@@ -2,7 +2,9 @@
 
 use simvec::storage::CollectionStore;
 use simvec::storage::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
-use simvec::types::{CollectionConfig, DistanceMetric, PointId, SearchQuery, VectorPoint};
+use simvec::types::{
+    CollectionConfig, DistanceMetric, PointId, SearchQuery, StorageConfig, VectorPoint,
+};
 
 fn config() -> CollectionConfig {
     CollectionConfig::new(4, DistanceMetric::Cosine)
@@ -280,10 +282,15 @@ fn test_checkpoint_truncated_wal_reopens_with_all_points() {
                 }])
                 .unwrap();
             store.checkpoint().unwrap();
-            assert_eq!(
-                store.wal().appended_bytes(),
-                0,
-                "checkpoint must truncate the log"
+            // The checkpoint truncates everything covered by the watermark and
+            // leaves exactly one fresh-LSN marker behind: the marker's segment
+            // survives the truncate so the next LSN never collides with an
+            // existing segment name.
+            let (txns, _) = store.wal().read_all_acked().unwrap();
+            assert_eq!(txns.len(), 1, "checkpoint must leave only its marker");
+            assert!(
+                matches!(txns[0].ops.as_slice(), [WalRecord::Compact]),
+                "the surviving record must be the checkpoint marker"
             );
         }
         assert_eq!(store.count(), total);
@@ -453,4 +460,61 @@ fn test_segment_hnsw_payload_bitflip_triggers_crc_fallback() {
         .search(&SearchQuery::new(vec![0.0, 0.0, 0.0, 0.0], 1))
         .unwrap();
     assert_eq!(hits.len(), 1);
+}
+
+/// Stage 1: a checkpoint marker written when the active segment is full must
+/// carry a fresh LSN and reopen cleanly. The old watermark-reusing marker
+/// could duplicate the tail LSN and fail segment continuity after a crash in
+/// the truncate window.
+#[test]
+fn test_checkpoint_marker_at_full_segment_reopens_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+    let storage = StorageConfig {
+        wal_segment_bytes: 256,
+        ..StorageConfig::default()
+    };
+    let total = 20u64;
+    {
+        let store =
+            CollectionStore::create_with_storage(&store_dir, "col", &config(), &storage).unwrap();
+        for id in 0..total {
+            store
+                .apply_ops(&[WalRecord::Upsert {
+                    point: WalPoint::from_point(&point(id)).unwrap(),
+                }])
+                .unwrap();
+        }
+        assert!(
+            store.wal().segment_names().len() > 1,
+            "the test needs a rolled-over log"
+        );
+        store.checkpoint().unwrap();
+        let names = store.wal().segment_names();
+        assert!(
+            names.windows(2).all(|pair| pair[0] < pair[1]),
+            "segment names must stay strictly ascending: {names:?}"
+        );
+        // The surviving log replays to exactly one no-op marker above the
+        // checkpoint watermark.
+        let (txns, _) = store.wal().read_all_acked().unwrap();
+        assert_eq!(txns.len(), 1);
+        assert!(matches!(txns[0].ops.as_slice(), [WalRecord::Compact]));
+        assert_eq!(store.count(), total);
+    }
+
+    let store = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(store.count(), total);
+    for id in 0..total {
+        assert!(
+            store.get(&PointId::Num(id)).unwrap().is_some(),
+            "point {id} must survive a checkpoint at a full segment"
+        );
+    }
+    // A back-to-back checkpoint allocates a new marker instead of duplicating
+    // the previous one, and still reopens cleanly.
+    store.checkpoint().unwrap();
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), total);
 }

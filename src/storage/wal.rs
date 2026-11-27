@@ -2,29 +2,47 @@
 //!
 //! The log is a directory of segment files named after the first `txn_id`
 //! they contain (`00000000000000000001.bin`), so lexical order is lsn order
-//! and the name doubles as the segment's lower bound. A segment is created
-//! lazily on the first append that needs it, and rolled over once its size
-//! reaches [`Wal::segment_bytes`]; a batch is never split across segments.
+//! and the name doubles as the segment's lower bound. Segments are
+//! preallocated to [`Wal::segment_bytes`] on creation and served through
+//! memory maps: appends stream encoded records into the active mapping with
+//! one `flush_range` per group-commit batch, and replay walks read-only
+//! mappings with a per-segment record index instead of buffering decoded
+//! transactions.
 //!
-//! Each record is `[u32 len][u32 crc32][postcard(WalTxn)]`; the checksum
-//! covers the encoded payload so a torn or bit-rotted record cannot be
-//! mistaken for a committed transaction. Durability is one `write_all` +
-//! `sync_all` per *batch*: the commit queue (`super::queue`) hands its whole
-//! backlog to [`Wal::append_batch`], so concurrent writers share a single
-//! fsync — that shared fsync is what makes group commit actually group.
-//! Single-record appends (maintenance markers) go through the same batch path.
+//! On-disk segment format (version 2):
 //!
-//! A batch that fails at any point is rolled back to the offset it started
-//! at. Without the rollback a half-written record would sit in the middle of
-//! the log, and replay stops at the first checksum mismatch — silently
-//! discarding every record behind it.
+//! ```text
+//! header (32 B): [magic 4 = "SVWL"][version u32 = 2][seed u32]
+//!                [first_lsn u64][reserved u64][reserved u64]
+//! record:       [u32 len][u32 crc][postcard bytes][0..7 zero padding]
+//! ```
+//!
+//! Records are 8-byte aligned. The CRC of each record chains the previous
+//! record's CRC (the segment seed for the first record) over the length
+//! prefix, the payload and the padding, so reusing a file under a new name
+//! fails verification instead of replaying stale entries. A zero length
+//! prefix is never emitted by a writer; it marks preallocated slack (or a
+//! torn tail) and ends the valid prefix. Only the last segment may end
+//! mid-record.
+//!
+//! A batch is never split across segments. If the active segment cannot hold
+//! the whole batch, the log rolls over to a fresh preallocated segment named
+//! after the batch's first transaction (fresh LSNs are guaranteed by the
+//! commit queue, so the name is always strictly above the previous tail).
+//! A batch bigger than a fresh segment grows that segment before writing.
+//!
+//! Rollover reuses a prebuilt spare file (`.spare`, capacity-matched) when
+//! one is available, so steady-state appends never create files on the
+//! critical path; the spare is replenished after the rollover. If the spare
+//! is missing or capacity-mismatched, the segment is created directly.
 //!
 //! Replay is idempotent: upserts overwrite by point id, deletes of missing
 //! points are no-ops, and `Compact` checkpoints only advance the water mark.
-//! A truncated or checksum-failed final record (crash mid-append) stops the
-//! replay silently and is treated as end of log — but only in the *last*
-//! segment: in any earlier segment the log continues after it, so the same
-//! damage is reported as `CorruptData` instead of silently dropping the tail.
+//! A truncated final record (crash mid-append) or a zero prefix in the last
+//! segment stops the replay silently and is treated as end of log — but only
+//! in the *last* segment: in any earlier segment the log continues after it,
+//! so the same damage is reported as `CorruptData` instead of silently
+//! dropping the tail.
 //!
 //! Segments exist so that discarding logged history is `unlink`, not
 //! `set_len(0)` on a file that then keeps growing: [`Wal::truncate_through`]
@@ -39,10 +57,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use memmap2::MmapMut;
+#[cfg(test)]
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VectorSearchError};
@@ -56,6 +77,10 @@ const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
 const SEGMENT_EXT: &str = "bin";
 const SEGMENT_NAME_DIGITS: usize = 20;
 
+/// Prebuilt spare segment file, capacity-matched on use. A different
+/// extension keeps it out of the segment listing.
+const SPARE_NAME: &str = ".spare";
+
 /// Durable watermark: every transaction at or below this lsn is already
 /// reflected in the collection's data files. It is written before covered
 /// segments are unlinked, so a segment that reappears after a crash cannot
@@ -68,6 +93,17 @@ const ACK_HEADER_LEN: usize = 28;
 /// Segments kept as one transaction log; the bytes after which a new segment
 /// is started. Default mirrors `StorageConfig::wal_segment_bytes`.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Segment format version written into every header.
+const SEG_VERSION: u32 = 2;
+/// Segment magic: `SVWL`.
+const SEG_MAGIC: [u8; 4] = *b"SVWL";
+/// Segment header length in bytes.
+const SEG_HEADER_LEN: u64 = 32;
+/// Record alignment in bytes.
+const RECORD_ALIGN: u64 = 8;
+/// Record framing: `[u32 len][u32 crc]` before the payload.
+const RECORD_HEADER_LEN: u64 = 8;
 
 /// One transaction: a batch of operations applied atomically to a collection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +167,10 @@ impl WalPoint {
 /// Delete variants keep point ids as strings on purpose: the binary codec
 /// cannot encode the untagged point id enum, so the typed boundary ends at
 /// the transaction entry and replay converts back exactly once.
+///
+/// Payload variants are keyed by external point id, never by slot: live apply
+/// and replay resolve the id through the same id tracker, so the two paths
+/// cannot disagree about which slot a payload belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
     Upsert {
@@ -142,8 +182,10 @@ pub enum WalRecord {
     DeleteBatch {
         point_ids: Vec<String>,
     },
-    /// Checkpoint marker written after compaction; replay ignores the payload
-    /// but keeps advancing the water mark.
+    /// Checkpoint marker written after the data files are durable. Replay
+    /// ignores the payload but keeps advancing the water mark. Markers always
+    /// carry freshly allocated LSNs (never the checkpoint watermark), so they
+    /// can never collide with an existing segment name.
     Compact,
     /// Quantization state change (codebook / scale update). Replay is idempotent
     /// — the derived `quant.bin` files are rebuildable, so this record only
@@ -151,24 +193,24 @@ pub enum WalRecord {
     Quantize,
     /// Reserved for drop (the whole directory is removed, nothing is logged).
     DropCollection,
-    /// Replace the entire payload for a slot. The payload is JSON-encoded
+    /// Replace the entire payload for a point. The payload is JSON-encoded
     /// because postcard cannot encode `serde_json::Value` (untagged enum).
     SetPayload {
-        slot: u32,
+        point_id: String,
         payload: Option<String>,
     },
-    /// Remove specific keys from a slot's payload. The remaining keys are
-    /// preserved; if the slot has no payload this is a no-op.
+    /// Remove specific keys from a point's payload. The remaining keys are
+    /// preserved; if the point has no payload this is a no-op.
     DeletePayloadKeys {
-        slot: u32,
+        point_id: String,
         keys: Vec<String>,
     },
-    /// Set a single key on a slot's payload (merge semantics). A missing
+    /// Set a single key on a point's payload (merge semantics). A missing
     /// payload is created containing just this key; all other keys are
     /// preserved. The value is JSON-encoded because postcard cannot encode
     /// `serde_json::Value` (untagged enum).
     SetPayloadField {
-        slot: u32,
+        point_id: String,
         key: String,
         value: String,
     },
@@ -189,38 +231,51 @@ pub enum WalRecord {
     },
 }
 
-/// Mutable WAL state: the segment directory listing plus the open handle of
-/// the segment currently being appended to.
+/// Open handle of the segment currently being appended to.
+struct ActiveSegment {
+    mmap: MmapMut,
+    file: File,
+}
+
+/// Mutable WAL state: the segment directory listing plus the append handle.
 #[derive(Default)]
 struct WalState {
     /// Segment names (first `txn_id` of each) in ascending order.
     segments: Vec<u64>,
-    /// Handle of the highest segment, opened for append. `None` after the
+    /// Valid data bytes per sealed (closed) segment, in `segments` order
+    /// excluding the active tail. Closed segments are immutable, so their
+    /// valid length never changes after rollover.
+    sealed_valid: Vec<u64>,
+    /// Handle of the highest segment, mapped for append. `None` after the
     /// segment was retired by a truncation, so the next append creates one.
-    active: Option<File>,
+    active: Option<ActiveSegment>,
     /// Highest `txn_id` known to live in the active segment. Used by
     /// [`Wal::truncate_through`] to decide whether that segment — the one
     /// whose upper bound no segment name encodes — is fully covered by the
     /// water mark. `u64::MAX` while unknown (a segment that was never fully
     /// read and never appended to), which makes the check conservative.
     active_last_lsn: u64,
-    /// Physical length of the valid prefix of the active segment. Replay
-    /// stops at a torn tail; appends must start at that prefix rather than
-    /// after the torn bytes, or the next replay would stop before every
-    /// transaction written since.
+    /// Length of the valid prefix of the active segment, from its start.
+    /// Everything at or beyond it is preallocated slack or a torn tail.
+    /// `None` only before the first replay or append establishes it.
     active_valid_len: Option<u64>,
+    /// CRC chaining value at the valid frontier: the segment seed for an
+    /// empty segment, otherwise the last valid record's CRC. Lets appends
+    /// chain without re-walking the segment. `None` until established by
+    /// open, rollover or replay.
+    active_crc: Option<u32>,
 }
 
 /// Segmented append-only WAL directory. Every durable mutation goes through
-/// [`Wal::append_batch`], one write + one fsync per batch.
+/// [`Wal::append_batch`], one visibility publish + one flush per batch.
 pub struct Wal {
     dir: PathBuf,
     segment_bytes: u64,
     state: parking_lot::Mutex<WalState>,
-    /// Bytes physically held by the log since the last full truncate. Drives
-    /// the size-based checkpoint schedule: a pure-insert workload never
-    /// crosses a tombstone ratio, so without it the log would grow without
-    /// bound.
+    /// Valid data bytes held by the log. Drives the size-based checkpoint
+    /// schedule: a pure-insert workload never crosses a tombstone ratio, so
+    /// without it the log would grow without bound. Preallocated slack is
+    /// not counted, only records.
     appended_bytes: std::sync::atomic::AtomicU64,
     /// Generation the watermark belongs to. An ack written by another
     /// generation describes a different set of data files and is ignored.
@@ -238,34 +293,72 @@ pub struct Wal {
 impl Wal {
     /// Open (or create) the log directory for appending.
     ///
-    /// `segment_bytes` is the size at which a new segment is started; it is
-    /// not persisted, so changing it applies to the next rollover only.
+    /// `segment_bytes` is the preallocation size at which a new segment is
+    /// started; it is not persisted, so changing it applies to the next
+    /// rollover only. Existing segments are length-walked (never verified)
+    /// to recover their valid prefixes and the valid-byte total; any damage
+    /// is reported by replay, not by open.
     pub fn open_or_create(dir: &Path, segment_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let segments = list_segments(dir)?;
-        let mut total = 0u64;
-        for name in &segments {
-            total += std::fs::metadata(segment_path(dir, *name))?.len();
+        let capacity = normalize_capacity(segment_bytes);
+        let mut sealed_valid = Vec::with_capacity(segments.len());
+        let mut total_valid = 0u64;
+        let mut tail_valid = 0u64;
+        let mut tail_crc = None;
+        for (index, name) in segments.iter().enumerate() {
+            if index + 1 == segments.len() {
+                // The tail is walked leniently (torn tails tolerated) and
+                // yields the chaining CRC, so the first append needs no scan.
+                let (valid, crc) = walk_tail_prefix(dir, *name);
+                tail_valid = valid;
+                tail_crc = crc;
+                total_valid += valid;
+            } else {
+                let valid = match walk_valid_prefix(dir, *name) {
+                    Ok(valid) => valid,
+                    // An unreadable segment file reads as empty here; replay
+                    // reports the damage with its segment context.
+                    Err(_) => 0,
+                };
+                total_valid += valid;
+                sealed_valid.push(valid);
+            }
         }
         let active = match segments.last() {
-            Some(name) => Some(OpenOptions::new().read(true).append(true).open(segment_path(dir, *name))?),
+            Some(name) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(segment_path(dir, *name))?;
+                // The mapping must cover the whole file (including slack) so
+                // appends never remap on the fast path.
+                let mmap = unsafe { MmapMut::map_mut(&file)? };
+                Some(ActiveSegment { mmap, file })
+            }
             None => None,
         };
         let (ack_generation, ack_lsn) = read_ack(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
-            segment_bytes: segment_bytes.max(1),
+            segment_bytes: capacity,
             ack_generation: AtomicU64::new(ack_generation),
             generation: AtomicU64::new(0),
             state: parking_lot::Mutex::new(WalState {
                 // An existing tail segment may hold transactions this process
                 // has not read; `replay`/`read_all` refines the bound.
                 active_last_lsn: if segments.is_empty() { 0 } else { u64::MAX },
-                active_valid_len: None,
+                active_valid_len: if segments.is_empty() {
+                    None
+                } else {
+                    Some(tail_valid)
+                },
+                sealed_valid,
                 segments,
                 active,
+                active_crc: tail_crc,
             }),
-            appended_bytes: std::sync::atomic::AtomicU64::new(total),
+            appended_bytes: std::sync::atomic::AtomicU64::new(total_valid),
             acked_lsn: AtomicU64::new(ack_lsn),
             #[cfg(test)]
             fail_next_append: std::sync::atomic::AtomicBool::new(false),
@@ -273,14 +366,14 @@ impl Wal {
     }
 
     /// Test-only: make the next batch append fail without writing anything,
-    /// the way a failing `write_all` or `sync_all` would.
+    /// the way a failing flush would.
     #[cfg(test)]
     pub fn fail_next_append_for_test(&self) {
         self.fail_next_append
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Segment size threshold (bytes) at which the log rolls over.
+    /// Segment preallocation size (bytes). New segments start at this size.
     pub fn segment_bytes(&self) -> u64 {
         self.segment_bytes
     }
@@ -333,29 +426,34 @@ impl Wal {
         Ok((txns, last_txn.max(floor)))
     }
 
-    /// Append a single transaction (one write + one fsync).
+    /// Append a single transaction (one visibility publish + one flush).
     pub fn append(&self, txn: &WalTxn) -> Result<()> {
         self.append_batch(&[(txn.txn_id, &txn.ops)])
     }
 
-    /// Append a batch of transactions with a single `write_all` +
-    /// `sync_all`.
+    /// Append a batch of transactions with a single visibility publish and a
+    /// single flush.
     ///
-    /// The batch is the unit of group commit: everything handed in here shares
-    /// one fsync, so a batch's transactions all become durable together and
-    /// none of them is applied unless the whole batch is durable.
+    /// The batch is the unit of group commit: everything handed in here
+    /// becomes durable together, and none of it is applied unless the whole
+    /// batch is durable.
     ///
-    /// On failure the batch is rolled back to the log length it started from.
-    /// Leaving a torn record behind would make every later replay stop at
-    /// that checksum mismatch and drop the rest of the log, so the rollback
-    /// is part of the failure contract, not an optimization.
+    /// Records are encoded per transaction and streamed into the active
+    /// mapping in order — no whole-batch buffer is ever assembled — then one
+    /// `flush_range` makes the batch visible. On failure nothing is published:
+    /// `active_valid_len` still points at the pre-batch prefix, so the torn
+    /// bytes are preallocated slack again rather than a corrupt log.
     pub fn append_batch(&self, batch: &[(u64, &[WalRecord])]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        let mut buffer = Vec::new();
+        // Encode per transaction (small buffers, no whole-batch Vec) and
+        // measure the framed footprint up front: the batch is never split, so
+        // the rollover decision needs the total before writing anything.
+        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch.len());
         let mut first_txn = u64::MAX;
         let mut last_txn = 0u64;
+        let mut total = 0u64;
         for (txn_id, ops) in batch {
             let bytes = postcard::to_stdvec(&WalTxnRef {
                 txn_id: *txn_id,
@@ -369,9 +467,8 @@ impl Wal {
             }
             first_txn = first_txn.min(*txn_id);
             last_txn = last_txn.max(*txn_id);
-            buffer.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buffer.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-            buffer.extend_from_slice(&bytes);
+            total += record_total_len(bytes.len());
+            encoded.push((*txn_id, bytes));
         }
 
         let mut state = self.state.lock();
@@ -384,83 +481,127 @@ impl Wal {
                 "test-injected wal append failure".to_string(),
             ));
         }
-        // Repair a torn tail before deciding whether to roll over. Physical
-        // length is not a safe rollover signal: a torn record can push it past
-        // the threshold, and leaving those bytes behind would close a segment
-        // whose checksum failure is no longer tolerated as a tail. The valid
-        // prefix is the only length the log may build on.
-        let (physical_len, valid_len) = match &state.active {
-            Some(file) => {
-                let physical = file.metadata()?.len();
-                let valid = state.active_valid_len.unwrap_or(physical);
-                (physical, valid)
-            }
-            None => (0, 0),
-        };
-        if physical_len > valid_len {
-            state
-                .active
-                .as_mut()
-                .expect("active segment is present")
-                .set_len(valid_len)?;
-            state
-                .active
-                .as_mut()
-                .expect("active segment is present")
-                .sync_all()?;
-            state.active_valid_len = Some(valid_len);
-            let dropped = physical_len - valid_len;
-            self.appended_bytes
-                .fetch_sub(dropped.min(self.appended_bytes()), AtomicOrdering::Relaxed);
-        }
-        // Roll over before writing, so a segment never exceeds the threshold
-        // by more than the size of one batch. The new segment is named after
-        // the first transaction it will hold.
+        let valid_len = state.active_valid_len.unwrap_or(0);
+        // Roll over before writing, so a segment grows past the threshold
+        // only by the size of one batch. The new segment is named after the
+        // first transaction it will hold; LSNs are freshly allocated by the
+        // commit queue, so the name is always strictly above the old tail.
         let needs_segment = match &state.active {
-            Some(_) => valid_len >= self.segment_bytes,
+            Some(_) => valid_len + total > self.segment_bytes,
             None => true,
         };
-        let append_start = if needs_segment { 0 } else { valid_len };
         if needs_segment {
-            let name = next_segment_name(&state.segments, first_txn);
-            let file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .open(segment_path(&self.dir, name))?;
-            // The directory entry has to be durable before any record in it
-            // can be considered committed.
-            File::open(&self.dir)?.sync_all()?;
-            state.segments.push(name);
-            state.active = Some(file);
-            state.active_last_lsn = 0;
-            state.active_valid_len = Some(0);
+            self.roll_over_locked(&mut state, first_txn, total)?;
         }
-
-        {
-            let file = state.active.as_mut().expect("active segment opened above");
-            let write_result = file.write_all(&buffer).and_then(|_| file.sync_all());
-            if let Err(e) = write_result {
-                // Drop the partial batch so the log keeps a clean suffix.
-                let _ = file.set_len(append_start);
-                let _ = file.sync_all();
-                return Err(e.into());
+        let cached_crc = state.active_crc;
+        let append_start_snapshot = state.active_valid_len.unwrap_or(0);
+        let tail_name = *state.segments.last().expect("active segment is listed");
+        // A tail that never got its header (crash between file creation and
+        // header write) is reheaded before any record is framed. The header
+        // write goes through a separate file handle; the mapping already
+        // covers the file, so no remap is needed.
+        if cached_crc.is_none() || append_start_snapshot < SEG_HEADER_LEN {
+            let seed = random_seed();
+            write_segment_header(&segment_path(&self.dir, tail_name), seed, tail_name)?;
+            state.active_valid_len = Some(SEG_HEADER_LEN);
+            state.active_crc = Some(seed);
+        }
+        let append_start = state.active_valid_len.unwrap_or(SEG_HEADER_LEN);
+        let mut crc = state.active_crc.expect("crc established above");
+        let active = state.active.as_mut().expect("active segment opened above");
+        // A batch bigger than a fresh segment grows it before writing; the
+        // growth extends preallocated slack, never the valid prefix.
+        let end = append_start + total;
+        if end > active.mmap.len() as u64 {
+            active.file.set_len(end)?;
+            active.mmap = unsafe { MmapMut::map_mut(&active.file)? };
+        }
+        let mut offset = append_start;
+        for (_, bytes) in &encoded {
+            let data_len = bytes.len() as u64;
+            let framed = record_total_len(bytes.len());
+            let mmap_len = active.mmap.len();
+            let dst = &mut active.mmap[offset as usize..(offset + framed) as usize];
+            debug_assert!(offset + framed <= mmap_len as u64);
+            dst[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            // CRC chains the previous record (or the seed): it covers the
+            // length prefix, the payload and the zero padding.
+            let pad = (framed - RECORD_HEADER_LEN - data_len) as usize;
+            crc = chain_crc(crc, &(bytes.len() as u32).to_le_bytes(), bytes, pad);
+            dst[4..8].copy_from_slice(&crc.to_le_bytes());
+            dst[8..8 + bytes.len()].copy_from_slice(bytes);
+            for b in &mut dst[8 + bytes.len()..] {
+                *b = 0;
             }
+            offset += framed;
         }
+        // One visibility publish + one flush for the whole batch.
+        active
+            .mmap
+            .flush_range(append_start as usize, total as usize)?;
+        active.file.sync_all()?;
         state.active_last_lsn = state.active_last_lsn.max(last_txn);
-        state.active_valid_len = Some(append_start + buffer.len() as u64);
+        state.active_valid_len = Some(end);
+        state.active_crc = Some(crc);
         drop(state);
         self.appended_bytes
-            .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Roll over to a fresh segment while holding the state lock. The closed
+    /// segment keeps its exact valid prefix; the spare file is consumed when
+    /// capacity matches, otherwise the segment is preallocated directly.
+    fn roll_over_locked(
+        &self,
+        state: &mut WalState,
+        first_txn: u64,
+        batch_total: u64,
+    ) -> Result<()> {
+        // Seal the closed segment: truncate it to its valid prefix so no
+        // torn tail or preallocated slack survives inside a segment that
+        // replay will later treat as a middle segment (where any damage is
+        // corruption, never a tolerated tail). Batches were already flushed
+        // on append; the truncate only drops slack, never valid records.
+        if !state.segments.is_empty() {
+            let closed_valid = state.active_valid_len.unwrap_or(0);
+            if let Some(active) = state.active.take() {
+                active.file.set_len(closed_valid)?;
+                active.file.sync_all()?;
+            }
+            state.sealed_valid.push(closed_valid);
+        }
+        let name = next_segment_name(&state.segments, first_txn);
+        let capacity = normalize_capacity(self.segment_bytes.max(SEG_HEADER_LEN + batch_total));
+        let path = segment_path(&self.dir, name);
+        if !take_spare(&self.dir, &path, capacity)? {
+            create_segment_file(&path, capacity)?;
+        }
+        // The directory entry has to be durable before any record in it
+        // can be considered committed.
+        File::open(&self.dir)?.sync_all()?;
+        let seed = random_seed();
+        write_segment_header(&path, seed, name)?;
+        File::open(&path)?.sync_all()?;
+        // Replenish the spare for the next rollover while the shape is known.
+        let _ = make_spare(&self.dir, self.segment_bytes);
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        state.segments.push(name);
+        state.active = Some(ActiveSegment { mmap, file });
+        state.active_last_lsn = 0;
+        state.active_valid_len = Some(SEG_HEADER_LEN);
+        state.active_crc = Some(seed);
         Ok(())
     }
 
     /// Replay all records in order, invoking `f` for each decoded transaction.
     ///
     /// Returns the highest `txn_id` seen. A truncated final record (crash
-    /// mid-append) or a checksum mismatch on the final record stops the replay
-    /// silently — nothing after a torn record can be trusted; anything else
-    /// that is malformed is reported as `CorruptData`.
+    /// mid-append), a zero prefix (preallocated slack) or a checksum mismatch
+    /// on the final record stops the replay silently — nothing after a torn
+    /// record can be trusted; anything else that is malformed is reported as
+    /// `CorruptData`.
     pub fn replay(&self, f: impl FnMut(&WalTxn) -> Result<()>) -> Result<u64> {
         self.replay_after(None, f)
     }
@@ -475,25 +616,21 @@ impl Wal {
     ) -> Result<u64> {
         let segments = self.state.lock().segments.clone();
         let mut last_txn = 0u64;
-        let mut valid_len = 0u64;
+        let mut valid_len = SEG_HEADER_LEN;
+        let mut tail_crc = None;
         for (index, name) in segments.iter().enumerate() {
             let last_segment = index + 1 == segments.len();
-            let mut file = File::open(segment_path(&self.dir, *name))?;
-            let (segment_last_txn, segment_valid_len) = read_segment(
-                &mut file,
-                last_segment,
-                after,
-                &self.dir,
-                *name,
-                &mut f,
-                last_txn,
-            )?;
+            let path = segment_path(&self.dir, *name);
+            let bytes = std::fs::read(&path)?;
+            let (segment_last_txn, segment_valid_len, segment_crc) =
+                read_segment_bytes(&bytes, last_segment, after, &path, *name, &mut f, last_txn)?;
             // Segment names are lower bounds on their first transaction. A
             // closed segment must end exactly before the next one starts:
             // a gap means a segment was lost, an overlap means a name was
             // reused. Either way replaying only the surviving segments would
-            // silently drop or duplicate committed transactions.
-            if !last_segment && segment_valid_len > 0 {
+            // silently drop or duplicate committed transactions. LSNs are
+            // allocated densely by the commit queue, so holes cannot occur.
+            if !last_segment {
                 if let Some(next) = segments.get(index + 1) {
                     let expected = segment_last_txn.checked_add(1).unwrap_or(u64::MAX);
                     if *next != expected {
@@ -509,15 +646,18 @@ impl Wal {
             last_txn = segment_last_txn;
             if last_segment {
                 valid_len = segment_valid_len;
+                tail_crc = Some(segment_crc);
             }
         }
         // The log's highest lsn and valid tail are now known: the first
         // repairs the truncation decision, the second keeps future appends
-        // behind any torn record we just skipped.
+        // behind every torn record we just skipped, and the third lets the
+        // next append chain its CRC without re-walking the segment.
         let mut state = self.state.lock();
         state.active_last_lsn = last_txn;
         if !segments.is_empty() {
             state.active_valid_len = Some(valid_len);
+            state.active_crc = tail_crc;
         }
         Ok(last_txn)
     }
@@ -543,13 +683,13 @@ impl Wal {
         for name in state.segments.drain(..) {
             remove_segment(&self.dir, name)?;
         }
+        state.sealed_valid.clear();
         sync_dir(&self.dir)?;
         state.active = None;
         state.active_last_lsn = 0;
         state.active_valid_len = None;
         drop(state);
-        self.acked_lsn
-            .store(new_ack, AtomicOrdering::Release);
+        self.acked_lsn.store(new_ack, AtomicOrdering::Release);
         self.appended_bytes.store(0, AtomicOrdering::Relaxed);
         Ok(())
     }
@@ -580,17 +720,23 @@ impl Wal {
             .store(generation, AtomicOrdering::Release);
         self.acked_lsn.store(new_ack, AtomicOrdering::Release);
         let segments = std::mem::take(&mut state.segments);
+        let sealed = std::mem::take(&mut state.sealed_valid);
         let mut kept: Vec<u64> = Vec::with_capacity(segments.len());
+        let mut kept_valid: Vec<u64> = Vec::with_capacity(sealed.len());
         let mut removed_bytes = 0u64;
         for (index, name) in segments.iter().enumerate() {
+            // Valid bytes of segment `index`: sealed table for heads, the
+            // live tail counter for the last segment.
+            let valid = match sealed.get(index) {
+                Some(valid) => *valid,
+                None => state.active_valid_len.unwrap_or(0),
+            };
             let covered = match segments.get(index + 1) {
                 Some(next) => next.saturating_sub(1) <= watermark,
                 None => state.active.is_none() || state.active_last_lsn <= watermark,
             };
             if covered {
-                removed_bytes += std::fs::metadata(segment_path(&self.dir, *name))
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
+                removed_bytes += valid;
                 remove_segment(&self.dir, *name)?;
                 if index + 1 == segments.len() {
                     // The tail segment is gone: retire the handle so the next
@@ -601,9 +747,13 @@ impl Wal {
                 }
             } else {
                 kept.push(*name);
+                if index + 1 < segments.len() {
+                    kept_valid.push(valid);
+                }
             }
         }
         state.segments = kept;
+        state.sealed_valid = kept_valid;
         sync_dir(&self.dir)?;
         drop(state);
         if removed_bytes > 0 {
@@ -615,8 +765,8 @@ impl Wal {
         Ok(())
     }
 
-    /// Bytes currently held in the log. Drives the size-based checkpoint
-    /// schedule.
+    /// Valid data bytes currently held in the log. Drives the size-based
+    /// checkpoint schedule.
     pub fn appended_bytes(&self) -> u64 {
         self.appended_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -650,6 +800,13 @@ impl Wal {
             .map(|name| segment_path(&self.dir, *name))
     }
 
+    /// Valid prefix length of the active segment, if any. Test-only hook so
+    /// crash-injection tests can place torn bytes exactly at the frontier.
+    #[cfg(test)]
+    pub fn active_valid_len_for_test(&self) -> Option<u64> {
+        self.state.lock().active_valid_len
+    }
+
     /// Directory holding the segments.
     pub fn path(&self) -> &Path {
         &self.dir
@@ -665,55 +822,134 @@ impl std::fmt::Debug for Wal {
     }
 }
 
-/// Read one segment, feeding transactions to `f`. Returns the highest lsn
-/// seen so far and the physical end of its valid prefix.
-fn read_segment(
-    file: &mut File,
+/// Framed length of a record holding `data_len` payload bytes, 8-aligned.
+fn record_total_len(data_len: usize) -> u64 {
+    ((RECORD_HEADER_LEN as usize + data_len + RECORD_ALIGN as usize - 1)
+        / RECORD_ALIGN as usize * RECORD_ALIGN as usize) as u64
+}
+
+/// Normalize a segment capacity: at least header plus one minimal record,
+/// 8-byte aligned.
+fn normalize_capacity(segment_bytes: u64) -> u64 {
+    let min = SEG_HEADER_LEN + RECORD_ALIGN;
+    let capacity = segment_bytes.max(1).max(min);
+    (capacity + RECORD_ALIGN - 1) / RECORD_ALIGN * RECORD_ALIGN
+}
+
+fn random_seed() -> u32 {
+    // Cheap non-cryptographic seed: address entropy plus time. Uniqueness per
+    // segment is what matters (a reused file fails CRC), not randomness.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    (hasher.finish() & 0xffff_ffff) as u32
+}
+
+/// Chained CRC: `prev` is the previous record's CRC (or the segment seed),
+/// covering the length prefix, the payload and the zero padding.
+fn chain_crc(prev: u32, len_le: &[u8; 4], data: &[u8], pad: usize) -> u32 {
+    let mut hasher = crc32fast::Hasher::new_with_initial(prev);
+    hasher.update(len_le);
+    hasher.update(data);
+    if pad > 0 {
+        static ZEROES: [u8; 7] = [0; 7];
+        hasher.update(&ZEROES[..pad]);
+    }
+    hasher.finalize()
+}
+
+/// Read one segment's bytes, feeding transactions to `f`. Returns the highest
+/// lsn seen so far and the end of its valid prefix. Builds a per-segment
+/// record index (offsets) while walking, so the valid prefix and any floor
+/// skip derive from random access into the mapping rather than a buffered
+/// decode.
+fn read_segment_bytes(
+    bytes: &[u8],
     last_segment: bool,
     after: Option<u64>,
-    dir: &Path,
+    path: &Path,
     name: u64,
     f: &mut impl FnMut(&WalTxn) -> Result<()>,
     mut last_txn: u64,
-) -> Result<(u64, u64)> {
-    file.rewind()?;
-    let mut header_buf = [0u8; 8];
-    let mut offset = 0u64;
-    let mut valid_len = 0u64;
-    loop {
-        match file.read_exact(&mut header_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+) -> Result<(u64, u64, u32)> {
+    if bytes.len() < SEG_HEADER_LEN as usize {
+        if last_segment {
+            return Ok((last_txn, 0, 0));
         }
-        let len = u32::from_le_bytes(header_buf[0..4].try_into().expect("len slice"));
-        if len == 0 {
+        return Err(VectorSearchError::CorruptData(format!(
+            "wal segment {} is shorter than its header",
+            path.display()
+        )));
+    }
+    if &bytes[0..4] != SEG_MAGIC {
+        if last_segment && bytes.iter().all(|b| *b == 0) {
+            // Fully preallocated but never headed: a crash between file
+            // creation and header write. Treat as an empty tail; the next
+            // append rewrites the header.
+            return Ok((last_txn, 0, 0));
+        }
+        return Err(VectorSearchError::CorruptData(format!(
+            "wal segment {} has a bad magic",
+            path.display()
+        )));
+    }
+    if u32::from_le_bytes(bytes[4..8].try_into().expect("version slice")) != SEG_VERSION {
+        return Err(VectorSearchError::CorruptData(format!(
+            "wal segment {} has an unsupported version",
+            path.display()
+        )));
+    }
+    let seed = u32::from_le_bytes(bytes[8..12].try_into().expect("seed slice"));
+    let first_lsn = u64::from_le_bytes(bytes[12..20].try_into().expect("first-lsn slice"));
+    if first_lsn != name {
+        return Err(VectorSearchError::CorruptData(format!(
+            "wal segment {} header first-lsn {first_lsn} disagrees with its name",
+            path.display()
+        )));
+    }
+    // Record index: byte offsets of every record start in this segment.
+    // The walk below is sequential (the CRC chains), but the index makes
+    // the valid prefix and every record randomly addressable afterwards.
+    let mut index: Vec<u64> = Vec::new();
+    let mut crc = seed;
+    let mut offset = SEG_HEADER_LEN;
+    let len = bytes.len() as u64;
+    while offset + RECORD_HEADER_LEN <= len {
+        let record_len =
+            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        if record_len == 0 {
+            // Preallocated slack: end of the valid prefix.
+            break;
+        }
+        if record_len > MAX_RECORD_LEN {
             return Err(VectorSearchError::CorruptData(format!(
-                "wal record with zero length in {}",
-                dir.join(segment_file_name(name)).display()
+                "wal record length {record_len} exceeds limit"
             )));
         }
-        if len > MAX_RECORD_LEN {
-            return Err(VectorSearchError::CorruptData(format!(
-                "wal record length {len} exceeds limit"
-            )));
-        }
-        let record_end = offset + 8 + len as u64;
-        let expected_crc = u32::from_le_bytes(header_buf[4..8].try_into().expect("crc slice"));
-        let mut bytes = vec![0u8; len as usize];
-        if let Err(e) = file.read_exact(&mut bytes) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                if last_segment {
-                    break; // truncated trailing record from a crash
-                }
-                return Err(VectorSearchError::CorruptData(format!(
-                    "wal segment {} ends mid-record before the log does",
-                    segment_file_name(name)
-                )));
+        let framed = record_total_len(record_len as usize);
+        if offset + framed > len {
+            if last_segment {
+                break; // truncated trailing record from a crash
             }
-            return Err(e.into());
+            return Err(VectorSearchError::CorruptData(format!(
+                "wal segment {} ends mid-record before the log does",
+                segment_file_name(name)
+            )));
         }
-        if crc32fast::hash(&bytes) != expected_crc {
+        let data_start = (offset + RECORD_HEADER_LEN) as usize;
+        let data_end = data_start + record_len as usize;
+        let pad = (framed - RECORD_HEADER_LEN - record_len as u64) as usize;
+        // Padding is always written as zeros; non-zero padding is damage,
+        // handled exactly like a checksum mismatch below.
+        let pad_ok = bytes[data_end..data_end + pad].iter().all(|b| *b == 0);
+        let mut len_le = [0u8; 4];
+        len_le.copy_from_slice(&bytes[offset as usize..offset as usize + 4]);
+        let expected = chain_crc(crc, &len_le, &bytes[data_start..data_end], pad);
+        let stored =
+            u32::from_le_bytes(bytes[offset as usize + 4..offset as usize + 8].try_into().expect("crc slice"));
+        if !pad_ok || expected != stored {
             // Torn write or bit rot. In the tail segment nothing after it can
             // be trusted either, so the replay simply ends; in an earlier
             // segment the log continues, which makes it real corruption.
@@ -725,15 +961,170 @@ fn read_segment(
                 segment_file_name(name)
             )));
         }
-        let txn: WalTxn = postcard::from_bytes(&bytes)?;
+        crc = stored;
+        index.push(offset);
+        let txn: WalTxn = postcard::from_bytes(&bytes[data_start..data_end])?;
         if after.is_none_or(|lsn| txn.txn_id > lsn) {
             f(&txn)?;
         }
         last_txn = txn.txn_id.max(last_txn);
-        offset = record_end;
-        valid_len = record_end;
+        offset += framed;
     }
-    Ok((last_txn, valid_len))
+    debug_assert!(index.windows(2).all(|pair| pair[0] < pair[1]));
+    Ok((last_txn, offset, crc))
+}
+
+/// Lenient tail walk for open: like replay of the last segment (zero prefix,
+/// truncation and checksum mismatch all end the prefix silently), but without
+/// decoding. Returns the valid prefix and the chaining CRC at it (`None` when
+/// the file cannot be read at all).
+fn walk_tail_prefix(dir: &Path, name: u64) -> (u64, Option<u32>) {
+    let Ok(bytes) = std::fs::read(segment_path(dir, name)) else {
+        return (0, None);
+    };
+    if bytes.len() < SEG_HEADER_LEN as usize
+        || &bytes[0..4] != SEG_MAGIC
+        || u32::from_le_bytes(bytes[4..8].try_into().expect("version slice")) != SEG_VERSION
+        || u64::from_le_bytes(bytes[12..20].try_into().expect("first-lsn slice")) != name
+    {
+        return (0, None);
+    }
+    let seed = u32::from_le_bytes(bytes[8..12].try_into().expect("seed slice"));
+    let mut crc = seed;
+    let mut offset = SEG_HEADER_LEN;
+    let len = bytes.len() as u64;
+    while offset + RECORD_HEADER_LEN <= len {
+        let record_len =
+            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        if record_len == 0 || record_len > MAX_RECORD_LEN {
+            break;
+        }
+        let framed = record_total_len(record_len as usize);
+        if offset + framed > len {
+            break;
+        }
+        let data_start = (offset + RECORD_HEADER_LEN) as usize;
+        let data_end = data_start + record_len as usize;
+        let pad = (framed - RECORD_HEADER_LEN - record_len as u64) as usize;
+        let pad_ok = bytes[data_end..data_end + pad].iter().all(|b| *b == 0);
+        let mut len_le = [0u8; 4];
+        len_le.copy_from_slice(&bytes[offset as usize..offset as usize + 4]);
+        let expected = chain_crc(crc, &len_le, &bytes[data_start..data_end], pad);
+        let stored =
+            u32::from_le_bytes(bytes[offset as usize + 4..offset as usize + 8].try_into().expect("crc slice"));
+        if !pad_ok || expected != stored {
+            break;
+        }
+        crc = stored;
+        offset += framed;
+    }
+    (offset, Some(crc))
+}
+
+/// Length-walk a segment file without verifying checksums: used at open to
+/// recover valid prefixes and the valid-byte total. Never fails; any damage
+/// is reported later by replay with its segment context.
+fn walk_valid_prefix(dir: &Path, name: u64) -> Result<u64> {
+    let bytes = std::fs::read(segment_path(dir, name))?;
+    if bytes.len() < SEG_HEADER_LEN as usize
+        || &bytes[0..4] != SEG_MAGIC
+        || u32::from_le_bytes(bytes[4..8].try_into().expect("version slice")) != SEG_VERSION
+    {
+        return Ok(0);
+    }
+    if u64::from_le_bytes(bytes[12..20].try_into().expect("first-lsn slice")) != name {
+        return Ok(0);
+    }
+    let mut offset = SEG_HEADER_LEN;
+    let len = bytes.len() as u64;
+    while offset + RECORD_HEADER_LEN <= len {
+        let record_len =
+            u32::from_le_bytes(bytes[offset as usize..offset as usize + 4].try_into().expect("len slice"));
+        if record_len == 0 || record_len > MAX_RECORD_LEN {
+            break;
+        }
+        let framed = record_total_len(record_len as usize);
+        if offset + framed > len {
+            break;
+        }
+        offset += framed;
+    }
+    Ok(offset)
+}
+
+/// Create and preallocate a segment file with a valid (zeroed) body.
+fn create_segment_file(path: &Path, capacity: u64) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.set_len(capacity)?;
+    file.sync_all()?;
+    drop(file);
+    Ok(())
+}
+
+/// Write the segment header: magic, version, seed and first lsn.
+fn write_segment_header(path: &Path, seed: u32, first_lsn: u64) -> Result<()> {
+    let mut header = [0u8; SEG_HEADER_LEN as usize];
+    header[0..4].copy_from_slice(&SEG_MAGIC);
+    header[4..8].copy_from_slice(&SEG_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&seed.to_le_bytes());
+    header[12..20].copy_from_slice(&first_lsn.to_le_bytes());
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.write_all(&header)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Consume the prebuilt spare file when its capacity matches.
+fn take_spare(dir: &Path, target: &Path, capacity: u64) -> Result<bool> {
+    let spare = dir.join(SPARE_NAME);
+    let meta = match std::fs::metadata(&spare) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.len() != capacity {
+        return Ok(false);
+    }
+    match std::fs::rename(&spare, target) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Prebuild the spare segment file for the next rollover. Best-effort: a
+/// missing spare only means the next rollover creates its file directly.
+/// A stale spare from a previous capacity is replaced.
+fn make_spare(dir: &Path, capacity: u64) -> Result<()> {
+    let spare = dir.join(SPARE_NAME);
+    if spare.exists() {
+        if std::fs::metadata(&spare).map(|meta| meta.len()).unwrap_or(0) == capacity {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&spare);
+    }
+    let tmp = dir.join(".spare.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.set_len(capacity)?;
+    file.sync_all()?;
+    drop(file);
+    match std::fs::rename(&tmp, &spare) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    sync_dir(dir)
 }
 
 /// Persist the generation and replay watermark with a checksum and a
@@ -846,6 +1237,14 @@ fn remove_segment(dir: &Path, name: u64) -> Result<()> {
     }
 }
 
+/// Read a segment through a read-only mapping. Used by tests that inspect
+/// the log without replaying it.
+#[cfg(test)]
+fn read_segment_mmap(path: &Path) -> Result<Mmap> {
+    let file = File::open(path)?;
+    Ok(unsafe { Mmap::map(&file)? })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,15 +1300,17 @@ mod tests {
         let wal = wal(&path);
         wal.append(&txn(1, 10)).unwrap();
 
-        // Append a garbage trailing record that is not a valid length-prefixed
-        // txn: 4 bytes claiming a 100-byte record that does not exist.
+        // Corrupt the tail: flip a payload byte of the last record so its
+        // checksum no longer matches. The replay must stop after the valid
+        // prefix instead of applying torn data.
+        let segment = segment_path(&path, 1);
+        let valid = wal.active_valid_len_for_test().unwrap();
         {
-            let mut f = OpenOptions::new()
-                .append(true)
-                .open(segment_path(&path, 1))
-                .unwrap();
-            f.write_all(&100u32.to_le_bytes()).unwrap();
-            f.sync_all().unwrap();
+            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+            let last = (valid - 1) as usize;
+            mmap[last] ^= 0xFF;
+            mmap.flush().unwrap();
         }
 
         let mut seen = Vec::new();
@@ -919,8 +1320,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(last, 1);
-        assert_eq!(seen, vec![1]);
+        assert_eq!(last, 0, "the torn tail contributes no transaction");
+        assert!(seen.is_empty());
     }
 
     #[test]
@@ -929,13 +1330,13 @@ mod tests {
         let path = dir.path().join("wal");
         let first = wal(&path);
         first.append(&txn(1, 10)).unwrap();
+        let valid = first.active_valid_len_for_test().unwrap();
         {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(segment_path(&path, 1))
-                .unwrap();
-            file.write_all(&100u32.to_le_bytes()).unwrap();
-            file.sync_all().unwrap();
+            let segment = segment_path(&path, 1);
+            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+            mmap[valid as usize] = 0xFF;
+            mmap.flush().unwrap();
         }
         drop(first);
 
@@ -956,16 +1357,18 @@ mod tests {
         let path = dir.path().join("wal");
         let first = wal(&path);
         first.append(&txn(1, 10)).unwrap();
-        // Grow the physical file past a tiny rollover threshold with a torn
-        // record. A reopen learns the valid prefix; the next append must cut
-        // the tail *before* closing the segment, or the stale bytes become a
-        // corrupt middle segment on the following reopen.
+        // Extend the file past the valid prefix and plant a torn record
+        // there. A reopen learns the valid prefix; the next append must
+        // build on that prefix *before* closing the segment, or the stale
+        // bytes become a corrupt middle segment on the following reopen.
+        let valid = first.active_valid_len_for_test().unwrap();
         {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(segment_path(&path, 1))
-                .unwrap();
-            file.write_all(&100u32.to_le_bytes()).unwrap();
+            use std::io::{Seek, SeekFrom};
+            let segment = segment_path(&path, 1);
+            let mut file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            file.set_len(valid + 16).unwrap();
+            file.seek(SeekFrom::Start(valid)).unwrap();
+            file.write_all(&[0xFF]).unwrap();
             file.sync_all().unwrap();
         }
         drop(first);
@@ -996,16 +1399,13 @@ mod tests {
         // parses but the checksum no longer matches, so the replay must stop
         // after the first record instead of applying torn data.
         let segment = segment_path(&path, 1);
-        let file_len = std::fs::metadata(&segment).unwrap().len();
+        let file_len = wal.active_valid_len_for_test().unwrap();
         {
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&segment)
-                .unwrap();
-            use std::io::{Seek, SeekFrom, Write};
-            f.seek(SeekFrom::Start(file_len - 1)).unwrap();
-            f.write_all(&[0xFFu8]).unwrap();
+            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+            let last = (file_len - 1) as usize;
+            mmap[last] ^= 0xFF;
+            mmap.flush().unwrap();
         }
 
         let mut seen = Vec::new();
@@ -1066,7 +1466,7 @@ mod tests {
         let last = wal
             .replay(|t| {
                 seen.push((t.txn_id, t.ops.clone()));
-                Ok(())
+            Ok(())
             })
             .unwrap();
         assert_eq!(last, 2);
@@ -1078,12 +1478,9 @@ mod tests {
     fn test_segments_roll_over_and_replay_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        // One record is roughly 40 bytes; 100 bytes forces a segment every
-        // couple of transactions.
-        let wal = Wal::open_or_create(&path, 100).unwrap();
-        for id in 1..=5u64 {
-            wal.append(&txn(id, id * 10)).unwrap();
-        }
+        // Small segments force a rollover every couple of transactions.
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 2);
         let names = wal.segment_names();
         assert!(
             names.len() > 1,
@@ -1102,12 +1499,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(last, 5);
-        assert_eq!(seen, vec![1, 2, 3, 4, 5], "replay follows segment order");
+        assert_eq!(last, *ids.last().unwrap());
+        assert_eq!(seen, ids, "replay follows segment order");
 
         // A reopen must find the same log through the directory listing.
         drop(wal);
-        let reopened = Wal::open_or_create(&path, 100).unwrap();
+        let reopened = Wal::open_or_create(&path, 128).unwrap();
         assert_eq!(reopened.segment_names(), names);
         assert!(reopened.appended_bytes() > 0);
         let mut count = 0;
@@ -1118,29 +1515,27 @@ mod tests {
                     Ok(())
                 })
                 .unwrap(),
-            5
+            ids.len() as u64
         );
-        assert_eq!(count, 5);
+        assert_eq!(count, ids.len());
     }
 
     #[test]
     fn test_missing_wal_segment_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = Wal::open_or_create(&path, 40).unwrap();
-        for id in 1..=6u64 {
-            wal.append(&txn(id, id * 10)).unwrap();
-        }
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 3);
         let names = wal.segment_names();
         assert!(names.len() >= 3, "need several segments, got {names:?}");
         // The untouched log must be valid; only the removed segment should
         // trigger the continuity check.
-        assert_eq!(wal.replay(|_| Ok(())).unwrap(), 6);
+        assert_eq!(wal.replay(|_| Ok(())).unwrap(), *ids.last().unwrap());
         drop(wal);
 
         let missing = names[names.len() / 2];
         std::fs::remove_file(segment_path(&path, missing)).unwrap();
-        let reopened = Wal::open_or_create(&path, 100).unwrap();
+        let reopened = Wal::open_or_create(&path, 128).unwrap();
         let err = reopened.replay(|_| Ok(())).unwrap_err();
         assert!(
             err.to_string().contains("not contiguous"),
@@ -1152,20 +1547,18 @@ mod tests {
     fn test_truncate_through_removes_only_covered_segments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = Wal::open_or_create(&path, 40).unwrap();
-        for id in 1..=6u64 {
-            wal.append(&txn(id, id)).unwrap();
-        }
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 3);
         let names = wal.segment_names();
         assert!(names.len() >= 3, "need several segments, got {names:?}");
-        // Highest lsn the log holds is 6 (learned by replay).
-        assert_eq!(wal.replay(|_| Ok(())).unwrap(), 6);
+        // Highest lsn the log holds is learned by replay.
+        assert_eq!(wal.replay(|_| Ok(())).unwrap(), *ids.last().unwrap());
         let before = wal.appended_bytes();
 
-        // A water mark inside the second segment keeps it and everything
-        // after it, and drops only the first segment.
+        // A water mark at the second segment's first lsn keeps it and
+        // everything after it, and drops only the first segment.
         let watermark = names[1];
-        wal.truncate_through(watermark).unwrap();
+        wal.truncate_through(watermark.saturating_sub(1)).unwrap();
         let kept = wal.segment_names();
         assert!(
             !kept.contains(&names[0]),
@@ -1185,7 +1578,7 @@ mod tests {
         })
         .unwrap();
         assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(*seen.last().unwrap(), 6);
+        assert_eq!(*seen.last().unwrap(), *ids.last().unwrap());
     }
 
     #[test]
@@ -1262,10 +1655,8 @@ mod tests {
     fn test_corrupt_middle_segment_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = Wal::open_or_create(&path, 100).unwrap();
-        for id in 1..=6u64 {
-            wal.append(&txn(id, id)).unwrap();
-        }
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        append_until_segments(&wal, 2);
         let names = wal.segment_names();
         assert!(names.len() >= 2, "need several segments, got {names:?}");
         drop(wal);
@@ -1274,16 +1665,114 @@ mod tests {
         // replay cannot treat that as a torn tail, because the log evidently
         // continues behind it.
         let segment = segment_path(&path, names[0]);
-        let mut bytes = std::fs::read(&segment).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        std::fs::write(&segment, &bytes).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+        let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+        // Flip a byte inside the first record's payload: the length prefix
+        // still parses but the chained CRC no longer matches.
+        mmap[(SEG_HEADER_LEN + RECORD_HEADER_LEN) as usize] ^= 0xFF;
+        mmap.flush().unwrap();
+        drop(mmap);
 
-        let wal = Wal::open_or_create(&path, 100).unwrap();
+        let wal = Wal::open_or_create(&path, 128).unwrap();
         let error = wal.replay(|_| Ok(())).unwrap_err();
         assert!(
             matches!(error, VectorSearchError::CorruptData(_)),
             "mid-log damage must surface as CorruptData, got {error:?}"
         );
+    }
+
+    /// Append until the log holds at least `wanted` segments; returns the
+    /// committed lsn sequence. Encoding-size agnostic: rollover timing
+    /// depends on the framed record size, so tests grow the log instead of
+    /// assuming a fixed batch count per segment.
+    fn append_until_segments(wal: &Wal, wanted: usize) -> Vec<u64> {
+        let mut id = 0u64;
+        while wal.segment_names().len() < wanted {
+            id += 1;
+            assert!(id < 100, "rollover never happened");
+            wal.append(&txn(id, id * 10)).unwrap();
+        }
+        (1..=id).collect()
+    }
+
+    #[test]
+    fn test_rollover_reuses_prebuilt_spare() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        // A spare is prebuilt after the first segment is created.
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 2);
+        assert!(wal.segment_names().len() > 1);
+        assert!(
+            path.join(SPARE_NAME).exists(),
+            "a spare segment must be prebuilt after a rollover"
+        );
+        let mut seen = Vec::new();
+        let last = wal
+            .replay(|t| {
+                seen.push(t.txn_id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(last, *ids.last().unwrap());
+        assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn test_header_first_lsn_mismatch_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = wal(&path);
+        wal.append(&txn(5, 10)).unwrap();
+        drop(wal);
+
+        // Rewrite the header's first-lsn so it disagrees with the file name.
+        let segment = segment_path(&path, 5);
+        {
+            let file = OpenOptions::new().read(true).write(true).open(&segment).unwrap();
+            let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+            mmap[12..20].copy_from_slice(&99u64.to_le_bytes());
+            mmap.flush().unwrap();
+        }
+
+        let wal = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        let error = wal.replay(|_| Ok(())).unwrap_err();
+        assert!(
+            matches!(error, VectorSearchError::CorruptData(_)),
+            "header/name disagreement must be CorruptData, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_record_index_matches_replay_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 2);
+        // Walk every segment mapping directly and check the record index:
+        // offsets must ascend and each frame must decode to the next lsn.
+        let mut expected = 1u64;
+        for name in wal.segment_names() {
+            let mmap = read_segment_mmap(&segment_path(&path, name)).unwrap();
+            let mut offset = SEG_HEADER_LEN as usize;
+            while offset + RECORD_HEADER_LEN as usize <= mmap.len() {
+                let record_len = u32::from_le_bytes(
+                    mmap[offset..offset + 4].try_into().expect("len slice"),
+                );
+                if record_len == 0 {
+                    break;
+                }
+                let framed =
+                    record_total_len(record_len as usize) as usize;
+                let txn: WalTxn = postcard::from_bytes(
+                    &mmap[offset + RECORD_HEADER_LEN as usize..offset + RECORD_HEADER_LEN as usize + record_len as usize],
+                )
+                .unwrap();
+                assert_eq!(txn.txn_id, expected, "record index order");
+                expected += 1;
+                offset += framed;
+            }
+        }
+        assert_eq!(expected, ids.len() as u64 + 1);
     }
 }

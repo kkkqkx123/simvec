@@ -68,7 +68,7 @@ fn allocation_never_straddles_a_page() {
                             // Free page 1's blocks without allocating anything else.
     store
         .apply_ops(&[WalRecord::SetPayload {
-            slot: 3,
+            point_id: "3".to_string(),
             payload: None,
         }])
         .expect("drop payload");

@@ -270,10 +270,11 @@ fn test_compact_checkpoint_truncates_wal() {
         assert!(delete_logged(&store, &PointId::Num(i)));
     }
     store.compact().unwrap();
-    // A compaction checkpoint truncates the WAL.
+    // Compaction rewrote every derived file, so the WAL is wiped: no logged
+    // transaction remains authoritative.
     let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
-    let last = wal.replay(|_| Ok(())).unwrap();
-    assert_eq!(last, 0, "WAL must be empty after compaction");
+    let (txns, _) = wal.read_all().unwrap();
+    assert!(txns.is_empty(), "WAL must be empty after compaction");
     assert_eq!(store.count(), 4);
 }
 
@@ -393,29 +394,34 @@ fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
         "several segments must be on disk before the checkpoint"
     );
     let files_before = std::fs::read_dir(&wal_dir).unwrap().count();
-    assert_eq!(files_before, segments.len());
+    // Segments plus the prebuilt spare (and the ack file once published).
+    assert_eq!(files_before, segments.len() + 1);
 
     store.checkpoint().unwrap();
 
+    // Everything covered by the watermark is unlinked in whole-file unlinks;
+    // only the tail segment carrying the fresh-LSN marker survives, plus the
+    // durable replay watermark and the prebuilt spare.
     assert_eq!(
-        store.wal().segment_names(),
-        Vec::<u64>::new(),
-        "a checkpoint covering the whole log leaves no segment behind"
+        store.wal().segment_names().len(),
+        1,
+        "only the marker tail segment survives the checkpoint"
     );
-    assert_eq!(store.wal().appended_bytes(), 0);
+    let (txns, _) = store.wal().read_all_acked().unwrap();
+    assert_eq!(txns.len(), 1);
+    assert!(matches!(txns[0].ops.as_slice(), [WalRecord::Compact]));
     assert_eq!(store.wal().acked_lsn(), 24);
-    // Segments are unlinked, not truncated in place. The only survivor is
-    // the durable replay watermark published before the unlink.
-    let remaining: Vec<_> = std::fs::read_dir(&wal_dir)
+    let mut remaining: Vec<_> = std::fs::read_dir(&wal_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(remaining.len(), 1, "unexpected files: {remaining:?}");
-    assert_eq!(remaining[0], "acked-lsn");
+    remaining.sort();
+    assert_eq!(remaining.len(), 3, "unexpected files: {remaining:?}");
 
-    // Appending after the wipe starts a fresh segment and replays cleanly.
+    // Appending after the checkpoint reuses the marker tail segment and
+    // replays cleanly.
     upsert_logged(&store, &point(100, 4));
-    assert_eq!(store.wal().segment_names(), vec![25]);
+    assert_eq!(store.wal().segment_names().len(), 1);
     drop(store);
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(reopened.count(), 25);

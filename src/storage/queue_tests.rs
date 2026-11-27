@@ -383,3 +383,91 @@ fn panicking_worker_fails_waiters_and_refuses_later_writes() {
     assert_eq!(reopened.count(), 1);
     assert!(reopened.get(&PointId::Num(1)).unwrap().is_some());
 }
+
+/// Stage 2: a failed batch must leave no reservation residue, so a retry of
+/// the same ids, later payload edits, a checkpoint and a reopen all agree on
+/// id → slot, payload bytes and filter state.
+///
+/// `scroll` walks slots in order, so equal scroll sequences prove equal slot
+/// numbering; per-point `get` proves equal payloads.
+#[test]
+fn failed_batch_retry_checkpoint_reopen_is_identical() {
+    use crate::types::Payload;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col");
+    let store = store(&store_dir);
+    let payload = |tag: &str| Payload::from([("tag".to_string(), serde_json::json!(tag))]);
+
+    for id in [1u64, 2] {
+        let mut point = point(id);
+        point.payload = Some(payload(&format!("p{id}")));
+        store.apply_ops(&[upsert_op(&point)]).unwrap();
+    }
+
+    // Fail a batch that reserves two new ids, then retry the same ids: the
+    // retry must land on the slots replay will rebuild.
+    store.wal().fail_next_append_for_test();
+    let mut failed: Vec<VectorPoint> = Vec::new();
+    for id in [3u64, 4] {
+        let mut point = point(id);
+        point.payload = Some(payload(&format!("p{id}")));
+        failed.push(point);
+    }
+    let ops: Vec<WalRecord> = failed.iter().map(upsert_op).collect();
+    store
+        .apply_ops(&ops)
+        .expect_err("the injected failure must surface");
+    assert!(store.get(&PointId::Num(3)).unwrap().is_none());
+    assert!(store.get(&PointId::Num(4)).unwrap().is_none());
+
+    for point in &failed {
+        store.apply_ops(&[upsert_op(point)]).unwrap();
+    }
+    // Payload edits resolve by external id on both the live and replay paths.
+    store
+        .set_payload(&PointId::Num(1), payload("q1"))
+        .unwrap();
+    store
+        .set_payload_fields(&PointId::Num(3), payload("q3"))
+        .unwrap();
+    store
+        .delete_payload_keys(&PointId::Num(2), vec!["tag".to_string()])
+        .unwrap();
+    store.checkpoint().unwrap();
+
+    let live_ids: Vec<PointId> = store
+        .scroll(64, None, Some(true), Some(true))
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|point| point.id)
+        .collect();
+    let live_points: Vec<(PointId, VectorPoint)> = live_ids
+        .iter()
+        .map(|id| (id.clone(), store.get(id).unwrap().unwrap()))
+        .collect();
+
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    let open_ids: Vec<PointId> = reopened
+        .scroll(64, None, Some(true), Some(true))
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|point| point.id)
+        .collect();
+    assert_eq!(live_ids, open_ids, "slot order must survive reopening");
+    for (id, expected) in &live_points {
+        let actual = reopened.get(id).unwrap().unwrap();
+        assert_eq!(
+            actual.vector(),
+            expected.vector(),
+            "vector of {id} must match after reopen"
+        );
+        assert_eq!(
+            actual.payload, expected.payload,
+            "payload of {id} must match after reopen"
+        );
+    }
+}

@@ -103,10 +103,10 @@ impl CollectionStore {
     /// be tombstoned. The entire payload map is replaced atomically via a
     /// WAL-backed transaction.
     pub fn set_payload(&self, id: &PointId, payload: Payload) -> Result<()> {
-        let slot = self.live_slot_of(id)?;
+        self.live_slot_of(id)?;
         let json = serde_json::to_string(&payload)?;
         self.apply_ops(&[WalRecord::SetPayload {
-            slot,
+            point_id: id.to_string(),
             payload: Some(json),
         }])
     }
@@ -131,12 +131,12 @@ impl CollectionStore {
         if fields.is_empty() {
             return Ok(());
         }
-        let slot = self.live_slot_of(id)?;
+        self.live_slot_of(id)?;
         let mut ops = Vec::with_capacity(fields.len());
         for (key, value) in fields {
             let json = serde_json::to_string(&value)?;
             ops.push(WalRecord::SetPayloadField {
-                slot,
+                point_id: id.to_string(),
                 key,
                 value: json,
             });
@@ -147,8 +147,11 @@ impl CollectionStore {
     /// Remove specific keys from a point's payload. The remaining keys are
     /// preserved. If the point has no payload this is a no-op.
     pub fn delete_payload_keys(&self, id: &PointId, keys: Vec<String>) -> Result<()> {
-        let slot = self.live_slot_of(id)?;
-        self.apply_ops(&[WalRecord::DeletePayloadKeys { slot, keys }])
+        self.live_slot_of(id)?;
+        self.apply_ops(&[WalRecord::DeletePayloadKeys {
+            point_id: id.to_string(),
+            keys,
+        }])
     }
 
     /// Resolve a live point's slot or fail with `InvalidPointId`.

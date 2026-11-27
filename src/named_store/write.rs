@@ -111,18 +111,17 @@ impl NamedStore {
     fn commit_for_point(
         &self,
         point_id: &PointId,
-        build: impl FnOnce(u32) -> Result<Vec<WalRecord>>,
+        build: impl FnOnce(String) -> Result<Vec<WalRecord>>,
     ) -> Result<()> {
         let started = Instant::now();
         let _gate = self.gate.lock();
         let mut inner = self.inner.lock();
-        let slot = inner
-            .reverse
-            .get(point_id)
-            .ok_or_else(|| {
-                VectorSearchError::InvalidConfig(format!("point {point_id} not found"))
-            })?;
-        let records = build(slot)?;
+        if !inner.reverse.contains_key(point_id) {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "point {point_id} not found"
+            )));
+        }
+        let records = build(point_id.to_string())?;
         self.commit_records_locked(&mut inner, records, started)
     }
 
@@ -149,12 +148,15 @@ impl NamedStore {
                 )
             })
             .count() as u64;
+        // The LSN is consumed only by a durable append: bumping it before the
+        // append would leave a hole on failure and break segment-name
+        // continuity. The gate serializes commits, so no race is possible.
         let txn_id = inner.next_lsn;
-        inner.next_lsn += 1;
         self.wal.append(&WalTxn {
             txn_id,
             ops: records.clone(),
         })?;
+        inner.next_lsn += 1;
         for record in records {
             match record {
                 WalRecord::UpsertVectors {
@@ -179,7 +181,10 @@ impl NamedStore {
                         }
                     }
                 }
-                WalRecord::SetPayload { slot, payload } => {
+                WalRecord::SetPayload { point_id, payload } => {
+                    let Some(slot) = inner.reverse.get_str(&point_id) else {
+                        continue;
+                    };
                     if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         let payload = payload
                             .as_ref()
@@ -188,7 +193,10 @@ impl NamedStore {
                         point.replace_payload(payload);
                     }
                 }
-                WalRecord::DeletePayloadKeys { slot, keys } => {
+                WalRecord::DeletePayloadKeys { point_id, keys } => {
+                    let Some(slot) = inner.reverse.get_str(&point_id) else {
+                        continue;
+                    };
                     if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         if let Some(payload) = &mut point.payload {
                             for key in keys {
@@ -198,7 +206,14 @@ impl NamedStore {
                         point.touch_payload();
                     }
                 }
-                WalRecord::SetPayloadField { slot, key, value } => {
+                WalRecord::SetPayloadField {
+                    point_id,
+                    key,
+                    value,
+                } => {
+                    let Some(slot) = inner.reverse.get_str(&point_id) else {
+                        continue;
+                    };
                     if let Some(Some(point)) = inner.points.get_mut(slot as usize) {
                         let payload = point.payload.get_or_insert_with(Default::default);
                         let value: serde_json::Value = serde_json::from_str(&value)?;
@@ -317,16 +332,19 @@ impl NamedStore {
     /// Replace the payload for a single point.
     pub fn set_payload(&self, point_id: &PointId, payload: Payload) -> Result<()> {
         let payload = Some(serde_json::to_string(&payload)?);
-        self.commit_for_point(point_id, |slot| {
-            Ok(vec![WalRecord::SetPayload { slot, payload }])
+        self.commit_for_point(point_id, |id| {
+            Ok(vec![WalRecord::SetPayload {
+                point_id: id,
+                payload,
+            }])
         })
     }
 
     /// Remove specific keys from a point's payload.
     pub fn delete_payload_keys(&self, point_id: &PointId, keys: &[String]) -> Result<()> {
-        self.commit_for_point(point_id, |slot| {
+        self.commit_for_point(point_id, |id| {
             Ok(vec![WalRecord::DeletePayloadKeys {
-                slot,
+                point_id: id,
                 keys: keys.to_vec(),
             }])
         })
@@ -339,10 +357,14 @@ impl NamedStore {
             .map(|(key, value)| Ok((key, serde_json::to_string(&value)?)))
             .collect();
         let encoded = encoded?;
-        self.commit_for_point(point_id, |slot| {
+        self.commit_for_point(point_id, |id| {
             Ok(encoded
                 .into_iter()
-                .map(|(key, value)| WalRecord::SetPayloadField { slot, key, value })
+                .map(|(key, value)| WalRecord::SetPayloadField {
+                    point_id: id.clone(),
+                    key,
+                    value,
+                })
                 .collect())
         })
     }

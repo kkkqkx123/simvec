@@ -138,6 +138,22 @@ impl<V: Copy> IdMap<V> {
         self.uuid.clear();
     }
 
+    /// Whether `id` is present, regardless of its value.
+    pub(crate) fn contains_id(&self, id: &PointId) -> bool {
+        match id {
+            PointId::Num(n) => self.numeric.contains_key(n),
+            PointId::Uuid(u) => self.uuid.contains_key(u.as_str()),
+        }
+    }
+
+    /// Remove `id`, returning its value if present.
+    pub(crate) fn remove_value(&mut self, id: &PointId) -> Option<V> {
+        match id {
+            PointId::Num(n) => self.numeric.remove(n),
+            PointId::Uuid(u) => self.uuid.remove(u.as_str()),
+        }
+    }
+
     /// All entries as typed ids and values.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (PointId, V)> + '_ {
         self.numeric
@@ -208,13 +224,13 @@ impl IdMap<u32> {
 struct StoreInner {
     meta: Meta,
     reverse: IdMap,
-    /// Slots handed out by the commit queue's reserve step for transactions
-    /// that are not applied yet. An id stays here from the moment its slot is
-    /// reserved until the applier writes the directory entry, so a concurrent
-    /// transaction upserting the same id reuses the slot instead of getting a
-    /// second one. The slot numbers are exactly the ones replay assigns,
-    /// because both walk the log in the same order.
-    reserved: IdMap,
+    /// Ids reserved by the commit queue's reserve step for transactions that
+    /// are not applied yet. Presence only — slot numbers are assigned at
+    /// apply time in log order, so live and replay derive identical numbers
+    /// by construction. An id stays here from reserve until the applier
+    /// publishes it, letting a concurrent transaction upserting the same id
+    /// share the forthcoming slot instead of counting a second one.
+    reserved: IdMap<()>,
     /// Next log sequence number to hand out. Initialized above the water mark
     /// replayed at open, so a replayed record can never collide with a new
     /// one.

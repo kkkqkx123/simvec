@@ -38,7 +38,7 @@ use super::segment_ivf::{self, SegmentIvf};
 use super::segments;
 use super::tombstones::TombstoneBits;
 use super::vectors::Vectors;
-use super::{CollectionStore, DataFiles, Meta, WalRecord, WalTxn};
+use super::{CollectionStore, DataFiles, Meta};
 use crate::error::{Result, VectorSearchError};
 use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
 use crate::types::{HnswConfig, IndexConfig, IvfConfig, PointId};
@@ -646,7 +646,7 @@ impl CollectionStore {
         // no longer describes.
         self.generation_poisoned
             .store(true, AtomicOrdering::Release);
-        // The watermark written by the truncate below belongs to the new
+        // The ack published by the wipe below belongs to the new
         // generation, not to the one the log was opened with.
         self.wal.bind_generation(next_generation.id());
         // Reopen from the published path so every handle's path stays valid
@@ -712,11 +712,11 @@ impl CollectionStore {
             .store(had_index && !has_new_index, AtomicOrdering::Relaxed);
 
         // The manifest is published; recovery replays from its lsn even if the
-        // old WAL segments survive a crash here.
-        self.wal.append(&WalTxn {
-            txn_id: watermark,
-            ops: vec![WalRecord::Compact],
-        })?;
+        // old WAL segments survive a crash here. The gate is drained, so no
+        // transaction is newer than the watermark: truncating through it
+        // empties the log. No marker is written — the surviving generation
+        // lsn plus the published ack pin the replay floor, and the next
+        // allocated LSN cannot collide.
         self.wal.truncate_through(watermark)?;
 
         // Old mmaps stay valid for readers that loaded them before the swap.

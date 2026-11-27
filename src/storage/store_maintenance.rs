@@ -84,7 +84,7 @@ impl CollectionStore {
         self.flush_data_files(capacity)?;
 
         // Phase 2: durable water marks.
-        let inner = self.inner.write();
+        let mut inner = self.inner.write();
         let data_dir = self.data_dir();
         inner.meta.save(&data_dir)?;
         segments::write(&data_dir, inner.meta.segment_slots, inner.meta.next_slot)?;
@@ -112,11 +112,28 @@ impl CollectionStore {
         // through the water mark: every segment covered by `meta.bin` is
         // unlinked, and only transactions newer than it would survive (there
         // are none — the queue gate is closed for the whole call).
+        //
+        // The marker takes a freshly allocated LSN, never the watermark:
+        // reusing the watermark would duplicate the previous tail's LSN and
+        // break segment-name continuity on a rollover. The generation lsn
+        // stays at the watermark (the files contain exactly that); the marker
+        // is a no-op whose segment survives the truncate below.
         let watermark = inner.meta.last_applied_txn;
-        self.wal.append(&WalTxn {
-            txn_id: watermark,
+        let marker_lsn = inner.next_lsn;
+        inner.next_lsn = marker_lsn + 1;
+        if let Err(e) = self.wal.append(&WalTxn {
+            txn_id: marker_lsn,
             ops: vec![WalRecord::Compact],
-        })?;
+        }) {
+            // The gate is closed and `inner` is held: no other LSN can be
+            // allocated concurrently, so the number is safely returned.
+            inner.next_lsn = marker_lsn;
+            return Err(e);
+        }
+        // The in-memory water mark stays at the watermark (the files contain
+        // exactly that); the marker is a no-op whose LSN was consumed from
+        // `next_lsn`, so a back-to-back checkpoint naturally allocates a new
+        // one. Replay converges on the same numbering.
         self.wal.truncate_through(watermark)?;
         drop(inner);
         self.metrics.record_checkpoint(started.elapsed());
@@ -458,15 +475,15 @@ impl CollectionStore {
         let mut inner = self.inner.write();
         inner.meta.quantization_config = new_quant;
         inner.meta.save(&self.data_dir())?;
-        // Append a WAL checkpoint so replay knows to re-validate quant files.
-        // No in-memory mutation is needed; replay for `Quantize` is a no-op
-        // because quant files are derived and rebuildable.
-        // Best-effort: WAL append failure after meta save is still recoverable
+        // Route the marker through the commit queue so it carries a freshly
+        // allocated LSN in queue order: reusing `last_applied_txn` here could
+        // duplicate a concurrent transaction's LSN and break segment-name
+        // continuity. Replay for `Quantize` is a no-op because quant files
+        // are derived and rebuildable.
+        // Best-effort: WAL failure after meta save is still recoverable
         // (open discards corrupt quant files and falls back to exact).
-        let _ = self.wal.append(&WalTxn {
-            txn_id: inner.meta.last_applied_txn,
-            ops: vec![WalRecord::Quantize],
-        });
+        drop(inner);
+        let _ = self.apply_ops(&[WalRecord::Quantize]);
         Ok(())
     }
 }
