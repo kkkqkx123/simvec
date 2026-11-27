@@ -29,6 +29,7 @@ use std::time::Duration;
 use memmap2::Mmap;
 
 use super::directory::KEY_REC_SIZE;
+use super::dense_snapshot::{DenseSnapshot, SnapshotPoint};
 use super::generation::StagedGeneration;
 use super::index_lifecycle::PublishedIndex;
 use super::keys::Keys;
@@ -59,10 +60,16 @@ struct CompactionPlan {
     /// `map[old_slot] = new_slot` for live slots; `u32::MAX` = dropped.
     map: Vec<u32>,
     live_count: u64,
+    /// Id directory and per-id water marks captured under the store lock.
+    points: Vec<SnapshotPoint>,
 }
 
 /// Compute the plan from a metadata snapshot and the current tombstone bits.
-fn build_plan(meta: &Meta, tombstones: &TombstoneBits) -> CompactionPlan {
+fn build_plan(
+    meta: &Meta,
+    tombstones: &TombstoneBits,
+    inner: &super::StoreInner,
+) -> CompactionPlan {
     let (new_capacity, map) =
         plan_slots(|s| !tombstones.bit(s), meta.next_slot, meta.segment_slots);
     let live_count = map.iter().filter(|s| **s != u32::MAX).count() as u64;
@@ -75,6 +82,7 @@ fn build_plan(meta: &Meta, tombstones: &TombstoneBits) -> CompactionPlan {
         new_capacity,
         map,
         live_count,
+        points: DenseSnapshot::capture_points(&inner.reverse, &inner.versions),
     }
 }
 
@@ -288,7 +296,7 @@ impl CollectionStore {
                     return Ok(inner.meta.live_count);
                 }
                 let tombstones = self.data_arc().tombstones.load();
-                build_plan(&inner.meta, &tombstones)
+                build_plan(&inner.meta, &tombstones, &inner)
             };
             let version = self.mutations.load(AtomicOrdering::Relaxed);
             let staged = self.generation.read().stage()?;
@@ -333,7 +341,7 @@ impl CollectionStore {
             return Ok(inner.meta.live_count);
         }
         let tombstones = self.data_arc().tombstones.load();
-        let plan = build_plan(&inner.meta, &tombstones);
+        let plan = build_plan(&inner.meta, &tombstones, &inner);
         drop(tombstones);
         let staged = self.generation.read().stage()?;
         let remapped = match self.stage_generation(&plan, &staged) {
@@ -464,7 +472,8 @@ impl CollectionStore {
             .as_ref()
             .as_ref()
             .expect("PayloadStore must be present");
-        old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
+        let new_store = old_store.compact_to(&dir.join("payloads_store"), &live_slots)?;
+        let tracker_version = new_store.tracker_version();
         drop(ps_guard);
 
         TombstoneBits::new(plan.new_capacity as usize).save(dir, plan.new_capacity)?;
@@ -472,6 +481,29 @@ impl CollectionStore {
         if defs.exists() {
             std::fs::copy(defs, dir.join("payload_indexes.json"))?;
         }
+        let points = plan
+            .points
+            .iter()
+            .map(|point| {
+                let mut mapped = point.clone();
+                if !mapped.deleted {
+                    mapped.slot = plan.map[point.slot as usize];
+                }
+                mapped
+            })
+            .collect();
+        let snapshot = DenseSnapshot {
+            generation: staged.id(),
+            lsn: meta.last_applied_txn,
+            next_slot: meta.next_slot,
+            slot_capacity: meta.slot_capacity,
+            live_count: meta.live_count,
+            tombstone_count: 0,
+            tracker_version,
+            points,
+            tombstones: Vec::new(),
+        };
+        DenseSnapshot::write(dir, &snapshot)?;
         meta.save(dir)?;
 
         Ok(self.remapped_index(plan, dir))
@@ -501,6 +533,9 @@ impl CollectionStore {
         let had_index = self.data_arc().index.load().is_some();
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, watermark)?;
+        // The watermark written by the truncate below belongs to the new
+        // generation, not to the one the log was opened with.
+        self.wal.bind_generation(next_generation.id());
         // Reopen from the published path so every handle's path stays valid
         // for later growth and checkpoint writes.
         let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage)?;

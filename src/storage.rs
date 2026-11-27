@@ -6,6 +6,7 @@
 //! - `vectors.bin`  dense row-major f32, segmented mmap
 //! - `keys.bin`     slot -> point id directory
 //! - `tombstones.bin` slot -> deleted flag (survives WAL truncation)
+//! - `dense_snapshot.bin` id directory + per-id lsn at the generation's lsn
 //! - `payloads_store/` block-based payload storage (tracker + pages)
 //!
 //! The generation manifest is the commit point; compaction stages a whole
@@ -49,6 +50,7 @@ mod tombstones;
 pub(crate) mod vectors;
 mod wal;
 
+mod dense_snapshot;
 mod store_maintenance;
 mod store_open;
 mod store_payload;
@@ -96,12 +98,12 @@ use crate::types::{IvfConfig, Payload, PointId, StorageConfig};
 /// against 48-56 for the enum) and confines the owned `String` allocation to
 /// ids that really are uuids.
 #[derive(Debug, Default)]
-pub(crate) struct IdMap {
-    numeric: HashMap<u64, u32>,
-    uuid: HashMap<String, u32>,
+pub(crate) struct IdMap<V = u32> {
+    numeric: HashMap<u64, V>,
+    uuid: HashMap<String, V>,
 }
 
-impl IdMap {
+impl<V: Copy> IdMap<V> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             numeric: HashMap::with_capacity(capacity),
@@ -113,6 +115,39 @@ impl IdMap {
         self.numeric.len() + self.uuid.len()
     }
 
+    pub(crate) fn get_value(&self, id: &PointId) -> Option<V> {
+        match id {
+            PointId::Num(n) => self.numeric.get(n).copied(),
+            PointId::Uuid(u) => self.uuid.get(u.as_str()).copied(),
+        }
+    }
+
+    pub(crate) fn insert_value(&mut self, id: &PointId, value: V) -> Option<V> {
+        match id {
+            PointId::Num(n) => self.numeric.insert(*n, value),
+            PointId::Uuid(u) => self.uuid.insert(u.clone(), value),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.numeric.clear();
+        self.uuid.clear();
+    }
+
+    /// All entries as typed ids and values.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (PointId, V)> + '_ {
+        self.numeric
+            .iter()
+            .map(|(&number, &value)| (PointId::Num(number), value))
+            .chain(
+                self.uuid
+                    .iter()
+                    .map(|(id, &value)| (PointId::Uuid(id.clone()), value)),
+            )
+    }
+}
+
+impl IdMap<u32> {
     /// Slot holding a point id that arrived as a string (WAL records and
     /// snapshots carry ids as text). Numeric ids are parsed, never allocated.
     pub(crate) fn get_str(&self, id: &str) -> Option<u32> {
@@ -163,11 +198,6 @@ impl IdMap {
             PointId::Uuid(u) => self.uuid.remove(u.as_str()),
         }
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.numeric.clear();
-        self.uuid.clear();
-    }
 }
 
 /// In-memory mutable state, guarded by the store's `RwLock`.
@@ -191,6 +221,10 @@ struct StoreInner {
     ivf_config: Option<IvfConfig>,
     /// Last measured drift ratio, exposed via `CollectionInfo`.
     last_drift_ratio: Option<f64>,
+    /// Last applied lsn for every known id, including deleted ids. A
+    /// replayed record older than its id's water mark is dropped instead of
+    /// overwriting newer state with a resurrected WAL segment.
+    versions: IdMap<u64>,
     /// Slot-indexed pre-filter bitmap for equality payload conditions.
     filter_bitmap: FilterBitmap,
     /// Declared per-field payload indexes (MapIndex / NumericIndex).

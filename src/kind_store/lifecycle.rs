@@ -50,8 +50,9 @@ impl KindStore {
         };
         let bytes = postcard::to_stdvec(&meta)?;
         std::fs::write(dir.join("kind.bin"), &bytes)?;
-        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         let generation = Generation::create(dir)?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
+        wal.bind_generation(generation.id());
         let data_dir = generation.path();
         let blobs = PointBlobs::create(&data_dir.join(BLOBS_FILE))?;
         let payloads = PointBlobs::create(&data_dir.join(PAYLOADS_FILE))?;
@@ -81,8 +82,9 @@ impl KindStore {
     pub fn open(dir: &Path, storage: &crate::types::StorageConfig) -> Result<Arc<Self>> {
         let bytes = std::fs::read(dir.join("kind.bin"))?;
         let meta: KindMeta = postcard::from_bytes(&bytes)?;
-        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
         let generation = Generation::open(dir)?;
+        let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
+        wal.bind_generation(generation.id());
         let data_dir = generation.path();
         let snapshot_path = data_dir.join("kind_snapshot.bin");
         let snapshot = snapshot::read::<KindSnapshot>(&snapshot_path)?;
@@ -283,6 +285,7 @@ impl KindStore {
         drop((blobs, payloads, postings));
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, lsn)?;
+        self.wal.bind_generation(next_generation.id());
 
         let data_dir = next_generation.path();
         self.blobs.store(Arc::new(PointBlobs::open(

@@ -31,9 +31,11 @@
 //! removes every segment whose whole lsn range is at or below a durable water
 //! mark (the checkpoint's `last_applied_txn`), and [`Wal::truncate`] wipes the
 //! directory for the paths that rewrite every derived file anyway. Both paths
-//! publish the water mark in `wal/acked-lsn` *before* unlinking, so replay can
-//! skip a segment that survives a crash and cannot overwrite newer data with
-//! an old transaction.
+//! publish the water mark in `wal/acked-lsn` *before* unlinking, bound to the
+//! generation whose files it describes. A store binds its generation at open
+//! and after a compaction publish; an ack from a different generation is
+//! ignored, because only that generation's manifest knows which operations
+//! its files contain.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -61,7 +63,7 @@ const SEGMENT_NAME_DIGITS: usize = 20;
 const ACK_FILE: &str = "acked-lsn";
 const ACK_MAGIC: [u8; 4] = *b"SVAK";
 const ACK_VERSION: u32 = 1;
-const ACK_HEADER_LEN: usize = 20;
+const ACK_HEADER_LEN: usize = 28;
 
 /// Segments kept as one transaction log; the bytes after which a new segment
 /// is started. Default mirrors `StorageConfig::wal_segment_bytes`.
@@ -215,6 +217,11 @@ pub struct Wal {
     /// crosses a tombstone ratio, so without it the log would grow without
     /// bound.
     appended_bytes: std::sync::atomic::AtomicU64,
+    /// Generation the watermark belongs to. An ack written by another
+    /// generation describes a different set of data files and is ignored.
+    ack_generation: AtomicU64,
+    /// Generation whose log this is. Zero until the owning store binds it.
+    generation: AtomicU64,
     /// Highest lsn whose effects are durable in the data files. Only
     /// advanced by checkpoint/truncation paths, never by ordinary appends.
     acked_lsn: AtomicU64,
@@ -239,9 +246,12 @@ impl Wal {
             Some(name) => Some(OpenOptions::new().read(true).append(true).open(segment_path(dir, *name))?),
             None => None,
         };
+        let (ack_generation, ack_lsn) = read_ack(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_bytes: segment_bytes.max(1),
+            ack_generation: AtomicU64::new(ack_generation),
+            generation: AtomicU64::new(0),
             state: parking_lot::Mutex::new(WalState {
                 // An existing tail segment may hold transactions this process
                 // has not read; `replay`/`read_all` refines the bound.
@@ -250,7 +260,7 @@ impl Wal {
                 active,
             }),
             appended_bytes: std::sync::atomic::AtomicU64::new(total),
-            acked_lsn: AtomicU64::new(read_ack(dir)),
+            acked_lsn: AtomicU64::new(ack_lsn),
             #[cfg(test)]
             fail_next_append: std::sync::atomic::AtomicBool::new(false),
         })
@@ -269,9 +279,26 @@ impl Wal {
         self.segment_bytes
     }
 
-    /// Highest lsn already covered by the collection's data files.
+    /// Bind this log to the generation whose files it is replayed into.
+    /// An ack from a different generation is discarded: only the generation
+    /// manifest can say which operations its files already contain.
+    pub fn bind_generation(&self, generation: u64) {
+        self.generation.store(generation, AtomicOrdering::Release);
+    }
+
+    /// Highest lsn already covered by the bound generation's data files.
     pub fn acked_lsn(&self) -> u64 {
+        if self.ack_generation.load(AtomicOrdering::Acquire)
+            != self.generation.load(AtomicOrdering::Acquire)
+        {
+            return 0;
+        }
         self.acked_lsn.load(AtomicOrdering::Acquire)
+    }
+
+    /// Generation that published the current watermark.
+    pub fn ack_generation(&self) -> u64 {
+        self.ack_generation.load(AtomicOrdering::Acquire)
     }
 
     /// Read every transaction newer than the durable watermark.
@@ -445,7 +472,10 @@ impl Wal {
             state.active_last_lsn
         };
         let new_ack = self.acked_lsn().max(covered);
-        write_ack(&self.dir, new_ack)?;
+        let generation = self.generation.load(AtomicOrdering::Acquire);
+        write_ack(&self.dir, generation, new_ack)?;
+        self.ack_generation
+            .store(generation, AtomicOrdering::Release);
         for name in state.segments.drain(..) {
             remove_segment(&self.dir, name)?;
         }
@@ -478,9 +508,12 @@ impl Wal {
         // the data files. Publish that watermark before unlinking anything:
         // if a covered segment survives a crash, replay skips it instead of
         // overwriting newer state with old operations.
-        write_ack(&self.dir, self.acked_lsn().max(watermark))?;
-        self.acked_lsn
-            .store(self.acked_lsn().max(watermark), AtomicOrdering::Release);
+        let new_ack = self.acked_lsn().max(watermark);
+        let generation = self.generation.load(AtomicOrdering::Acquire);
+        write_ack(&self.dir, generation, new_ack)?;
+        self.ack_generation
+            .store(generation, AtomicOrdering::Release);
+        self.acked_lsn.store(new_ack, AtomicOrdering::Release);
         let segments = std::mem::take(&mut state.segments);
         let mut kept: Vec<u64> = Vec::with_capacity(segments.len());
         let mut removed_bytes = 0u64;
@@ -632,17 +665,21 @@ fn read_segment(
     Ok(last_txn)
 }
 
-/// Persist the replay watermark with a checksum and a directory fsync.
-/// A torn or corrupt file reads as zero, which is always safe: replay then
-/// starts from the first segment.
-fn write_ack(dir: &Path, lsn: u64) -> Result<()> {
+/// Persist the generation and replay watermark with a checksum and a
+/// directory fsync. A torn or corrupt file reads as an unbound zero, which
+/// is always safe: the generation manifest remains the replay authority.
+fn write_ack(dir: &Path, generation: u64, lsn: u64) -> Result<()> {
     let target = dir.join(ACK_FILE);
     let tmp = dir.join("acked-lsn.tmp");
     let mut bytes = Vec::with_capacity(ACK_HEADER_LEN);
     bytes.extend_from_slice(&ACK_MAGIC);
     bytes.extend_from_slice(&ACK_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&generation.to_le_bytes());
     bytes.extend_from_slice(&lsn.to_le_bytes());
-    bytes.extend_from_slice(&crc32fast::hash(&lsn.to_le_bytes()).to_le_bytes());
+    let mut checked = Vec::with_capacity(16);
+    checked.extend_from_slice(&generation.to_le_bytes());
+    checked.extend_from_slice(&lsn.to_le_bytes());
+    bytes.extend_from_slice(&crc32fast::hash(&checked).to_le_bytes());
 
     let mut file = File::create(&tmp)?;
     file.write_all(&bytes)?;
@@ -652,22 +689,29 @@ fn write_ack(dir: &Path, lsn: u64) -> Result<()> {
     sync_dir(dir)
 }
 
-fn read_ack(dir: &Path) -> u64 {
+fn read_ack(dir: &Path) -> (u64, u64) {
     let Ok(bytes) = std::fs::read(dir.join(ACK_FILE)) else {
-        return 0;
+        return (0, 0);
     };
     if bytes.len() != ACK_HEADER_LEN || bytes[0..4] != ACK_MAGIC {
-        return 0;
+        return (0, 0);
     }
     if u32::from_le_bytes(bytes[4..8].try_into().expect("ack version slice")) != ACK_VERSION {
-        return 0;
+        return (0, 0);
     }
-    let lsn_bytes: [u8; 8] = bytes[8..16].try_into().expect("ack lsn slice");
-    let expected = u32::from_le_bytes(bytes[16..20].try_into().expect("ack crc slice"));
-    if crc32fast::hash(&lsn_bytes) != expected {
-        return 0;
+    let generation_bytes: [u8; 8] = bytes[8..16].try_into().expect("ack generation slice");
+    let lsn_bytes: [u8; 8] = bytes[16..24].try_into().expect("ack lsn slice");
+    let expected = u32::from_le_bytes(bytes[24..28].try_into().expect("ack crc slice"));
+    let mut checked = Vec::with_capacity(16);
+    checked.extend_from_slice(&generation_bytes);
+    checked.extend_from_slice(&lsn_bytes);
+    if crc32fast::hash(&checked) != expected {
+        return (0, 0);
     }
-    u64::from_le_bytes(lsn_bytes)
+    (
+        u64::from_le_bytes(generation_bytes),
+        u64::from_le_bytes(lsn_bytes),
+    )
 }
 
 /// Make WAL segment removals and new segment names durable as a directory
@@ -1030,6 +1074,31 @@ mod tests {
         wal.append(&txn(3, 3)).unwrap();
         assert_eq!(wal.segment_names(), vec![3]);
         assert_eq!(wal.replay(|_| Ok(())).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_ack_belongs_to_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let first = wal(&path);
+        first.bind_generation(7);
+        first.append(&txn(1, 10)).unwrap();
+        first.truncate_through(1).unwrap();
+        assert_eq!(first.ack_generation(), 7);
+        assert_eq!(first.acked_lsn(), 1);
+        drop(first);
+
+        let reopened = wal(&path);
+        assert_eq!(reopened.ack_generation(), 7);
+        assert_eq!(reopened.acked_lsn(), 0, "unbound store cannot use the ack");
+        reopened.bind_generation(8);
+        assert_eq!(
+            reopened.acked_lsn(),
+            0,
+            "another generation's ack must be ignored"
+        );
+        reopened.bind_generation(7);
+        assert_eq!(reopened.acked_lsn(), 1);
     }
 
     #[test]

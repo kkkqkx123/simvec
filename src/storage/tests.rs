@@ -1,3 +1,4 @@
+use super::dense_snapshot::DenseSnapshot;
 use super::*;
 use crate::error::{Result, VectorSearchError};
 use crate::types::{CollectionConfig, DistanceMetric, VectorPoint};
@@ -673,7 +674,7 @@ fn test_checkpoint_flush_runs_without_the_write_lock() {
 
 #[test]
 fn test_id_map_handles_both_id_kinds() {
-    let mut map = IdMap::with_capacity(4);
+    let mut map: IdMap = IdMap::with_capacity(4);
     let num = PointId::Num(7);
     let uuid = PointId::Uuid("550e8400-e29b-41d4-a716-446655440000".to_string());
 
@@ -755,6 +756,127 @@ fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
     super::Generation::open(root).unwrap().path()
 }
 
+/// A checkpointed collection restores its directory from the dense snapshot;
+/// tampering with `keys.bin` must not change the ids the reopened store sees.
+#[test]
+fn test_dense_snapshot_restores_id_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_snapshot");
+    let store = CollectionStore::create(&store_dir, "col_snapshot", &config(4)).unwrap();
+    let payload = [("color", serde_json::json!("red"))]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    upsert_logged(
+        &store,
+        &VectorPoint::new("1111", vec![1.0, 0.0, 0.0, 0.0]).with_payload(payload),
+    );
+    upsert_logged(&store, &VectorPoint::new("2222", vec![0.0, 1.0, 0.0, 0.0]));
+    delete_logged(&store, &PointId::from("2222"));
+    store.checkpoint().unwrap();
+
+    let data = data_dir(&store_dir);
+    let snapshot = DenseSnapshot::read(&data).unwrap().unwrap();
+    assert_eq!(
+        snapshot.generation,
+        super::Generation::open(&store_dir).unwrap().id()
+    );
+    assert_eq!(snapshot.lsn, store.meta().last_applied_txn);
+    assert_eq!(snapshot.points.len(), 2);
+    assert_eq!(
+        snapshot.points.iter().filter(|point| point.deleted).count(),
+        1
+    );
+
+    let keys = data.join("keys.bin");
+    let mut bytes = std::fs::read(&keys).unwrap();
+    let match_at = bytes
+        .windows(4)
+        .position(|window| window == b"1111")
+        .expect("live key is stored in keys.bin");
+    bytes[match_at..match_at + 4].copy_from_slice(b"9999");
+    std::fs::write(&keys, bytes).unwrap();
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 1);
+    let point = reopened.get(&PointId::from("1111")).unwrap().unwrap();
+    assert_eq!(
+        point.payload.unwrap().get("color"),
+        Some(&serde_json::json!("red"))
+    );
+    assert!(reopened.get(&PointId::from("9999")).unwrap().is_none());
+}
+
+/// A snapshot ahead of the manifest belongs to a checkpoint that never
+/// committed. Open must ignore it and rebuild from files plus WAL.
+#[test]
+fn test_unpublished_dense_snapshot_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_snapshot_ahead");
+    let store = CollectionStore::create(&store_dir, "col_snapshot_ahead", &config(4)).unwrap();
+    upsert_logged(&store, &point(7, 4));
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let data = data_dir(&store_dir);
+    let mut snapshot = DenseSnapshot::read(&data).unwrap().unwrap();
+    snapshot.lsn += 1;
+    DenseSnapshot::write(&data, &snapshot).unwrap();
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 1);
+    assert!(reopened.get(&PointId::from(7u64)).unwrap().is_some());
+}
+
+/// Out-of-order segments are treated as stale per id: a resurrected old
+/// upsert cannot overwrite a newer state, nor revive a deleted id.
+#[test]
+fn test_point_versions_drop_stale_replay_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_versions");
+    let store = CollectionStore::create(&store_dir, "col_versions", &config(4)).unwrap();
+    let newer = VectorPoint::new(42, vec![5.0; 4]);
+    let older = VectorPoint::new(42, vec![3.0; 4]);
+    let resurrected = VectorPoint::new(43, vec![7.0; 4]);
+    let wal = store.wal();
+    wal.append(&WalTxn {
+        txn_id: 5,
+        ops: vec![WalRecord::Upsert {
+            point: WalPoint::from_point(&newer).unwrap(),
+        }],
+    })
+    .unwrap();
+    wal.append(&WalTxn {
+        txn_id: 9,
+        ops: vec![WalRecord::Delete {
+            point_id: "42".to_string(),
+        }],
+    })
+    .unwrap();
+    wal.append(&WalTxn {
+        txn_id: 7,
+        ops: vec![WalRecord::Upsert {
+            point: WalPoint::from_point(&older).unwrap(),
+        }],
+    })
+    .unwrap();
+    wal.append(&WalTxn {
+        txn_id: 8,
+        ops: vec![WalRecord::Upsert {
+            point: WalPoint::from_point(&resurrected).unwrap(),
+        }],
+    })
+    .unwrap();
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert!(reopened.get(&PointId::from(42u64)).unwrap().is_none());
+    let point = reopened.get(&PointId::from(43u64)).unwrap().unwrap();
+    assert_eq!(point.vector(), &[7.0; 4]);
+    assert_eq!(reopened.meta().last_applied_txn, 9);
+}
+
 /// Checkpoint advances the generation lsn with the data files, and compaction
 /// publishes a new generation while keeping the WAL truncated.
 #[test]
@@ -776,6 +898,11 @@ fn test_generation_advances_with_checkpoint_and_compaction() {
     assert_ne!(before, after);
     let generation = super::Generation::open(&store_dir).unwrap();
     assert_eq!(generation.lsn(), store.meta().last_applied_txn);
+    let snapshot = DenseSnapshot::read(&after).unwrap().unwrap();
+    assert_eq!(snapshot.generation, generation.id());
+    assert_eq!(snapshot.lsn, generation.lsn());
+    assert_eq!(snapshot.points.len(), 4);
+    assert_eq!(snapshot.tombstones.len(), 0);
     assert!(store.get(&PointId::from(2u64)).unwrap().is_none());
     drop(store);
 

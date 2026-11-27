@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::dense_snapshot::DenseSnapshot;
 use super::index_lifecycle::PublishedIndex;
 use super::quant::QuantStore;
 use super::WalRecord;
@@ -86,6 +87,29 @@ impl CollectionStore {
         let inner = self.inner.write();
         let data_dir = self.data_dir();
         inner.meta.save(&data_dir)?;
+        // The snapshot and the manifest describe one generation. Writing the
+        // snapshot first means a crash can only leave it ahead of the
+        // manifest, which open detects and discards; the WAL is still intact
+        // at that point.
+        let generation = self.generation.read().clone();
+        let data = self.data_arc();
+        let tracker_version = data
+            .payload_store
+            .load()
+            .as_ref()
+            .as_ref()
+            .map_or(0, |store| store.tracker_version());
+        let tombstones = data.tombstones.load();
+        let snapshot = DenseSnapshot::capture(
+            generation.id(),
+            inner.meta.last_applied_txn,
+            &inner.meta,
+            &inner.reverse,
+            &inner.versions,
+            &tombstones,
+            tracker_version,
+        );
+        DenseSnapshot::write(&data_dir, &snapshot)?;
         // Publish the generation's lsn before the WAL watermark: recovery
         // never replays past what this generation's files contain.
         self.generation.write().set_lsn(inner.meta.last_applied_txn)?;

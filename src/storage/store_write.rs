@@ -11,6 +11,14 @@ use crate::types::{Payload, PointId, VectorPoint};
 use super::store_open::{count_ops, validate_admission_locked, validate_point};
 use super::*;
 
+/// Whether this id already has a water mark at or above `lsn`.
+fn stale_for_id(inner: &StoreInner, id: &PointId, lsn: u64) -> bool {
+    inner
+        .versions
+        .get_value(id)
+        .is_some_and(|version| version >= lsn)
+}
+
 impl CollectionStore {
     /// Apply a WAL-backed transaction.
     ///
@@ -90,7 +98,7 @@ impl CollectionStore {
         let prev_capacity = self.inner.read().meta.slot_capacity;
         {
             let mut inner = self.inner.write();
-            self.apply_records_locked(&mut inner, ops)?;
+            self.apply_records_locked(&mut inner, lsn, ops)?;
             // The lsn comes from the queue's monotonic counter, so this only
             // ever advances; replay applies the same records in the same order
             // and converges on the same water mark.
@@ -152,23 +160,48 @@ impl CollectionStore {
     pub(super) fn apply_records_locked(
         &self,
         inner: &mut StoreInner,
+        lsn: u64,
         ops: &[WalRecord],
     ) -> Result<()> {
+        // Second line of defence after the generation water mark: a segment
+        // put back by hand can carry lsns the store has already applied.
+        if lsn <= inner.meta.last_applied_txn {
+            return Ok(());
+        }
         // One bump per batch: compaction compares this counter across its
         // temp-file rewrite phase to prove no write raced it.
         self.mutations.fetch_add(1, AtomicOrdering::Relaxed);
+        // Versions advance once the batch is applied, so several operations
+        // on the same id inside one transaction all take effect. A replay of
+        // that transaction later still sees the version and is skipped.
+        let mut touched: Vec<PointId> = Vec::new();
         for op in ops {
             match op {
                 WalRecord::Upsert { point } => {
+                    let id = PointId::from(point.id.as_str());
+                    if stale_for_id(inner, &id, lsn) {
+                        continue;
+                    }
                     let point = point.to_point()?;
                     self.apply_upsert_locked(inner, &point)?;
+                    touched.push(id);
                 }
                 WalRecord::Delete { point_id } => {
-                    self.apply_delete_locked(inner, &PointId::from(point_id.as_str()))?
+                    let id = PointId::from(point_id.as_str());
+                    if stale_for_id(inner, &id, lsn) {
+                        continue;
+                    }
+                    self.apply_delete_locked(inner, &id)?;
+                    touched.push(id);
                 }
                 WalRecord::DeleteBatch { point_ids } => {
                     for id in point_ids {
-                        self.apply_delete_locked(inner, &PointId::from(id.as_str()))?;
+                        let id = PointId::from(id.as_str());
+                        if stale_for_id(inner, &id, lsn) {
+                            continue;
+                        }
+                        self.apply_delete_locked(inner, &id)?;
+                        touched.push(id);
                     }
                 }
                 WalRecord::SetPayload { slot, payload } => {
@@ -199,6 +232,9 @@ impl CollectionStore {
                     ));
                 }
             }
+        }
+        for id in touched {
+            inner.versions.insert_value(&id, lsn);
         }
         Ok(())
     }

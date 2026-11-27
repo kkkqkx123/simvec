@@ -15,8 +15,9 @@ use super::{StoreConfig, TRACKER_MAGIC};
 /// File format version.
 const TRACKER_VERSION: u32 = 1;
 
-/// Header: magic(4) + version(4) + slot_count(4) + block_size(4) + page_size(4) = 20 bytes.
-const TRACKER_HEADER_LEN: usize = 20;
+/// Header: magic(4) + version(4) + slot_count(4) + block_size(4) + page_size(4)
+/// + tracker_version(8) = 28 bytes.
+const TRACKER_HEADER_LEN: usize = 28;
 
 /// A pointer to a contiguous range of blocks within a data page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +63,7 @@ impl ValuePointer {
 /// Persisted to `tracker.bin` with a simple binary format for fast reload.
 pub struct Tracker {
     pointers: Vec<ValuePointer>,
-    pub(super) version: u64,
+    pub(crate) version: u64,
 }
 
 impl Tracker {
@@ -87,6 +88,12 @@ impl Tracker {
     /// Get the pointer for a slot (O(1)).
     pub fn get(&self, slot: u32) -> Option<ValuePointer> {
         self.pointers.get(slot as usize).copied()
+    }
+
+    /// Monotonic count of pointer changes, persisted with the file so a
+    /// generation snapshot can tell whether it describes this tracker.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
     /// All persisted pointers, used by open-time consistency validation.
@@ -135,6 +142,7 @@ impl Tracker {
         buf.extend_from_slice(&slot_count.to_le_bytes());
         buf.extend_from_slice(&(config.block_size as u32).to_le_bytes());
         buf.extend_from_slice(&(config.page_size as u32).to_le_bytes());
+        buf.extend_from_slice(&self.version.to_le_bytes());
 
         for ptr in &self.pointers {
             buf.extend_from_slice(&ptr.page_id.to_le_bytes());
@@ -172,6 +180,7 @@ impl Tracker {
         let slot_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
         let block_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
         let page_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+        let version = u64::from_le_bytes(data[20..28].try_into().expect("tracker version slice"));
 
         if block_size != config.block_size || page_size != config.page_size {
             return Err(VectorSearchError::CorruptData(format!(
@@ -206,10 +215,7 @@ impl Tracker {
             });
         }
 
-        Ok(Self {
-            pointers,
-            version: 0,
-        })
+        Ok(Self { pointers, version })
     }
 }
 
@@ -254,6 +260,7 @@ mod tests {
             let tracker = Tracker::open(dir.path(), &config).unwrap();
             assert_eq!(tracker.get(0).unwrap(), ValuePointer::new(0, 5, 128));
             assert_eq!(tracker.get(10).unwrap(), ValuePointer::new(2, 0, 512));
+            assert_eq!(tracker.version(), 2);
         }
     }
 }

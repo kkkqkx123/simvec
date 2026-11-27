@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 
+use super::dense_snapshot::DenseSnapshot;
 use super::filter_bitmap::FilterBitmap;
 use super::generation::Generation;
 use super::keys::Keys;
@@ -167,6 +168,7 @@ impl CollectionStore {
         initial_tombstones.save(&data_dir, meta.slot_capacity)?;
         let slot_capacity = meta.slot_capacity;
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
+        wal.bind_generation(generation.id());
         // New collections always use the Gridstore-style PayloadStore.
         let payload_store =
             PayloadStore::create(&data_dir.join("payloads_store"), storage.payload_store_config())?;
@@ -189,6 +191,7 @@ impl CollectionStore {
                 meta,
                 reverse: IdMap::with_capacity(slot_capacity as usize),
                 reserved: IdMap::default(),
+                versions: IdMap::default(),
                 next_lsn: 1,
                 ivf_config: match &config.index {
                     IndexConfig::Ivf(opt) => opt.clone(),
@@ -234,10 +237,15 @@ impl CollectionStore {
                 });
             }
         }
-        let meta = Meta::load(&data_dir)?;
+        let mut meta = Meta::load(&data_dir)?;
+        // `meta.bin` is written before the generation manifest. If a crash
+        // separates them, the manifest is the authority: reapplying the tail
+        // is idempotent, while skipping it would lose committed writes.
+        meta.last_applied_txn = meta.last_applied_txn.min(generation.lsn());
         let files = Arc::new(DataFiles::open(&data_dir, &meta, storage)?);
 
         let mut reverse = IdMap::with_capacity(meta.slot_capacity as usize);
+        let mut versions: IdMap<u64> = IdMap::default();
         let mut filter_bitmap = FilterBitmap::with_capacity(meta.slot_capacity as usize);
         let mut payload_indexes = PayloadIndexManager::new();
         for def in PayloadIndexManager::load_defs(&data_dir) {
@@ -248,32 +256,61 @@ impl CollectionStore {
                 continue;
             }
         }
+        let tombstone_count = files.tombstones.load().count_ones();
+        let tracker_version = files
+            .payload_store
+            .load()
+            .as_ref()
+            .as_ref()
+            .map_or(0, |store| store.tracker_version());
+        let snapshot = DenseSnapshot::read(&data_dir)?.filter(|snapshot| {
+            snapshot.matches(&generation, &meta, tombstone_count)
+                && snapshot.tracker_version == tracker_version
+        });
         {
-            let keys_view = files.keys.snapshot();
-            let tombstone_view = files.tombstones.load();
             let ps_guard = files.payload_store.load();
             let payload_store = ps_guard.as_ref().as_ref().expect("payload store is present");
-            for slot in 0..meta.next_slot as usize {
-                if let Some(key) = Keys::read_key(&keys_view, slot)? {
-                    // Tombstoned slots keep their key in `keys.bin` until
-                    // compaction reclaims them, but they must not re-enter the
-                    // live id map: a later upsert of the same id has to take a
-                    // fresh slot instead of silently writing into a slot that
-                    // stays invisible.
-                    if tombstone_view.bit(slot) {
+            if let Some(snapshot) = &snapshot {
+                for point in &snapshot.points {
+                    let id = DenseSnapshot::point_id(point);
+                    versions.insert_value(&id, point.lsn);
+                    if point.deleted {
                         continue;
                     }
-                    let id = PointId::from(key);
-                    reverse.insert(&id, slot as u32);
-                    if let Ok(Some(p)) = payload_store.get(slot as u32) {
-                        filter_bitmap.register_slot(slot as u32, Some(&p));
-                        payload_indexes.register_slot(slot as u32, Some(&p));
+                    reverse.insert(&id, point.slot);
+                    if let Ok(Some(p)) = payload_store.get(point.slot) {
+                        filter_bitmap.register_slot(point.slot, Some(&p));
+                        payload_indexes.register_slot(point.slot, Some(&p));
+                    }
+                }
+                meta.last_applied_txn = meta.last_applied_txn.max(snapshot.lsn);
+            } else {
+                let keys_view = files.keys.snapshot();
+                let tombstone_view = files.tombstones.load();
+                for slot in 0..meta.next_slot as usize {
+                    if let Some(key) = Keys::read_key(&keys_view, slot)? {
+                        // Tombstoned slots keep their key in `keys.bin` until
+                        // compaction reclaims them, but they must not re-enter the
+                        // live id map: a later upsert of the same id has to take a
+                        // fresh slot instead of silently writing into a slot that
+                        // stays invisible.
+                        if tombstone_view.bit(slot) {
+                            continue;
+                        }
+                        let id = PointId::from(key);
+                        reverse.insert(&id, slot as u32);
+                        versions.insert_value(&id, meta.last_applied_txn);
+                        if let Ok(Some(p)) = payload_store.get(slot as u32) {
+                            filter_bitmap.register_slot(slot as u32, Some(&p));
+                            payload_indexes.register_slot(slot as u32, Some(&p));
+                        }
                     }
                 }
             }
         }
 
         let wal = Wal::open_or_create(&dir.join("wal"), storage.wal_segment_bytes)?;
+        wal.bind_generation(generation.id());
 
         let store = Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
@@ -289,6 +326,7 @@ impl CollectionStore {
                 meta,
                 reverse,
                 reserved: IdMap::default(),
+                versions,
                 next_lsn: 1,
                 last_drift_ratio: None,
                 filter_bitmap,
@@ -333,7 +371,7 @@ impl CollectionStore {
         let (txns, last) = self.wal.read_all_from(floor)?;
         let mut inner = self.inner.write();
         for txn in &txns {
-            self.apply_records_locked(&mut inner, &txn.ops)?;
+            self.apply_records_locked(&mut inner, txn.txn_id, &txn.ops)?;
         }
         // Even an empty WAL carries information: the floor tells us how far
         // the data files have been checkpointed. Starting new lsns at 1 after

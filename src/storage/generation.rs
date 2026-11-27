@@ -104,6 +104,11 @@ impl Generation {
             .join(format!("g{:020}", self.manifest.generation))
     }
 
+    /// Monotonic id of the published generation.
+    pub(crate) fn id(&self) -> u64 {
+        self.manifest.generation
+    }
+
     /// Lsn whose effects are durable in this generation. WAL recovery never
     /// goes past it, regardless of the log's own watermark.
     pub(crate) fn lsn(&self) -> u64 {
@@ -184,6 +189,10 @@ impl Generation {
 impl StagedGeneration {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Remove an unpublished generation after a failed build.
