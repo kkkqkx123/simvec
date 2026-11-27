@@ -10,16 +10,18 @@
 //! payloads_store/
 //! ├── config.json     — StoreConfig (block_size, page_size)
 //! ├── tracker.bin     — slot → ValuePointer mapping
+//! ├── tracker.journal.bin — changes since the last tracker.bin publication
 //! ├── bitmask.bin     — block usage bitmap (1 = used, 0 = free)
 //! ├── page_0000.bin   — 32 MB data page (256K × 128 B blocks)
 //! ├── page_0001.bin
 //! └── ...
 //! ```
 //!
-//! Each payload is serialized as JSON bytes and stored across one or more
-//! contiguous 128-byte blocks within a page. The tracker provides direct
-//! O(1) slot → pointer lookup, and the bitmask enables fast free-space
-//! allocation without scanning.
+//! Each payload is stored as `[u32 crc32(JSON)][JSON bytes]` across one or
+//! more contiguous 128-byte blocks within a page. The CRC prevents a
+//! length-valid but overwritten page from being served as a different
+//! payload. The tracker provides direct O(1) slot → pointer lookup, and the
+//! bitmask enables fast free-space allocation without scanning.
 //!
 //! All on-disk state is derived: the collection WAL carries every payload
 //! write durably before it is applied, so replay can rebuild tracker, bitmask
@@ -45,6 +47,9 @@ const TRACKER_MAGIC: [u8; 4] = *b"VPTR";
 
 /// Magic bytes for the bitmask file.
 const BITMASK_MAGIC: [u8; 4] = *b"VBMP";
+
+/// CRC prefix stored in front of every payload blob in a data page.
+const PAYLOAD_CRC_LEN: usize = 4;
 
 /// Default block size: 128 bytes.
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
@@ -143,6 +148,32 @@ impl PayloadStore {
         })
     }
 
+    /// Open an existing payload store at `path`, rebuilding it from the WAL
+    /// when no generation has checkpointed yet.
+    ///
+    /// Before the first checkpoint every payload in the store is also in the
+    /// log, so a derived file that cannot be opened is disposable: replacing
+    /// it with an empty store lets WAL replay reconstruct every pointer. Once
+    /// a generation has published an lsn the log may no longer carry those
+    /// bytes, so the same damage stays `CorruptData`.
+    pub fn open_with_repair(path: &Path, replay_floor: u64, config: StoreConfig) -> Result<Self> {
+        match Self::open(path) {
+            Ok(store) => Ok(store),
+            Err(err) if replay_floor == 0 => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "rebuilding uncheckpointed payload store from the WAL"
+                );
+                if path.exists() {
+                    std::fs::remove_dir_all(path)?;
+                }
+                Self::create(path, config)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Open an existing payload store at `path`.
     pub fn open(path: &Path) -> Result<Self> {
         let config_path = path.join("config.json");
@@ -154,8 +185,7 @@ impl PayloadStore {
         config.validate()?;
 
         let tracker = Tracker::open(path, &config)?;
-        let bitmask = MmapBitmask::open(path, &config)?;
-        let pages = Pages::open(path)?;
+        let pages = Pages::open(path, &config)?;
         // Unlike the in-memory tracker, on-disk pointers have no WAL attached
         // at this point: if a checkpoint already truncated the log, a pointer
         // into a missing page can never be repaired. Fail the open instead of
@@ -164,7 +194,29 @@ impl PayloadStore {
             pages
                 .validate_pointer(&pointer, &config)
                 .map_err(|e| VectorSearchError::CorruptData(format!("slot {slot}: {e}")))?;
+            if pointer.is_empty() {
+                continue;
+            }
+            let stored = pages.read_value(&pointer, &config)?;
+            if stored.len() < PAYLOAD_CRC_LEN {
+                return Err(VectorSearchError::CorruptData(format!(
+                    "slot {slot}: payload blob is shorter than its checksum"
+                )));
+            }
+            let expected =
+                u32::from_le_bytes(stored[..PAYLOAD_CRC_LEN].try_into().expect("crc slice"));
+            if crc32fast::hash(&stored[PAYLOAD_CRC_LEN..]) != expected {
+                return Err(VectorSearchError::CorruptData(format!(
+                    "slot {slot}: payload blob failed its checksum"
+                )));
+            }
         }
+
+        // The tracker (including its journal) is the authority for which
+        // blocks are live; a damaged or stale bitmap is rebuilt from it
+        // instead of failing the open or handing out an aliased block.
+        let bitmask =
+            MmapBitmask::open_or_rebuild(path, &config, tracker.entries().map(|(_, p)| p))?;
 
         Ok(Self {
             base_path: path.to_path_buf(),
@@ -188,11 +240,23 @@ impl PayloadStore {
             return Ok(None);
         }
         let pages = self.pages.read();
-        let bytes = pages.read_value(&pointer, &self.config)?;
-        if bytes.is_empty() {
+        let stored = pages.read_value(&pointer, &self.config)?;
+        if stored.is_empty() {
             return Ok(None);
         }
-        let payload: Payload = serde_json::from_slice(&bytes).map_err(|e| {
+        if stored.len() < PAYLOAD_CRC_LEN {
+            return Err(VectorSearchError::CorruptData(format!(
+                "payload blob at slot {slot} is shorter than its checksum"
+            )));
+        }
+        let (crc, bytes) = stored.split_at(PAYLOAD_CRC_LEN);
+        let expected = u32::from_le_bytes(crc.try_into().expect("crc slice"));
+        if crc32fast::hash(bytes) != expected {
+            return Err(VectorSearchError::CorruptData(format!(
+                "payload blob at slot {slot} failed its checksum"
+            )));
+        }
+        let payload: Payload = serde_json::from_slice(bytes).map_err(|e| {
             VectorSearchError::CorruptData(format!("bad payload blob at slot {slot}: {e}"))
         })?;
         Ok(Some(payload))
@@ -209,19 +273,25 @@ impl PayloadStore {
     /// `write_value` serialize their own mutations through the inner page map,
     /// so a payload write never blocks a reader inspecting another page.
     pub fn put(&self, slot: u32, payload: Option<&Payload>) -> Result<()> {
-        let bytes = match payload {
-            Some(p) => serde_json::to_vec(p)?,
+        let stored = match payload {
+            Some(p) => {
+                let bytes = serde_json::to_vec(p)?;
+                let mut blob = Vec::with_capacity(PAYLOAD_CRC_LEN + bytes.len());
+                blob.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+                blob.extend_from_slice(&bytes);
+                blob
+            }
             None => Vec::new(),
         };
 
         // Validate the size before touching any allocation state: failing after
         // the old blocks were freed would leave the tracker pointing at blocks
         // the allocator may hand out again.
-        if bytes.len() > self.config.page_size {
+        if stored.len() > self.config.page_size {
             return Err(VectorSearchError::InvalidConfig(format!(
                 "payload of {} bytes exceeds the {} byte payload page",
-                bytes.len(),
-                self.config.page_size
+                stored.len() - PAYLOAD_CRC_LEN,
+                self.config.page_size.saturating_sub(PAYLOAD_CRC_LEN)
             )));
         }
 
@@ -240,13 +310,13 @@ impl PayloadStore {
             }
         }
 
-        if bytes.is_empty() {
-            tracker.set(slot, ValuePointer::empty());
+        if stored.is_empty() {
+            tracker.set_and_record(&self.base_path, slot, ValuePointer::empty())?;
             return Ok(());
         }
 
         // Allocate contiguous blocks.
-        let blocks_needed = self.blocks_needed(bytes.len());
+        let blocks_needed = self.blocks_needed(stored.len());
         let (page_id, block_offset) = bitmask.allocate(blocks_needed, &self.config)?;
 
         let pages = self.pages.read();
@@ -254,13 +324,22 @@ impl PayloadStore {
         pages.ensure_page(page_id as usize, &self.config)?;
 
         // Write data to pages.
-        let pointer = ValuePointer::new(page_id, block_offset, bytes.len() as u32);
-        pages.write_value(&pointer, &bytes, &self.config)?;
+        let pointer = ValuePointer::new(page_id, block_offset, stored.len() as u32);
+        pages.write_value(&pointer, &stored, &self.config)?;
 
-        // In-memory tracker only; persisted at the next checkpoint.
-        tracker.set(slot, pointer);
+        // The full table is still published only at checkpoint; the journal
+        // records this change so a later open can recover it without waiting
+        // for WAL replay to touch the slot again.
+        tracker.set_and_record(&self.base_path, slot, pointer)?;
 
         Ok(())
+    }
+
+    /// Test-only: publish the in-memory pointer table without a checkpoint.
+    /// Used to exercise the pre-checkpoint rebuild window.
+    #[cfg(test)]
+    pub(crate) fn persist_tracker_for_test(&self) -> Result<()> {
+        self.tracker.read().save(&self.base_path, &self.config)
     }
 
     /// Persist all derived state: the block bitmask, the slot→pointer tracker
@@ -341,7 +420,7 @@ impl PayloadStore {
     /// write is logged, so an oversized payload is a clean rejection rather
     /// than a WAL record that can never be applied.
     pub fn max_payload_bytes(&self) -> usize {
-        self.config.page_size
+        self.config.page_size.saturating_sub(PAYLOAD_CRC_LEN)
     }
 
     /// Number of blocks needed for a given byte length.
@@ -470,16 +549,23 @@ mod tests {
             // On-disk tracker is untouched: replay from WAL is the recovery
             // path, so per-point persistence is unnecessary.
             let persisted =
-                Tracker::open(dir.path(), &store.config).expect("open persisted tracker");
+                Tracker::open_base(dir.path(), &store.config).expect("open persisted tracker");
             assert!(persisted.get(199).is_none());
+            // The journal carries the same changes without rewriting the
+            // whole pointer table on every write.
+            let recovered = Tracker::open(dir.path(), &store.config).expect("replay journal");
+            assert!(recovered.get(199).is_some());
 
             store.checkpoint().unwrap();
             let persisted =
-                Tracker::open(dir.path(), &store.config).expect("open persisted tracker");
+                Tracker::open_base(dir.path(), &store.config).expect("open persisted tracker");
             assert_eq!(
                 persisted.get(199).expect("slot 199 persisted"),
                 store.tracker.read().get(199).expect("slot 199 in memory"),
             );
+            let journal = dir.path().join("tracker.journal.bin");
+            let journal_len = std::fs::metadata(&journal).map(|m| m.len()).unwrap();
+            assert_eq!(journal_len, 0, "checkpoint must clear the journal");
         }
         {
             let store = PayloadStore::open(dir.path()).expect("open");
@@ -513,6 +599,35 @@ mod tests {
                 assert_eq!(got.get("id"), Some(&json!(i)));
             }
         }
+    }
+
+    #[test]
+    fn test_payload_checksum_detects_bit_rot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig::default();
+        let pointer;
+        {
+            let store = PayloadStore::create(dir.path(), config.clone()).expect("create");
+            store.put(0, Some(&payload(&[("x", json!(1))]))).unwrap();
+            store.checkpoint().unwrap();
+            pointer = store.tracker.read().get(0).unwrap();
+        }
+        let page = dir
+            .path()
+            .join("pages")
+            .join(format!("page_{:04}.bin", pointer.page_id));
+        let mut bytes = std::fs::read(&page).unwrap();
+        let offset = pointer.block_offset as usize * config.block_size + PAYLOAD_CRC_LEN;
+        bytes[offset] ^= 0x01;
+        std::fs::write(&page, bytes).unwrap();
+
+        let err = PayloadStore::open(dir.path())
+            .err()
+            .expect("corrupt payload store must fail to open");
+        assert!(
+            err.to_string().contains("checksum"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

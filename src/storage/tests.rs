@@ -181,6 +181,145 @@ fn test_set_payload_field_wal_replay_survives_reopen() {
 }
 
 #[test]
+fn test_payload_store_rebuilds_before_first_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_rebuild");
+    let store = CollectionStore::create(&store_dir, "col_rebuild", &config(2)).unwrap();
+    let mut payload = HashMap::new();
+    payload.insert("k".to_string(), serde_json::json!("v"));
+    upsert_logged(&store, &point_with_payload(7, 2, payload.clone()));
+    let page = store.data_dir().join("payloads_store/pages/page_0000.bin");
+    assert!(page.exists());
+    // Publish the derived pointer without advancing the generation: this is
+    // the crash window where the page bytes may not be durable yet. The WAL
+    // is still the authority, so destroying the page must not lose the point.
+    {
+        let guard = store.data_arc().payload_store.load_full();
+        guard
+            .as_ref()
+            .as_ref()
+            .unwrap()
+            .persist_tracker_for_test()
+            .unwrap();
+    }
+    std::fs::write(&page, b"").unwrap();
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    let restored = reopened.get(&PointId::Num(7)).unwrap().unwrap();
+    assert_eq!(
+        restored.payload.unwrap().get("k"),
+        Some(&serde_json::json!("v"))
+    );
+}
+
+fn copy_snapshot_files(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == "snapshot.json" {
+            continue;
+        }
+        let target = dst.join(name);
+        if entry.path().is_dir() {
+            copy_snapshot_files(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_snapshot_pins_generation_and_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap");
+    let snap_dir = dir.path().join("snapshot");
+    let restored_dir = dir.path().join("restored");
+    let store = CollectionStore::create(&store_dir, "col_snap", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    upsert_logged(&store, &point(2, 4));
+    store.checkpoint().unwrap();
+    upsert_logged(&store, &point(3, 4));
+
+    let info = store.snapshot_to(&snap_dir).unwrap();
+    let verified = verify_snapshot(&snap_dir).unwrap();
+    assert_eq!(verified.generation, info.generation);
+    assert_eq!(verified.lsn, info.lsn);
+    assert!(verified.files.iter().any(|f| f.path == "wal/acked-lsn"));
+    drop(store);
+
+    copy_snapshot_files(&snap_dir, &restored_dir);
+    let restored = CollectionStore::open(&restored_dir).unwrap();
+    assert_eq!(restored.count(), 3);
+}
+
+#[test]
+fn test_restore_snapshot_creates_an_openable_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_restore");
+    let snap_dir = dir.path().join("snapshot_restore");
+    let restored_dir = dir.path().join("restored_restore");
+    let store = CollectionStore::create(&store_dir, "col_restore", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    store.checkpoint().unwrap();
+    upsert_logged(&store, &point(2, 4));
+    store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    restore_snapshot(&snap_dir, &restored_dir).unwrap();
+    let restored = CollectionStore::open(&restored_dir).unwrap();
+    assert_eq!(restored.count(), 2);
+}
+
+#[test]
+fn test_snapshot_manifest_rejects_escaping_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_dir = dir.path().join("snapshot_escape");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    let info = SnapshotInfo {
+        version: super::snapshot::SNAPSHOT_FORMAT_VERSION,
+        generation: 1,
+        lsn: 1,
+        files: vec![super::snapshot::SnapshotFile {
+            path: "../outside.bin".to_string(),
+            len: 0,
+            crc32: 0,
+        }],
+    };
+    super::snapshot::write_info(&snap_dir.join("snapshot.json"), &info).unwrap();
+
+    let err = verify_snapshot(&snap_dir)
+        .err()
+        .expect("escaping manifest path must fail");
+    assert!(err.to_string().contains("escapes"));
+}
+
+#[test]
+fn test_snapshot_verification_rejects_bit_rot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_bad");
+    let snap_dir = dir.path().join("snapshot_bad");
+    let store = CollectionStore::create(&store_dir, "col_snap_bad", &config(2)).unwrap();
+    upsert_logged(&store, &point(1, 2));
+    store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    let generation = std::fs::read_dir(snap_dir.join("generations"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("vectors.bin");
+    let mut bytes = std::fs::read(&generation).unwrap();
+    bytes[0] ^= 0x01;
+    std::fs::write(&generation, bytes).unwrap();
+
+    assert!(verify_snapshot(&snap_dir).is_err());
+}
+
+#[test]
 fn test_numeric_index_range_accelerated_search() {
     use crate::types::{
         ConditionType, FilterCondition, PayloadSchemaType, RangeCondition, SearchQuery,
@@ -537,6 +676,38 @@ fn test_drain_pending_empty_backlog_and_stay_visible() {
             hit.id
         );
     }
+}
+
+/// The partial segment stays outside the graph and is exact-scanned until
+/// the next complete segment promotes it.
+#[test]
+fn test_appendable_segment_stays_exact_until_promoted() {
+    use crate::types::{IndexType, SearchQuery};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_seg");
+    let cfg = config(2).with_index_type(IndexType::HNSW);
+    let store = CollectionStore::create_with_segment_slots(&store_dir, "col_seg", &cfg, 4).unwrap();
+    for id in 0..6u64 {
+        upsert_logged(&store, &VectorPoint::new(id, vec![id as f32 * 0.01, 1.0]));
+    }
+    assert!(
+        store.build_index().unwrap(),
+        "frozen segment must be indexed"
+    );
+    assert_eq!(store.pending_len(), 2, "partial segment stays exact");
+
+    upsert_logged(&store, &VectorPoint::new(6, vec![0.06, 1.0]));
+    assert_eq!(store.pending_len(), 3);
+    store.drain_pending_hnsw();
+    assert_eq!(
+        store.pending_len(),
+        3,
+        "drain must retain the appendable tail"
+    );
+
+    let hits = store.search(&SearchQuery::new(vec![0.0, 1.0], 7)).unwrap();
+    assert_eq!(hits.len(), 7, "exact tail must stay searchable");
 }
 
 /// A graph with no tombstone must not be walked: the repair reports no work

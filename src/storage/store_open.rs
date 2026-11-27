@@ -142,6 +142,7 @@ impl CollectionStore {
         let generation = Generation::create(dir)?;
         let data_dir = generation.path();
         meta.save(&data_dir)?;
+        super::segments::write(&data_dir, meta.segment_slots, 0)?;
 
         let vectors = Vectors::create(
             &data_dir.join("vectors.bin"),
@@ -182,6 +183,10 @@ impl CollectionStore {
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: parking_lot::RwLock::new(quant),
             index: ArcSwap::from(Arc::new(None)),
+            segments: ArcSwap::from(Arc::new(super::segments::SegmentSet::new(
+                0,
+                meta.segment_slots,
+            ))),
         }));
         Ok(Arc::new_cyclic(|weak| Self {
             dir: dir.to_path_buf(),
@@ -247,7 +252,12 @@ impl CollectionStore {
         // separates them, the manifest is the authority: reapplying the tail
         // is idempotent, while skipping it would lose committed writes.
         meta.last_applied_txn = meta.last_applied_txn.min(generation.lsn());
-        let files = Arc::new(DataFiles::open(&data_dir, &meta, storage)?);
+        let files = Arc::new(DataFiles::open(
+            &data_dir,
+            &meta,
+            storage,
+            generation.lsn(),
+        )?);
 
         let mut reverse = IdMap::with_capacity(meta.slot_capacity as usize);
         let mut versions: IdMap<u64> = IdMap::default();

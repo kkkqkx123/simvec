@@ -4,7 +4,7 @@
 //! `ValuePointer` (page_id, block_offset, length). It is persisted to
 //! `tracker.bin` and loaded into memory for O(1) lookups.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -18,6 +18,13 @@ const TRACKER_VERSION: u32 = 1;
 /// Header: magic(4) + version(4) + slot_count(4) + block_size(4) + page_size(4)
 /// + change counter (8) = 28 bytes.
 const TRACKER_HEADER_LEN: usize = 28;
+
+/// Append-only changes since the last published `tracker.bin`.
+const TRACKER_JOURNAL_FILE: &str = "tracker.journal.bin";
+
+/// One record: version(8) + slot(4) + pointer(12) + crc32(4).
+const JOURNAL_RECORD_LEN: usize = 28;
+const JOURNAL_CRC_LEN: usize = 4;
 
 /// A pointer to a contiguous range of blocks within a data page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +84,55 @@ impl Tracker {
         Ok(tracker)
     }
 
-    /// Open an existing tracker from disk.
+    /// Open the published pointer table and replay its append-only journal.
+    ///
+    /// A torn journal tail is truncated: the WAL still owns every change made
+    /// since the last checkpoint, so losing a derived record can never lose
+    /// committed data.
     pub fn open(path: &Path, config: &StoreConfig) -> Result<Self> {
+        let mut tracker = Self::open_base(path, config)?;
+        let journal = path.join(TRACKER_JOURNAL_FILE);
+        let Ok(data) = std::fs::read(&journal) else {
+            return Ok(tracker);
+        };
+        let mut valid_len = 0usize;
+        while valid_len + JOURNAL_RECORD_LEN <= data.len() {
+            let record = &data[valid_len..valid_len + JOURNAL_RECORD_LEN];
+            let payload = &record[..JOURNAL_RECORD_LEN - JOURNAL_CRC_LEN];
+            let expected = u32::from_le_bytes(
+                record[JOURNAL_RECORD_LEN - JOURNAL_CRC_LEN..]
+                    .try_into()
+                    .expect("journal crc slice"),
+            );
+            if crc32fast::hash(payload) != expected {
+                break;
+            }
+            let version = u64::from_le_bytes(payload[0..8].try_into().expect("journal version"));
+            let slot = u32::from_le_bytes(payload[8..12].try_into().expect("journal slot"));
+            let pointer = ValuePointer {
+                page_id: u32::from_le_bytes(payload[12..16].try_into().expect("journal page")),
+                block_offset: u32::from_le_bytes(
+                    payload[16..20].try_into().expect("journal block"),
+                ),
+                length: u32::from_le_bytes(payload[20..24].try_into().expect("journal length")),
+            };
+            if version > tracker.version {
+                tracker.set(slot, pointer);
+            }
+            valid_len += JOURNAL_RECORD_LEN;
+        }
+        if valid_len != data.len() {
+            // Drop only the unusable tail before the next append; otherwise a
+            // torn record would hide every later change forever.
+            let file = OpenOptions::new().write(true).open(&journal)?;
+            file.set_len(valid_len as u64)?;
+            file.sync_all()?;
+        }
+        Ok(tracker)
+    }
+
+    /// Read only the compact `tracker.bin`, without the journal.
+    pub(super) fn open_base(path: &Path, config: &StoreConfig) -> Result<Self> {
         let file_path = path.join("tracker.bin");
         let data = std::fs::read(&file_path)
             .map_err(|e| VectorSearchError::CorruptData(format!("cannot read tracker.bin: {e}")))?;
@@ -105,6 +159,29 @@ impl Tracker {
             .map(|(slot, pointer)| (slot as u32, pointer))
     }
 
+    /// Update a slot and append the change to the journal before it becomes
+    /// visible in memory.
+    pub fn set_and_record(&mut self, path: &Path, slot: u32, pointer: ValuePointer) -> Result<()> {
+        let version = self.version.wrapping_add(1);
+        let mut record = Vec::with_capacity(JOURNAL_RECORD_LEN);
+        record.extend_from_slice(&version.to_le_bytes());
+        record.extend_from_slice(&slot.to_le_bytes());
+        record.extend_from_slice(&pointer.page_id.to_le_bytes());
+        record.extend_from_slice(&pointer.block_offset.to_le_bytes());
+        record.extend_from_slice(&pointer.length.to_le_bytes());
+        let crc = crc32fast::hash(&record);
+        record.extend_from_slice(&crc.to_le_bytes());
+        debug_assert_eq!(record.len(), JOURNAL_RECORD_LEN);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.join(TRACKER_JOURNAL_FILE))?;
+        file.write_all(&record)?;
+        self.set(slot, pointer);
+        Ok(())
+    }
+
     /// Set the pointer for a slot, growing the array if needed.
     pub fn set(&mut self, slot: u32, pointer: ValuePointer) {
         let idx = slot as usize;
@@ -126,6 +203,17 @@ impl Tracker {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp_path, &file_path)?;
+        File::open(path)?.sync_all()?;
+        // The compact table now covers every journal record. Clearing only
+        // after the rename makes a crash between the two steps harmless: the
+        // stale records carry older versions and are ignored on replay.
+        let journal = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.join(TRACKER_JOURNAL_FILE))?;
+        journal.sync_all()?;
+        drop(journal);
         File::open(path)?.sync_all()?;
         Ok(())
     }
@@ -244,6 +332,33 @@ mod tests {
         assert_eq!(tracker.get(5).unwrap(), ValuePointer::new(1, 3, 200));
         // Slot 3 is within the Vec range but was set to empty by resize.
         assert_eq!(tracker.get(3), Some(ValuePointer::empty()));
+    }
+
+    #[test]
+    fn test_journal_replays_and_truncates_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        {
+            let mut tracker = Tracker::create(dir.path(), &config).unwrap();
+            tracker
+                .set_and_record(dir.path(), 0, ValuePointer::new(0, 1, 64))
+                .unwrap();
+            tracker
+                .set_and_record(dir.path(), 3, ValuePointer::new(1, 2, 96))
+                .unwrap();
+            let mut journal = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(TRACKER_JOURNAL_FILE))
+                .unwrap();
+            journal.write_all(&[1, 2, 3, 4, 5]).unwrap();
+        }
+        let tracker = Tracker::open(dir.path(), &config).unwrap();
+        assert_eq!(tracker.get(0), Some(ValuePointer::new(0, 1, 64)));
+        assert_eq!(tracker.get(3), Some(ValuePointer::new(1, 2, 96)));
+        let len = std::fs::metadata(dir.path().join(TRACKER_JOURNAL_FILE))
+            .unwrap()
+            .len();
+        assert_eq!(len, (2 * JOURNAL_RECORD_LEN) as u64);
     }
 
     #[test]

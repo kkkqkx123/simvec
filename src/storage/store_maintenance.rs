@@ -88,6 +88,7 @@ impl CollectionStore {
         let inner = self.inner.write();
         let data_dir = self.data_dir();
         inner.meta.save(&data_dir)?;
+        segments::write(&data_dir, inner.meta.segment_slots, inner.meta.next_slot)?;
         // The snapshot and the manifest describe one generation. Writing the
         // snapshot first means a crash can only leave it ahead of the
         // manifest, which open detects and discards; the WAL is still intact

@@ -77,7 +77,7 @@ Sparse spaces have no vocabulary bound and accept unsorted unique indices, which
 
 ### Storage layout
 
-Each collection is a directory under the engine root containing `vectors.bin` (mmap'd raw f32 rows), the WAL segment files, payload store, metadata, and index artifacts. Deletes are tombstones; compaction rewrites the directory. Rebuild scratch (`*.rebuild-*`), publish backups (`*.old-*`), and quarantined (`.suspect-*`) directories are never loaded into the serving registry — they exist only for crash recovery and inspection.
+Each collection is a directory under the engine root holding `generation.bin`, the shared `wal/`, `.lock` and a type marker; serving files live in `generations/g<20-digit id>/` and include `meta.bin`, `segments.json`, `vectors.bin` (mmap'd raw f32 rows), `keys.bin`, tombstones, payload store and index artifacts. Deletes are tombstones; compaction builds a new generation in `.g*-staging/`, publishes the manifest, then switches in-memory handles. Rebuild scratch (`*.rebuild-*`), publish backups (`*.old-*`), and quarantined (`.suspect-*`) directories are never loaded into the serving registry — they exist only for crash recovery and inspection.
 
 ### Score contract
 

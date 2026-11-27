@@ -202,17 +202,87 @@ impl PayloadIndexManager {
         }
     }
 
+    /// Resolve one condition against its declared index, sized to the live
+    /// slot capacity. `None` means the field or predicate cannot narrow the
+    /// candidate set and must stay a post-filter.
+    fn condition_mask(&self, cond: &FilterCondition, capacity: usize) -> Option<BitVec> {
+        let m = self.indexes.get(&cond.field)?;
+        let mut mask = m.index.bits(&cond.condition)?;
+        if mask.len() != capacity {
+            mask.resize(capacity, false);
+        }
+        Some(mask)
+    }
+
+    /// Complement of an exact condition mask. Index masks are exact over the
+    /// registered slots, so a slot outside `mask` really does satisfy the
+    /// negated predicate.
+    fn invert_mask(mask: &BitVec, capacity: usize) -> BitVec {
+        let mut inverted = BitVec::repeat(true, capacity);
+        for (mut dst, src) in inverted.iter_mut().zip(mask.iter()) {
+            if *src {
+                *dst = false;
+            }
+        }
+        inverted
+    }
+
+    /// Mask for a group where at least `min_count` conditions must match.
+    /// The group is only accelerated when every condition has an index; an
+    /// unindexed clause could otherwise satisfy the count outside the mask
+    /// and a matching slot would be lost.
+    fn should_mask(
+        &self,
+        conditions: &[FilterCondition],
+        min_count: usize,
+        capacity: usize,
+    ) -> Option<BitVec> {
+        if conditions.is_empty() {
+            return None;
+        }
+        if min_count == 0 {
+            return Some(BitVec::repeat(true, capacity));
+        }
+        if min_count > conditions.len() {
+            return Some(BitVec::repeat(false, capacity));
+        }
+        let mut masks = Vec::with_capacity(conditions.len());
+        for cond in conditions {
+            masks.push(self.condition_mask(cond, capacity)?);
+        }
+        if min_count == 1 {
+            let mut acc = masks.remove(0);
+            for mask in masks {
+                acc |= mask;
+            }
+            return Some(acc);
+        }
+        let mut counts = vec![0u32; capacity];
+        for mask in masks {
+            for (slot, matched) in mask.iter().enumerate() {
+                if *matched {
+                    counts[slot] = counts[slot].saturating_add(1);
+                }
+            }
+        }
+        let mut acc = BitVec::repeat(false, capacity);
+        for (slot, count) in counts.iter().enumerate() {
+            if *count as usize >= min_count {
+                acc.set(slot, true);
+            }
+        }
+        Some(acc)
+    }
+
     /// Split a filter into an acceleratable pre-filter mask and the must
     /// conditions left for post-filtering.
     ///
-    /// Planning semantics:
-    /// - every `must` condition whose field carries an index able to resolve
-    ///   it contributes to the AND-ed `pre_mask`;
-    /// - conditions without such an index land in `remaining_must`;
-    /// - `must_not`, `should`, `min_should` are preserved verbatim inside
-    ///   `remaining_must` handling (they stay post-filters), while any
-    ///   accelerated `must` still narrows candidates soundly because the
-    ///   post-filter re-evaluates everything that was not accelerated.
+    /// Every group narrows the same candidate mask with set algebra:
+    /// `must` ANDs indexed condition masks, `must_not` ANDs their complements,
+    /// `should` ORs them, and `min_should` keeps slots that satisfy at least
+    /// `min_count` indexed conditions. A group is skipped when any of its
+    /// clauses has no usable index, so the mask can never exclude a matching
+    /// slot; the full filter still runs on every candidate.
     ///
     /// Returns `pre_mask = None` when nothing was accelerated, meaning the
     /// whole filter runs post-filter exactly like before this manager
@@ -223,28 +293,63 @@ impl PayloadIndexManager {
             remaining_must: Vec::new(),
             indexes_used: Vec::new(),
         };
-        let Some(must) = filter.must.as_ref() else {
-            return plan;
-        };
         let mut acc: Option<BitVec> = None;
-        for cond in must {
-            let Some(m) = self.indexes.get(&cond.field) else {
-                plan.remaining_must.push(cond.clone());
-                continue;
-            };
-            let Some(mut cond_mask) = m.index.bits(&cond.condition) else {
-                plan.remaining_must.push(cond.clone());
-                continue;
-            };
-            if cond_mask.len() != capacity {
-                cond_mask.resize(capacity, false);
+        if let Some(must) = filter.must.as_ref() {
+            for cond in must {
+                let Some(m) = self.indexes.get(&cond.field) else {
+                    plan.remaining_must.push(cond.clone());
+                    continue;
+                };
+                let Some(cond_mask) = self.condition_mask(cond, capacity) else {
+                    plan.remaining_must.push(cond.clone());
+                    continue;
+                };
+                plan.indexes_used
+                    .push(format!("{}({})", cond.field, m.index.kind()));
+                acc = Some(match acc {
+                    Some(prev) => prev & cond_mask,
+                    None => cond_mask,
+                });
             }
-            plan.indexes_used
-                .push(format!("{}({})", cond.field, m.index.kind()));
-            acc = Some(match acc {
-                Some(prev) => prev & cond_mask,
-                None => cond_mask,
-            });
+        }
+        if let Some(must_not) = filter.must_not.as_ref() {
+            for cond in must_not {
+                let Some(cond_mask) = self.condition_mask(cond, capacity) else {
+                    continue;
+                };
+                let kind = self
+                    .indexes
+                    .get(&cond.field)
+                    .map(|m| m.index.kind())
+                    .unwrap_or("map");
+                plan.indexes_used
+                    .push(format!("{}({}:must_not)", cond.field, kind));
+                let inverted = Self::invert_mask(&cond_mask, capacity);
+                acc = Some(match acc {
+                    Some(prev) => prev & inverted,
+                    None => inverted,
+                });
+            }
+        }
+        if let Some(should) = filter.should.as_ref() {
+            if let Some(union) = self.should_mask(should, 1, capacity) {
+                plan.indexes_used.push("should".to_string());
+                acc = Some(match acc {
+                    Some(prev) => prev & union,
+                    None => union,
+                });
+            }
+        }
+        if let Some(min_should) = filter.min_should.as_ref() {
+            if let Some(counted) =
+                self.should_mask(&min_should.conditions, min_should.min_count, capacity)
+            {
+                plan.indexes_used.push("min_should".to_string());
+                acc = Some(match acc {
+                    Some(prev) => prev & counted,
+                    None => counted,
+                });
+            }
         }
         plan.pre_mask = acc;
         plan
@@ -268,5 +373,71 @@ impl PayloadIndexManager {
         std::fs::write(&tmp, json)?;
         std::fs::rename(tmp, dir.join("payload_indexes.json"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MinShouldCondition;
+    use serde_json::json;
+
+    fn manager() -> PayloadIndexManager {
+        let mut m = PayloadIndexManager::new();
+        m.declare("tag", PayloadSchemaType::Keyword, 4).unwrap();
+        m.declare("size", PayloadSchemaType::Integer, 4).unwrap();
+        for (slot, tag, size) in [(0, "red", 1), (1, "blue", 2), (2, "red", 2)] {
+            let mut payload = Payload::new();
+            payload.insert("tag".to_string(), json!(tag));
+            payload.insert("size".to_string(), json!(size));
+            m.register_slot(slot, Some(&payload));
+        }
+        m
+    }
+
+    #[test]
+    fn must_not_excludes_indexed_matches() {
+        let m = manager();
+        let filter = VectorFilter::new().must_not(FilterCondition::match_value("tag", "red"));
+        let mask = m.plan_filter(&filter, 4).pre_mask.expect("accelerated");
+        assert!(!mask[0] && mask[1] && !mask[2] && mask[3]);
+    }
+
+    #[test]
+    fn should_unions_indexed_conditions() {
+        let m = manager();
+        let mut filter = VectorFilter::new();
+        filter = filter.should(FilterCondition::match_value("tag", "red"));
+        filter = filter.should(FilterCondition::match_value("tag", "blue"));
+        let mask = m.plan_filter(&filter, 4).pre_mask.expect("accelerated");
+        assert!(mask[0] && mask[1] && mask[2] && !mask[3]);
+    }
+
+    #[test]
+    fn min_should_keeps_slots_with_enough_matches() {
+        let m = manager();
+        let filter = VectorFilter {
+            must: None,
+            must_not: None,
+            should: None,
+            min_should: Some(MinShouldCondition {
+                conditions: vec![
+                    FilterCondition::match_value("tag", "red"),
+                    FilterCondition::match_value("size", "2"),
+                ],
+                min_count: 2,
+            }),
+        };
+        let mask = m.plan_filter(&filter, 4).pre_mask.expect("accelerated");
+        assert!(!mask[0] && !mask[1] && mask[2] && !mask[3]);
+    }
+
+    #[test]
+    fn unindexed_should_clause_disables_narrowing() {
+        let m = manager();
+        let mut filter = VectorFilter::new();
+        filter = filter.should(FilterCondition::match_value("tag", "red"));
+        filter = filter.should(FilterCondition::match_value("ghost", "x"));
+        assert!(m.plan_filter(&filter, 4).pre_mask.is_none());
     }
 }

@@ -44,6 +44,7 @@ pub(crate) mod postings;
 pub(crate) mod payload_store;
 pub(crate) mod quant;
 mod queue;
+mod segments;
 mod search;
 pub(crate) mod snapshot;
 mod tombstones;
@@ -70,6 +71,7 @@ pub(crate) use generation::{CollectionLock, Generation};
 pub(crate) use meta::Meta;
 pub(crate) use payload_index::PayloadIndexManager;
 pub(crate) use payload_store::PayloadStore;
+pub use snapshot::{verify_snapshot, SnapshotInfo};
 pub(crate) use tombstones::TombstoneBits;
 pub use wal::{Wal, WalPoint, WalRecord, WalTxn, DEFAULT_SEGMENT_BYTES};
 
@@ -276,11 +278,18 @@ pub(super) struct DataFiles {
     payload_store: ArcSwap<Option<PayloadStore>>,
     quant: RwLock<Option<QuantStore>>,
     index: ArcSwap<Option<PublishedIndex>>,
+    /// Frozen/appendable boundary of this generation's segment set.
+    segments: ArcSwap<segments::SegmentSet>,
 }
 
 impl DataFiles {
     /// Open every serving file of one generation.
-    pub(super) fn open(dir: &Path, meta: &Meta, _storage: &StorageConfig) -> Result<Self> {
+    pub(super) fn open(
+        dir: &Path,
+        meta: &Meta,
+        storage: &StorageConfig,
+        replay_floor: u64,
+    ) -> Result<Self> {
         let dir = dir.to_path_buf();
         let vectors = Vectors::open(
             &dir.join("vectors.bin"),
@@ -289,13 +298,18 @@ impl DataFiles {
             meta.slot_capacity,
         )?;
         let keys = Keys::open(&dir.join("keys.bin"))?;
+        let segments = segments::read_or_derive(&dir, meta.segment_slots, meta.next_slot)?;
         let tombstones = TombstoneBits::load(
             &dir,
             meta.slot_capacity as usize,
             meta.tombstone_count,
         )?
         .unwrap_or_else(|| TombstoneBits::new(meta.slot_capacity as usize));
-        let payload_store = PayloadStore::open(&dir.join("payloads_store"))?;
+        let payload_store = PayloadStore::open_with_repair(
+            &dir.join("payloads_store"),
+            replay_floor,
+            storage.payload_store_config(),
+        )?;
         let quant = if meta.quantization_config.is_some() {
             QuantStore::open(
                 &dir,
@@ -315,6 +329,7 @@ impl DataFiles {
             payload_store: ArcSwap::from(Arc::new(Some(payload_store))),
             quant: RwLock::new(quant),
             index: ArcSwap::from(Arc::new(None)),
+            segments: ArcSwap::from(Arc::new(segments)),
         })
     }
 
@@ -398,6 +413,51 @@ impl CollectionStore {
         self.data_arc().dir.clone()
     }
 
+    /// Copy the serving generation and every surviving WAL segment into
+    /// `dest`, with a checksummed manifest.
+    ///
+    /// The maintenance lock, queue gate and store read lock are held for the
+    /// whole copy: no checkpoint can truncate the log, no compaction can swap
+    /// the generation and no config write can replace `meta.bin` while files
+    /// are being read. Because the copied WAL is complete at that point, the
+    /// manifest's replay floor pins a self-consistent restore point.
+    pub fn snapshot_to(&self, dest: impl AsRef<Path>) -> Result<SnapshotInfo> {
+        let dest = dest.as_ref();
+        if dest.exists() {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "snapshot destination {} already exists",
+                dest.display()
+            )));
+        }
+        self.ensure_not_poisoned()?;
+        let _maintenance = self.compact_mutex.lock();
+        let _gate = self.queue.quiesce();
+        let _inner = self.inner.read();
+        let generation = self.generation.read().clone();
+
+        std::fs::create_dir_all(dest)?;
+        let mut files = Vec::new();
+        copy_snapshot_tree(
+            &self.dir.join("generation.bin"),
+            dest,
+            "generation.bin",
+            &mut files,
+        )?;
+        let generation_rel = format!("{}/g{:020}", generation::GENERATIONS_DIR, generation.id());
+        copy_snapshot_tree(&generation.path(), dest, &generation_rel, &mut files)?;
+        copy_snapshot_tree(&self.dir.join("wal"), dest, "wal", &mut files)?;
+
+        let info = SnapshotInfo {
+            version: snapshot::SNAPSHOT_FORMAT_VERSION,
+            generation: generation.id(),
+            lsn: generation.lsn(),
+            files,
+        };
+        snapshot::write_info(&dest.join(snapshot::SNAPSHOT_MANIFEST_FILE), &info)?;
+        generation::sync_tree(dest)?;
+        Ok(info)
+    }
+
     /// Whether a generation publish left the in-memory switch unfinished.
     /// Such a collection stays readable but must be reopened before more
     /// writes are accepted.
@@ -441,6 +501,72 @@ impl std::fmt::Debug for CollectionStore {
             .field("slot_capacity", &inner.meta.slot_capacity)
             .finish()
     }
+}
+
+/// Restore a verified collection snapshot into a new directory.
+///
+/// The destination must not exist: restoring into a live collection would
+/// mix two generations and two WALs under one lock file. Opening the restored
+/// collection before returning exercises the same replay path a real restart
+/// uses, so a snapshot with a mismatched manifest fails here rather than on
+/// first use.
+pub fn restore_snapshot(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result<()> {
+    let src = src.as_ref();
+    let dest = dest.as_ref();
+    let info = snapshot::verify_snapshot(src)?;
+    if dest.exists() {
+        return Err(VectorSearchError::InvalidConfig(format!(
+            "restore destination {} already exists",
+            dest.display()
+        )));
+    }
+    std::fs::create_dir_all(dest)?;
+    for file in &info.files {
+        let target = snapshot::checked_path(dest, &file.path)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(snapshot::checked_path(src, &file.path)?, &target)?;
+    }
+    generation::sync_tree(dest)?;
+    let restored = CollectionStore::open(dest)?;
+    drop(restored);
+    Ok(())
+}
+
+fn copy_snapshot_tree(
+    src: &Path,
+    dest_root: &Path,
+    rel: &str,
+    files: &mut Vec<snapshot::SnapshotFile>,
+) -> Result<()> {
+    if src.is_dir() {
+        let target = dest_root.join(rel);
+        std::fs::create_dir_all(&target)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            copy_snapshot_tree(&entry.path(), dest_root, &child, files)?;
+        }
+        return Ok(());
+    }
+    let target = dest_root.join(rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, &target)?;
+    let (len, crc32) = snapshot::file_checksum(src)?;
+    files.push(snapshot::SnapshotFile {
+        path: rel.to_string(),
+        len,
+        crc32,
+    });
+    Ok(())
 }
 
 #[cfg(test)]

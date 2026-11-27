@@ -119,6 +119,11 @@ impl CollectionStore {
                 inner.meta.save(data.dir())?;
                 self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
             }
+            let segments =
+                super::segments::SegmentSet::new(inner.meta.next_slot, inner.meta.segment_slots);
+            if data.segments.load().immutable_end != segments.immutable_end {
+                data.segments.store(Arc::new(segments));
+            }
         }
         let (upserts, deletes) = count_ops(ops);
         self.metrics

@@ -384,13 +384,43 @@ impl Wal {
                 "test-injected wal append failure".to_string(),
             ));
         }
+        // Repair a torn tail before deciding whether to roll over. Physical
+        // length is not a safe rollover signal: a torn record can push it past
+        // the threshold, and leaving those bytes behind would close a segment
+        // whose checksum failure is no longer tolerated as a tail. The valid
+        // prefix is the only length the log may build on.
+        let (physical_len, valid_len) = match &state.active {
+            Some(file) => {
+                let physical = file.metadata()?.len();
+                let valid = state.active_valid_len.unwrap_or(physical);
+                (physical, valid)
+            }
+            None => (0, 0),
+        };
+        if physical_len > valid_len {
+            state
+                .active
+                .as_mut()
+                .expect("active segment is present")
+                .set_len(valid_len)?;
+            state
+                .active
+                .as_mut()
+                .expect("active segment is present")
+                .sync_all()?;
+            state.active_valid_len = Some(valid_len);
+            let dropped = physical_len - valid_len;
+            self.appended_bytes
+                .fetch_sub(dropped.min(self.appended_bytes()), AtomicOrdering::Relaxed);
+        }
         // Roll over before writing, so a segment never exceeds the threshold
         // by more than the size of one batch. The new segment is named after
         // the first transaction it will hold.
         let needs_segment = match &state.active {
-            Some(file) => file.metadata()?.len().max(0) >= self.segment_bytes,
+            Some(_) => valid_len >= self.segment_bytes,
             None => true,
         };
+        let append_start = if needs_segment { 0 } else { valid_len };
         if needs_segment {
             let name = next_segment_name(&state.segments, first_txn);
             let file = OpenOptions::new()
@@ -407,32 +437,18 @@ impl Wal {
             state.active_valid_len = Some(0);
         }
 
-        let physical_len = state
-            .active
-            .as_ref()
-            .expect("active segment opened above")
-            .metadata()?
-            .len();
-        let start_len = state.active_valid_len.unwrap_or(physical_len);
         {
-            let file = state
-                .active
-                .as_mut()
-                .expect("active segment opened above");
-            if physical_len > start_len {
-                file.set_len(start_len)?;
-                file.sync_all()?;
-            }
+            let file = state.active.as_mut().expect("active segment opened above");
             let write_result = file.write_all(&buffer).and_then(|_| file.sync_all());
             if let Err(e) = write_result {
                 // Drop the partial batch so the log keeps a clean suffix.
-                let _ = file.set_len(start_len);
+                let _ = file.set_len(append_start);
                 let _ = file.sync_all();
                 return Err(e.into());
             }
         }
         state.active_last_lsn = state.active_last_lsn.max(last_txn);
-        state.active_valid_len = Some(start_len + buffer.len() as u64);
+        state.active_valid_len = Some(append_start + buffer.len() as u64);
         drop(state);
         self.appended_bytes
             .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -472,6 +488,24 @@ impl Wal {
                 &mut f,
                 last_txn,
             )?;
+            // Segment names are lower bounds on their first transaction. A
+            // closed segment must end exactly before the next one starts:
+            // a gap means a segment was lost, an overlap means a name was
+            // reused. Either way replaying only the surviving segments would
+            // silently drop or duplicate committed transactions.
+            if !last_segment && segment_valid_len > 0 {
+                if let Some(next) = segments.get(index + 1) {
+                    let expected = segment_last_txn.checked_add(1).unwrap_or(u64::MAX);
+                    if *next != expected {
+                        return Err(VectorSearchError::CorruptData(format!(
+                            "wal segments are not contiguous: {} ends at lsn {}, next segment starts at {}",
+                            segment_file_name(*name),
+                            segment_last_txn,
+                            segment_file_name(*next),
+                        )));
+                    }
+                }
+            }
             last_txn = segment_last_txn;
             if last_segment {
                 valid_len = segment_valid_len;
@@ -917,6 +951,40 @@ mod tests {
     }
 
     #[test]
+    fn test_torn_tail_does_not_survive_a_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let first = wal(&path);
+        first.append(&txn(1, 10)).unwrap();
+        // Grow the physical file past a tiny rollover threshold with a torn
+        // record. A reopen learns the valid prefix; the next append must cut
+        // the tail *before* closing the segment, or the stale bytes become a
+        // corrupt middle segment on the following reopen.
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(segment_path(&path, 1))
+                .unwrap();
+            file.write_all(&100u32.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(first);
+
+        let recovered = Wal::open_or_create(&path, 40).unwrap();
+        assert_eq!(recovered.replay(|_| Ok(())).unwrap(), 1);
+        recovered.append(&txn(2, 20)).unwrap();
+        drop(recovered);
+
+        let reopened = Wal::open_or_create(&path, DEFAULT_SEGMENT_BYTES).unwrap();
+        let (txns, last) = reopened.read_all().unwrap();
+        assert_eq!(last, 2);
+        assert_eq!(
+            txns.iter().map(|t| t.txn_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
     fn test_replay_stops_at_checksum_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
@@ -1053,6 +1121,31 @@ mod tests {
             5
         );
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_missing_wal_segment_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, 40).unwrap();
+        for id in 1..=6u64 {
+            wal.append(&txn(id, id * 10)).unwrap();
+        }
+        let names = wal.segment_names();
+        assert!(names.len() >= 3, "need several segments, got {names:?}");
+        // The untouched log must be valid; only the removed segment should
+        // trigger the continuity check.
+        assert_eq!(wal.replay(|_| Ok(())).unwrap(), 6);
+        drop(wal);
+
+        let missing = names[names.len() / 2];
+        std::fs::remove_file(segment_path(&path, missing)).unwrap();
+        let reopened = Wal::open_or_create(&path, 100).unwrap();
+        let err = reopened.replay(|_| Ok(())).unwrap_err();
+        assert!(
+            err.to_string().contains("not contiguous"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

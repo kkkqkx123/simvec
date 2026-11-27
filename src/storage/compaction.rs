@@ -10,8 +10,9 @@
 //! files. A mutation counter guards publication: the swap happens under the
 //! write lock only if no transaction raced the rewrite; otherwise the attempt
 //! is retried on a fresh snapshot. Under sustained write pressure the
-//! compaction falls back to rewriting while holding the write lock, so
-//! progress is always guaranteed. In both paths `compact_mutex` excludes
+//! compaction falls back to staging under the queue gate with only a read
+//! snapshot, so progress is always guaranteed without holding the write lock
+//! for the whole rewrite. In both paths `compact_mutex` excludes
 //! index builds/drains, keeping slot numbers stable for the index.
 //!
 //! The commit also truncates the WAL, so it gates the commit queue for its
@@ -268,8 +269,9 @@ impl CollectionStore {
     /// without the store write lock; the commit (rename swap + in-memory
     /// rebuild + meta rewrite + WAL checkpoint) is the only section holding
     /// it, and only when no transaction raced the rewrite. Under sustained
-    /// write pressure a bounded fallback rewrites while holding the write
-    /// lock, so compaction always makes progress.
+    /// write pressure a bounded fallback stages under the queue gate from a
+    /// read snapshot, so compaction always makes progress without holding the
+    /// write lock across the rewrite.
     ///
     /// Returns the number of live points after compaction. Refuses to start
     /// when the target volume cannot hold the temp files, so a full disk
@@ -332,18 +334,21 @@ impl CollectionStore {
             );
         }
 
-        // Contended fallback: the whole rewrite inside the store write lock,
-        // still holding both compact+build guards so no build races it.
+        // Contended fallback: close the queue gate first, then stage from a
+        // read snapshot. The gate already prevents writers from changing the
+        // plan, so the expensive rewrite never needs the store write lock;
+        // only the final generation swap takes it.
         self.metrics.record_compaction_contended();
         let _build_guard = self.build_mutex.lock();
         let _gate = self.queue.quiesce();
-        let mut inner = self.inner.write();
-        if inner.meta.tombstone_count == 0 || inner.meta.next_slot == 0 {
-            return Ok(inner.meta.live_count);
-        }
-        let tombstones = self.data_arc().tombstones.load();
-        let plan = build_plan(&inner.meta, &tombstones, &inner);
-        drop(tombstones);
+        let plan = {
+            let inner = self.inner.read();
+            if inner.meta.tombstone_count == 0 || inner.meta.next_slot == 0 {
+                return Ok(inner.meta.live_count);
+            }
+            let tombstones = self.data_arc().tombstones.load();
+            build_plan(&inner.meta, &tombstones, &inner)
+        };
         let staged = self.generation.read().stage()?;
         let remapped = match self.stage_generation(&plan, &staged) {
             Ok(remapped) => remapped,
@@ -352,6 +357,7 @@ impl CollectionStore {
                 return Err(e);
             }
         };
+        let mut inner = self.inner.write();
         let live = self.commit_generation(&mut inner, &plan, staged, remapped);
         self.metrics.record_compaction(started.elapsed());
         live
@@ -504,6 +510,7 @@ impl CollectionStore {
             tombstones: Vec::new(),
         };
         DenseSnapshot::write(dir, &snapshot)?;
+        super::segments::write(dir, meta.segment_slots, meta.next_slot)?;
         meta.save(dir)?;
 
         Ok(self.remapped_index(plan, dir))
@@ -528,7 +535,8 @@ impl CollectionStore {
 
         // Validate the staged files before publication: a failure here leaves
         // the old generation serving and the staging directory unpublished.
-        let staged_files = DataFiles::open(staged.path(), &meta, &self.storage)?;
+        let staged_files =
+            DataFiles::open(staged.path(), &meta, &self.storage, meta.last_applied_txn)?;
         drop(staged_files);
         let had_index = self.data_arc().index.load().is_some();
         let old_generation = self.generation.read().clone();
@@ -544,7 +552,7 @@ impl CollectionStore {
         self.wal.bind_generation(next_generation.id());
         // Reopen from the published path so every handle's path stays valid
         // for later growth and checkpoint writes.
-        let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage)?;
+        let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage, watermark)?;
         if let Some(index) = remapped {
             new_files.index.store(Arc::new(Some(index)));
         }

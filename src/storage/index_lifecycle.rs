@@ -9,16 +9,21 @@
 //! - Publication happens under the store write lock: slots appended during
 //!   the build are adopted and `pending` is drained *before* the index
 //!   becomes visible, so approximate search never misses a point.
+//! Only completed segments enter the graph; slots in the partial tail segment
+//! stay in `pending` and are exact-scanned until a rebuild promotes the
+//! completed segment. A full tail segment's worth of pending slots schedules
+//! that rebuild, bounding both graph churn and exact-scan work.
+//!
 //! - The published index is stored before clearing `building`: an upsert that
 //!   loaded `index == None` and then observed `building == false` would
 //!   record its slot nowhere; with this order it still lands in `pending`,
 //!   which every publication path drains.
 
-use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::segments;
 use super::vectors::Vectors;
 use super::CollectionStore;
 use crate::error::Result;
@@ -163,13 +168,14 @@ impl CollectionStore {
             }
             return Ok(());
         };
-        let (dim, distance, next_slot, capacity) = {
+        let (dim, distance, next_slot, capacity, segment_slots) = {
             let inner = self.inner.read();
             (
                 inner.meta.vector_size,
                 inner.meta.distance,
                 inner.meta.next_slot,
                 inner.meta.slot_capacity as usize,
+                inner.meta.segment_slots,
             )
         };
         if !data.valid_for(dim, distance, next_slot) {
@@ -207,7 +213,9 @@ impl CollectionStore {
             // Slots appended after the persisted build are handled by the
             // incremental drain; only a backlog large enough to dwarf the
             // graph justifies a full rebuild.
-            if Self::pending_warrants_rebuild(p.len(), covered) {
+            if Self::pending_warrants_rebuild(p.len(), covered)
+                || p.len() >= segment_slots.max(1) as usize
+            {
                 self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
             }
         }
@@ -227,7 +235,20 @@ impl CollectionStore {
     /// O(1) instead of O(ef_construct) graph search.  Pending slots are
     /// scored by brute force in `search_hnsw` for correct visibility, and
     /// drained into the graph by the maintenance worker on each tick.
-    pub(super) fn register_slot(&self, slot: u32, vector: &[f32], _segment_slots: u32) {
+    pub(super) fn register_slot(&self, slot: u32, vector: &[f32], segment_slots: u32) {
+        // Writes to the partial tail segment stay out of the frozen index.
+        // They are exact-scanned through `pending` until a rebuild promotes
+        // the completed segment, which bounds graph churn per segment.
+        let boundary = segments::immutable_end(slot as u64 + 1, segment_slots);
+        if (slot as u64) >= boundary as u64 {
+            let mut pending = self.pending.lock();
+            pending.push(slot);
+            if pending.len() >= segment_slots.max(1) as usize {
+                self.needs_rebuild.store(true, AtomicOrdering::Relaxed);
+            }
+            return;
+        }
+
         let files = self.data_arc();
         let published = files.index.load();
         match published.as_ref() {
@@ -324,9 +345,10 @@ impl CollectionStore {
                 inner.meta.collection.clone(),
             )
         };
+        let build_end = segments::immutable_end(snapshot_next_slot, segment_slots);
         let live: Vec<u32> = {
             let tombstones = files.tombstones.load();
-            (0..snapshot_next_slot as u32)
+            (0..build_end)
                 .filter(|&s| !tombstones.bit(s as usize))
                 .collect()
         };
@@ -365,42 +387,42 @@ impl CollectionStore {
             }
         };
 
-        // Adopt everything that raced the build: slots appended past the
-        // snapshot and pending slots recorded while no index was published.
-        // Holds the store write lock (acquired before the pending lock,
-        // matching `register_slot`'s order), so concurrent upserts either ran
-        // before (and are adopted here) or run after (and see the published
-        // graph directly).
-        //
-        // Slots appended during the build sit in both the appended range and
-        // `pending`; the range pass wins and the pending drain skips them, so
-        // each node is inserted exactly once (a repeated insert would be
-        // miscounted as an overwrite-staleness event).
-        {
+        // Fold the slots that completed a segment during the build into the
+        // graph and leave the new appendable tail in `pending` for exact
+        // scanning. The range pass and the pending drain are disjoint, so
+        // each node is inserted exactly once.
+        let pending_after = {
             let inner = self.inner.write();
             let mut p = self.pending.lock();
             let tombstones = files.tombstones.load();
             let vsnap = files.vectors.snapshot();
-            let mut adopted: HashSet<u32> = HashSet::new();
-            for slot in snapshot_next_slot..inner.meta.next_slot {
-                let slot = slot as u32;
+            let publish_end = segments::immutable_end(inner.meta.next_slot, segment_slots);
+            for slot in build_end..publish_end {
                 if tombstones.bit(slot as usize) {
                     continue;
                 }
                 if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
                     index.insert(slot, v, &vsnap, segment_slots);
-                    adopted.insert(slot);
                 }
             }
+            let mut retained = Vec::new();
             for slot in p.drain(..) {
-                if adopted.contains(&slot) || tombstones.bit(slot as usize) {
+                if (slot as u64) >= publish_end as u64 || tombstones.bit(slot as usize) {
+                    retained.push(slot);
+                    continue;
+                }
+                if slot >= build_end {
+                    // Already inserted by the range pass above.
                     continue;
                 }
                 if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
                     index.insert(slot, v, &vsnap, segment_slots);
                 }
             }
-        }
+            let pending_after = retained.len();
+            *p = retained;
+            pending_after
+        };
         let persisted = index.to_persisted();
         // Publish before clearing the building flag: an upsert that loaded
         // `index == None` and then observed `building == false` would record
@@ -414,7 +436,10 @@ impl CollectionStore {
             AtomicOrdering::Relaxed,
         );
         self.building.store(false, AtomicOrdering::Relaxed);
-        self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
+        self.needs_rebuild.store(
+            pending_after >= segment_slots.max(1) as usize,
+            AtomicOrdering::Relaxed,
+        );
 
         if let Err(e) = persist::save_hnsw(&self.data_dir(), &persisted) {
             tracing::warn!(collection = %name, error = %e, "hnsw.bin save failed");
@@ -452,9 +477,10 @@ impl CollectionStore {
                 inner.meta.collection.clone(),
             )
         };
+        let build_end = segments::immutable_end(snapshot_next_slot, segment_slots);
         let live: Vec<u32> = {
             let tombstones = files.tombstones.load();
-            (0..snapshot_next_slot as u32)
+            (0..build_end)
                 .filter(|&s| !tombstones.bit(s as usize))
                 .collect()
         };
@@ -499,26 +525,30 @@ impl CollectionStore {
         // `register_slot`'s order) so concurrent upserts either ran before
         // (and their slots are adopted/drained here) or run after (and see
         // the published index directly).
-        let persisted = {
+        let (persisted, pending_after) = {
             let inner = self.inner.write();
             let mut p = self.pending.lock();
             let tombstones = files.tombstones.load();
             let vsnap = files.vectors.snapshot();
-            index.adopt_range(
-                snapshot_next_slot as u32,
-                inner.meta.next_slot as u32,
-                &tombstones,
-                &vsnap,
-                segment_slots,
-            );
+            let publish_end = segments::immutable_end(inner.meta.next_slot, segment_slots);
+            index.adopt_range(build_end, publish_end, &tombstones, &vsnap, segment_slots);
+            let mut retained = Vec::new();
             for slot in p.drain(..) {
-                if !tombstones.bit(slot as usize) {
-                    if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
-                        index.assign_slot(slot, v);
-                    }
+                if (slot as u64) >= publish_end as u64 || tombstones.bit(slot as usize) {
+                    retained.push(slot);
+                    continue;
+                }
+                if slot >= build_end {
+                    // Already adopted by the range pass above.
+                    continue;
+                }
+                if let Some(v) = Vectors::read_slot(&vsnap, slot as u64, segment_slots, dim) {
+                    index.assign_slot(slot, v);
                 }
             }
-            index.to_persisted()
+            let pending_after = retained.len();
+            *p = retained;
+            (index.to_persisted(), pending_after)
         };
         // Publish before clearing the building flag: an upsert that loaded
         // `index == None` and then observed `building == false` would record
@@ -531,7 +561,10 @@ impl CollectionStore {
             AtomicOrdering::Relaxed,
         );
         self.building.store(false, AtomicOrdering::Relaxed);
-        self.needs_rebuild.store(false, AtomicOrdering::Relaxed);
+        self.needs_rebuild.store(
+            pending_after >= segment_slots.max(1) as usize,
+            AtomicOrdering::Relaxed,
+        );
 
         if let Err(e) = persist::save(&self.data_dir(), &persisted) {
             tracing::warn!(collection = %name, error = %e, "index.bin save failed");
@@ -584,14 +617,24 @@ impl CollectionStore {
         // graph structure is stable.  The store write lock is NOT held,
         // so upserts and searches continue concurrently.
         let _guard = self.build_mutex.lock();
-        let (dim, segment_slots) = {
+        let (dim, segment_slots, next_slot) = {
             let inner = self.inner.read();
-            (inner.meta.vector_size, inner.meta.segment_slots)
+            (
+                inner.meta.vector_size,
+                inner.meta.segment_slots,
+                inner.meta.next_slot,
+            )
         };
+        let boundary = segments::immutable_end(next_slot, segment_slots);
         let tombstones = files.tombstones.load();
         let vsnap = files.vectors.snapshot();
         let mut drained = 0u64;
+        let mut retained = Vec::new();
         for slot in pending {
+            if (slot as u64) >= boundary as u64 {
+                retained.push(slot);
+                continue;
+            }
             if tombstones.bit(slot as usize) {
                 continue;
             }
@@ -599,6 +642,9 @@ impl CollectionStore {
                 index.insert(slot, v, &vsnap, segment_slots);
                 drained += 1;
             }
+        }
+        if !retained.is_empty() {
+            self.pending.lock().extend(retained);
         }
         if drained > 0 {
             tracing::debug!(

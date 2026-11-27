@@ -6,7 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -64,4 +64,97 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     postcard::from_bytes(&bytes)
         .map(Some)
         .map_err(|e| VectorSearchError::CorruptData(e.to_string()))
+}
+
+/// Manifest file name of a copied collection snapshot.
+pub const SNAPSHOT_MANIFEST_FILE: &str = "snapshot.json";
+
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// One copied file, addressed relative to the snapshot root.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotFile {
+    pub path: String,
+    pub len: u64,
+    pub crc32: u32,
+}
+
+/// Durable description of a point-in-time collection copy.
+///
+/// `lsn` is the generation replay floor at copy time. The snapshot also
+/// carries every surviving WAL segment, so a restore can replay anything the
+/// copied generation does not contain without reaching into the live store.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotInfo {
+    pub version: u32,
+    pub generation: u64,
+    pub lsn: u64,
+    pub files: Vec<SnapshotFile>,
+}
+
+/// Publish a snapshot manifest. The envelope gives it the same torn-write
+/// protection as the generation manifest.
+pub fn write_info(path: &Path, info: &SnapshotInfo) -> Result<()> {
+    write(path, info)
+}
+
+/// Verify that every file named by a snapshot manifest is present, has the
+/// recorded length and matches its CRC. Extra files are allowed so a caller
+/// can attach its own metadata without invalidating the snapshot.
+pub fn verify_snapshot(dir: &Path) -> Result<SnapshotInfo> {
+    let path = dir.join(SNAPSHOT_MANIFEST_FILE);
+    let Some(info) = read::<SnapshotInfo>(&path)? else {
+        return Err(VectorSearchError::CorruptData(format!(
+            "missing or corrupt snapshot manifest {}",
+            path.display()
+        )));
+    };
+    if info.version != SNAPSHOT_FORMAT_VERSION {
+        return Err(VectorSearchError::CorruptData(format!(
+            "unsupported snapshot manifest version {}",
+            info.version
+        )));
+    }
+    for file in &info.files {
+        let target = checked_path(dir, &file.path)?;
+        let (len, crc32) = file_checksum(&target)?;
+        if len != file.len || crc32 != file.crc32 {
+            return Err(VectorSearchError::CorruptData(format!(
+                "snapshot file {} failed verification",
+                file.path
+            )));
+        }
+    }
+    Ok(info)
+}
+
+/// Resolve a manifest path without allowing it to leave `base`.
+pub(crate) fn checked_path(base: &Path, rel: &str) -> Result<PathBuf> {
+    let path = Path::new(rel);
+    let safe = path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)));
+    if !safe || path.as_os_str().is_empty() {
+        return Err(VectorSearchError::CorruptData(format!(
+            "snapshot path escapes the snapshot root: {rel}"
+        )));
+    }
+    Ok(base.join(path))
+}
+
+/// Stream a file's length and CRC without holding the whole file in memory.
+pub(crate) fn file_checksum(path: &Path) -> Result<(u64, u32)> {
+    let mut file = File::open(path)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        len += read as u64;
+    }
+    Ok((len, hasher.finalize()))
 }

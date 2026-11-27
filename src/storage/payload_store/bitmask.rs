@@ -22,13 +22,14 @@
 //! [24..)   bitmap data     ceil(total_blocks / 8) bytes
 //! ```
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VectorSearchError};
 
-use super::{StoreConfig, BITMASK_MAGIC};
+use super::{StoreConfig, ValuePointer, BITMASK_MAGIC};
 
 const BITMASK_VERSION: u32 = 1;
 const BITMASK_HEADER_LEN: usize = 24;
@@ -146,6 +147,34 @@ impl MmapBitmask {
         })
     }
 
+    /// Open the bitmask, rebuilding it from live pointers when it is damaged
+    /// or when a stale bit would alias a live payload.
+    ///
+    /// The bitmap is derived state: the tracker is the authority for which
+    /// blocks a live pointer owns. Orphaned used blocks are harmless and are
+    /// left alone, but a free bit on a live pointer must never survive.
+    pub fn open_or_rebuild(
+        path: &Path,
+        config: &StoreConfig,
+        pointers: impl Iterator<Item = ValuePointer>,
+    ) -> Result<Self> {
+        let pointers: Vec<ValuePointer> = pointers.collect();
+        match Self::open(path, config) {
+            Ok(bitmask) if !bitmask.needs_rebuild(&pointers, config) => Ok(bitmask),
+            Ok(bitmask) => {
+                bitmask.rebuild(&pointers, config)?;
+                bitmask.persist()?;
+                Ok(bitmask)
+            }
+            Err(_) => {
+                let bitmask = Self::create(path, config)?;
+                bitmask.rebuild(&pointers, config)?;
+                bitmask.persist()?;
+                Ok(bitmask)
+            }
+        }
+    }
+
     /// Open an existing bitmask.
     pub fn open(path: &Path, config: &StoreConfig) -> Result<Self> {
         let file_path = path.join("bitmask.bin");
@@ -168,6 +197,50 @@ impl MmapBitmask {
             path: file_path,
             inner: parking_lot::RwLock::new(inner),
         })
+    }
+
+    /// A stale bitmap is safe as long as every live pointer still owns its
+    /// blocks. Only a free bit on a live block requires a rebuild.
+    fn needs_rebuild(&self, pointers: &[ValuePointer], config: &StoreConfig) -> bool {
+        let inner = self.inner.read();
+        Self::live_blocks(pointers, config).any(|block| !inner.is_used(block))
+    }
+
+    /// Rebuild the allocation exactly from the live pointer table.
+    fn rebuild(&self, pointers: &[ValuePointer], config: &StoreConfig) -> Result<()> {
+        let blocks: Vec<u64> = Self::live_blocks(pointers, config).collect();
+        let mut inner = self.inner.write();
+        let needed = blocks.iter().copied().max().unwrap_or(0) + 1;
+        if needed > inner.total_blocks {
+            let page_blocks = config.blocks_per_page() as u64;
+            inner.total_blocks = needed.div_ceil(page_blocks) * page_blocks;
+            let bitmap_len = inner.total_blocks.div_ceil(8) as usize;
+            inner.data.resize(bitmap_len, 0);
+        }
+        inner.data.fill(0);
+        for block in blocks {
+            inner.set_bit(block, true);
+        }
+        inner.next_fit = 0;
+        Ok(())
+    }
+
+    /// Expand every live pointer into the global block indices it owns.
+    fn live_blocks<'a>(
+        pointers: &'a [ValuePointer],
+        config: &'a StoreConfig,
+    ) -> impl Iterator<Item = u64> + 'a {
+        let blocks_per_page = config.blocks_per_page() as u64;
+        let mut seen = HashSet::new();
+        pointers
+            .iter()
+            .filter(|p| !p.is_empty())
+            .flat_map(move |p| {
+                let start = p.page_id as u64 * blocks_per_page + p.block_offset as u64;
+                let count = (p.length as u64).div_ceil(config.block_size as u64);
+                start..start + count
+            })
+            .filter(move |block| seen.insert(*block))
     }
 
     /// Allocate `count` contiguous blocks. Returns (page_id, block_offset).
@@ -396,6 +469,27 @@ mod tests {
         let bm = MmapBitmask::create(dir.path(), &config).unwrap();
         let err = bm.allocate(9, &config).expect_err("must reject");
         assert!(err.to_string().contains("exceeds one"), "{err}");
+    }
+
+    #[test]
+    fn stale_free_bit_is_rebuilt_from_the_live_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        let pointer = ValuePointer::new(0, 0, 2 * config.block_size as u32);
+        {
+            let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+            bm.allocate(2, &config).unwrap();
+            bm.persist().unwrap();
+        }
+        let path = dir.path().join("bitmask.bin");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[BITMASK_HEADER_LEN] &= !1;
+        std::fs::write(&path, bytes).unwrap();
+
+        let bm =
+            MmapBitmask::open_or_rebuild(dir.path(), &config, std::iter::once(pointer)).unwrap();
+        let (_page, off) = bm.allocate(1, &config).unwrap();
+        assert!(off >= 2, "live blocks must not be handed out again");
     }
 
     #[test]

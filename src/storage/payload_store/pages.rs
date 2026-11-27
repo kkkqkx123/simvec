@@ -47,7 +47,7 @@ impl Pages {
     }
 
     /// Open existing pages from disk.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, config: &StoreConfig) -> Result<Self> {
         let pages_dir = path.join("pages");
         if !pages_dir.exists() {
             std::fs::create_dir_all(&pages_dir)?;
@@ -63,7 +63,7 @@ impl Pages {
                 .and_then(|s| s.strip_suffix(".bin"))
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                let page = Self::open_page(entry.path())?;
+                let page = Self::open_page(entry.path(), config)?;
                 page_files.insert(page_id, page);
             }
         }
@@ -87,7 +87,7 @@ impl Pages {
         let path = self.page_path(page_id);
         let file = File::create(&path)?;
         file.set_len(config.page_size as u64)?;
-        let entry = Self::open_page(path)?;
+        let entry = Self::open_page(path, config)?;
         self.page_files.write().insert(page_id, entry);
         Ok(())
     }
@@ -116,6 +116,12 @@ impl Pages {
     pub fn validate_pointer(&self, pointer: &ValuePointer, config: &StoreConfig) -> Result<()> {
         if pointer.is_empty() {
             return Ok(());
+        }
+        if (pointer.length as usize) < super::PAYLOAD_CRC_LEN {
+            return Err(VectorSearchError::CorruptData(format!(
+                "payload pointer at page {} offset {} is shorter than its checksum",
+                pointer.page_id, pointer.block_offset
+            )));
         }
         let pages = self.page_files.read();
         let entry = pages.get(&pointer.page_id).ok_or_else(|| {
@@ -252,14 +258,18 @@ impl Pages {
     }
 
     /// Open a single page file and create its mmap.
-    fn open_page(path: PathBuf) -> Result<PageEntry> {
+    fn open_page(path: PathBuf, config: &StoreConfig) -> Result<PageEntry> {
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let len = file.metadata()?.len();
-        let mmap = if len > 0 {
-            Some(unsafe { MmapOptions::new().map(&file)? })
-        } else {
-            None
-        };
+        let mut len = file.metadata()?.len();
+        // A zero-length page is a crash artefact from a write whose extent
+        // was never durable. Pages are fixed-size, so restoring the extent is
+        // safe and keeps `ensure_page` from handing back a page with no mmap.
+        if len == 0 {
+            file.set_len(config.page_size as u64)?;
+            file.sync_all()?;
+            len = config.page_size as u64;
+        }
+        let mmap = Some(unsafe { MmapOptions::new().map(&file)? });
         Ok(PageEntry {
             file,
             mmap: RwLock::new(mmap),
