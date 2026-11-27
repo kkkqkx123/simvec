@@ -57,23 +57,13 @@ impl CollectionStore {
                         payload: Some(json),
                         ..
                     } => {
-                        self.validate_payload_len(json.len())?;
+                        self.validate_json_bytes(json.as_bytes())?;
                     }
-                    WalRecord::SetPayloadField {
-                        point_id,
-                        key,
-                        value,
-                    } => {
-                        // Merging grows the existing payload; the merged shape
-                        // is what has to fit, not just the new value. The id is
-                        // resolved exactly like the apply path will resolve it.
-                        let mut merged = self
-                            .payload_slot_of(&PointId::from(point_id.as_str()))
-                            .and_then(|slot| self.read_payload_at(slot).ok())
-                            .flatten()
-                            .unwrap_or_default();
-                        merged.insert(key.clone(), serde_json::from_str(value)?);
-                        self.validate_payload_size(Some(&merged))?;
+                    WalRecord::SetPayloadField { value, .. } => {
+                        // The merged shape is validated for the whole batch
+                        // before the WAL append; here only the JSON encoding
+                        // of the incoming value has to be rejected early.
+                        self.validate_json_bytes(value.as_bytes())?;
                     }
                     _ => {}
                 }
@@ -301,7 +291,7 @@ impl CollectionStore {
                     applied_slots.push(slot);
                 }
                 // Checkpoint / quantization markers carry no separate mutation.
-                WalRecord::Compact | WalRecord::Quantize | WalRecord::DropCollection => {}
+                WalRecord::Compact | WalRecord::Quantize => {}
                 // Kind and named payloads never enter a dense collection's log.
                 WalRecord::UpsertVectors { .. } | WalRecord::PatchNamedVectors { .. } => {
                     return Err(VectorSearchError::CorruptData(
@@ -420,13 +410,6 @@ impl CollectionStore {
             return None;
         }
         Some(slot)
-    }
-
-    /// Resolve the id a payload mutation targets (locking variant for the
-    /// pre-logging validation path).
-    fn payload_slot_of(&self, id: &PointId) -> Option<u32> {
-        let inner = self.inner.read();
-        self.payload_slot_of_locked(&inner, &id.to_string())
     }
 
     /// Resolve the slot an upsert writes to.

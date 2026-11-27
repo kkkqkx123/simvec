@@ -635,9 +635,6 @@ impl CollectionStore {
         segments::select_for_compaction(&self.segment_entries(), threshold)
     }
 
-    // ── Payload routing helpers ────────────────────────────────────────
-
-    // ── Payload field indexes ──────────────────────────────────────────
 }
 
 impl Drop for CollectionStore {

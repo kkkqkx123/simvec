@@ -1,8 +1,8 @@
 # 存储差距修改方案
 
-本文按依赖顺序给出 `docs/issue/storage-comparison-with-qdrant.md` 中问题的修改阶段。每个阶段包含目标、主要改动、不变量和验收方式。设计文档不展开完整代码，只描述模块职责、状态转换和验证边界。
+本文按依赖顺序给出 `docs/issue/storage-comparison-with-qdrant.md` 中问题的修改阶段。每个阶段包含目标、主要改动、不变量和验收方式。设计文档不展开完整代码，只描述模块职责、状态转换和验证边界。实施审计结果与本轮交付边界见 `docs/plan/storage-implementation-audit.md`。
 
-总原则是“先正确性，再并发与容量，再能力扩展”。WAL 和重放语义没有稳定之前，不应开始物理分段或索引扩展；版本与迁移能力属于未来任务，见 `docs/plan/long-term/versioning-and-migration.md`。
+总原则是“先正确性，再并发与容量，再能力扩展”。WAL 和重放语义没有稳定之前，不应开始物理分段或索引扩展；版本与迁移能力属于未来任务，见 `docs/plan/long-term/versioning-and-migration.md`。本方案描述长期目标，实施审计文档记录当前已经落地和明确延后的部分。
 
 ## 总体依赖顺序
 

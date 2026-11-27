@@ -275,21 +275,23 @@ fn test_restore_snapshot_creates_an_openable_collection() {
 #[test]
 fn test_snapshot_manifest_rejects_escaping_paths() {
     let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_escape");
     let snap_dir = dir.path().join("snapshot_escape");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    let info = SnapshotInfo {
-        version: super::snapshot::SNAPSHOT_FORMAT_VERSION,
-        generation: 1,
-        lsn: 1,
-        reused_files: 0,
-        files: vec![super::snapshot::SnapshotFile {
-            path: "../outside.bin".to_string(),
-            version: 1,
-            len: 0,
-            crc32: 0,
-        }],
-    };
-    super::snapshot::write_info(&snap_dir.join("snapshot.json"), &info).unwrap();
+    let store = CollectionStore::create(&store_dir, "col_snap_escape", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    store.checkpoint().unwrap();
+    let info = store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    let mut tampered = info;
+    tampered.files.clear();
+    tampered.files.push(super::snapshot::SnapshotFile {
+        path: "../outside.bin".to_string(),
+        version: tampered.generation,
+        len: 0,
+        crc32: 0,
+    });
+    super::snapshot::write_info(&snap_dir.join("snapshot.json"), &tampered).unwrap();
 
     let err = verify_snapshot(&snap_dir)
         .err()
@@ -1429,6 +1431,90 @@ fn test_durable_floor_reflects_pins() {
         "a pin at the floor holds the durable view back by one"
     );
     drop(pin);
+}
+
+/// Payload admission rejects the encoded value, not just the raw JSON.
+#[test]
+fn test_lz4_payload_size_checks_encoded_length() {
+    use crate::types::{PayloadCompression, StorageConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_lz4_limit");
+    let storage = StorageConfig {
+        payload_block_size: 64,
+        payload_page_size: 128,
+        payload_compression: PayloadCompression::Lz4,
+        ..StorageConfig::default()
+    };
+    let store =
+        CollectionStore::create_with_storage(&store_dir, "col_lz4_limit", &config(4), &storage)
+            .unwrap();
+
+    let mut seed = 0x1234_5678u32;
+    let body: String = (0..300)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            char::from(b'!' + ((seed >> 24) % 90) as u8)
+        })
+        .collect();
+    let mut payload = crate::types::Payload::new();
+    payload.insert("body".to_string(), serde_json::json!(body));
+    let err = store
+        .apply_ops(&[WalRecord::Upsert {
+            point: WalPoint::from_point(&point_with_payload(1, 4, payload)).unwrap(),
+        }])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("encoded payload"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(store.count(), 0, "a rejected write must not be logged");
+
+    drop(store);
+    let reopened =
+        CollectionStore::open_with_storage(&store_dir, &StorageConfig::default()).unwrap();
+    assert_eq!(reopened.count(), 0);
+}
+
+/// A batch whose merged payload grows past one page is rejected before the
+/// WAL append, even when every individual field value would fit.
+#[test]
+fn test_batch_payload_merge_size_is_validated() {
+    use crate::types::{Payload, StorageConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_batch_payload_limit");
+    let storage = StorageConfig {
+        payload_block_size: 32,
+        payload_page_size: 256,
+        ..StorageConfig::default()
+    };
+    let store = CollectionStore::create_with_storage(
+        &store_dir,
+        "col_batch_payload_limit",
+        &config(4),
+        &storage,
+    )
+    .unwrap();
+    upsert_logged(&store, &point(1, 4));
+
+    let fields = Payload::from([
+        ("first".to_string(), serde_json::json!("a".repeat(180))),
+        ("second".to_string(), serde_json::json!("b".repeat(180))),
+    ]);
+    let err = store
+        .set_payload_fields(&PointId::Num(1), fields)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("encoded payload"),
+        "unexpected error: {err}"
+    );
+    assert!(store.get(&PointId::Num(1)).unwrap().unwrap().payload.is_none());
+
+    drop(store);
+    let reopened =
+        CollectionStore::open_with_storage(&store_dir, &StorageConfig::default()).unwrap();
+    assert!(reopened.get(&PointId::Num(1)).unwrap().unwrap().payload.is_none());
 }
 
 /// LZ4-compressed payloads round-trip through checkpoint and reopen.

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::WalRecord;
 use super::{CollectionStore, StoreInner};
 
@@ -25,24 +27,112 @@ impl CollectionStore {
         let Some(payload) = payload else {
             return Ok(());
         };
-        let len = serde_json::to_vec(payload)?.len();
-        self.validate_payload_len(len)
+        let bytes = serde_json::to_vec(payload)?;
+        self.validate_json_bytes(&bytes)
     }
 
-    pub(super) fn validate_payload_len(&self, len: usize) -> Result<()> {
+    pub(super) fn validate_json_bytes(&self, json: &[u8]) -> Result<()> {
         let data = self.data_arc();
         let ps_guard = data.payload_store.load();
         let Some(ps) = ps_guard.as_ref().as_ref() else {
             return Ok(());
         };
-        let limit = ps.max_payload_bytes();
-        if len > limit {
-            return Err(VectorSearchError::InvalidConfig(format!(
-                "payload of {len} bytes exceeds the {limit} byte payload page; \
-                 raise StorageConfig::payload_page_size"
-            )));
+        ps.validate_json_bytes(json)
+    }
+
+    /// Revalidate a whole batch against the payload state it will be applied
+    /// to. Single-op admission checks cannot see payload growth accumulated by
+    /// earlier ops in the same transaction, so this runs before the WAL append
+    /// and rejects the entire batch if any encoded value would not fit a page.
+    pub(super) fn validate_batch_payloads(&self, batch: &[super::queue::Ticket]) -> Result<()> {
+        let inner = self.inner.write();
+        let data = self.data_arc();
+        let payload_guard = data.payload_store.load();
+        let Some(ps) = payload_guard.as_ref().as_ref() else {
+            return Ok(());
+        };
+        let mut working: HashMap<PointId, Option<Payload>> = HashMap::new();
+        for ticket in batch {
+            for op in &ticket.ops {
+                let (id, next) = match op {
+                    WalRecord::Upsert { point } => {
+                        let id = PointId::from(point.id.as_str());
+                        let payload = match &point.payload {
+                            Some(json) => Some(serde_json::from_str::<Payload>(json)?),
+                            None => None,
+                        };
+                        (id, payload)
+                    }
+                    WalRecord::SetPayload { point_id, payload } => {
+                        let id = PointId::from(point_id.as_str());
+                        let payload = match payload {
+                            Some(json) => Some(serde_json::from_str::<Payload>(json)?),
+                            None => None,
+                        };
+                        (id, payload)
+                    }
+                    WalRecord::DeletePayloadKeys { point_id, keys } => {
+                        let id = PointId::from(point_id.as_str());
+                        let mut current =
+                            self.current_payload_locked(&inner, ps, &working, &id)?;
+                        if let Some(payload) = current.as_mut() {
+                            for key in keys {
+                                payload.remove(key.as_str());
+                            }
+                        }
+                        (id, current)
+                    }
+                    WalRecord::SetPayloadField {
+                        point_id,
+                        key,
+                        value,
+                    } => {
+                        let id = PointId::from(point_id.as_str());
+                        let mut current =
+                            self.current_payload_locked(&inner, ps, &working, &id)?;
+                        let payload = current.get_or_insert_with(Payload::new);
+                        payload.insert(key.clone(), serde_json::from_str(value)?);
+                        (id, current)
+                    }
+                    WalRecord::Delete { point_id } => {
+                        working.insert(PointId::from(point_id.as_str()), None);
+                        continue;
+                    }
+                    WalRecord::DeleteBatch { point_ids } => {
+                        for point_id in point_ids {
+                            working.insert(PointId::from(point_id.as_str()), None);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Some(payload) = next.as_ref() {
+                    let bytes = serde_json::to_vec(payload)?;
+                    ps.validate_json_bytes(&bytes)?;
+                }
+                working.insert(id, next);
+            }
         }
         Ok(())
+    }
+
+    fn current_payload_locked(
+        &self,
+        inner: &StoreInner,
+        ps: &super::PayloadStore,
+        working: &HashMap<PointId, Option<Payload>>,
+        id: &PointId,
+    ) -> Result<Option<Payload>> {
+        if let Some(current) = working.get(id) {
+            return Ok(current.clone());
+        }
+        let Some(slot) = inner.reverse.get(id) else {
+            return Ok(None);
+        };
+        if self.data_arc().tombstones.load().bit(slot as usize) {
+            return Ok(None);
+        }
+        ps.get(slot)
     }
 
     /// Write a payload for a slot to PayloadStore.

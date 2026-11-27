@@ -90,7 +90,7 @@ pub struct Meta {
     /// Live points.
     pub live_count: u64,
     pub tombstone_count: u64,
-    /// WAL water mark; reserved for the WAL work item.
+    /// Highest lsn applied to the serving files.
     pub last_applied_txn: u64,
     /// Optional live-point admission cap (see `CollectionConfig::max_points`).
     #[serde(default)]

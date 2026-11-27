@@ -563,7 +563,7 @@ impl NamedStore {
                     }
                 }
                 WalRecord::Compact => {}
-                WalRecord::Upsert { .. } | WalRecord::Quantize | WalRecord::DropCollection => {
+                WalRecord::Upsert { .. } | WalRecord::Quantize => {
                     return Err(VectorSearchError::CorruptData(format!(
                         "unexpected WAL record in named collection {}",
                         self.dir.display()

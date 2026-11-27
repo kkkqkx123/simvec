@@ -100,7 +100,6 @@ impl Completion {
     }
 }
 
-/// One queued transaction: its lsn, its ops and the caller waiting on it.
 /// One queued transaction: its ops and the caller waiting on it. The LSN is
 /// assigned by the worker at flush time, in queue order.
 pub(super) struct Ticket {
@@ -316,6 +315,19 @@ impl CommitQueue {
     fn run_batch(&self, store: &CollectionStore, batch: Vec<Ticket>) {
         store.metrics().record_apply_queue_depth(batch.len() as u64);
         let base = store.assign_batch_lsns(batch.len() as u64);
+        // Admission validation saw each op in isolation. Re-check the whole
+        // batch against the state it will be applied to so a payload that only
+        // fits before several fields are merged cannot enter the log and fail
+        // during apply or replay. Failure rolls the batch back like a WAL
+        // error: no LSN hole, no reservation residue, no unlogged record.
+        if let Err(e) = store.validate_batch_payloads(&batch) {
+            store.abort_unlogged_batch(base, &batch);
+            let message = format!("batch payload validation failed: {e}");
+            for ticket in &batch {
+                self.settle(&ticket.completion, Err(internal(&message)));
+            }
+            return;
+        }
         let logged: Vec<(u64, &[WalRecord])> = batch
             .iter()
             .enumerate()

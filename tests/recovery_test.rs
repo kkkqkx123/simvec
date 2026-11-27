@@ -289,7 +289,7 @@ fn test_checkpoint_truncated_wal_reopens_with_all_points() {
             // leaves exactly one fresh-LSN marker behind: the marker's segment
             // survives the truncate so the next LSN never collides with an
             // existing segment name.
-            let (txns, _) = store.wal().read_all_acked().unwrap();
+            let (txns, _) = store.wal().read_all_from(store.wal().acked_lsn()).unwrap();
             assert_eq!(txns.len(), 1, "checkpoint must leave only its marker");
             assert!(
                 matches!(txns[0].ops.as_slice(), [WalRecord::Compact]),
@@ -500,7 +500,7 @@ fn test_checkpoint_marker_at_full_segment_reopens_cleanly() {
         );
         // The surviving log replays to exactly one no-op marker above the
         // checkpoint watermark.
-        let (txns, _) = store.wal().read_all_acked().unwrap();
+        let (txns, _) = store.wal().read_all_from(store.wal().acked_lsn()).unwrap();
         assert_eq!(txns.len(), 1);
         assert!(matches!(txns[0].ops.as_slice(), [WalRecord::Compact]));
         assert_eq!(store.count(), total);

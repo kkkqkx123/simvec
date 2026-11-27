@@ -206,8 +206,7 @@ impl KindStore {
                 WalRecord::Upsert { .. }
                 | WalRecord::PatchNamedVectors { .. }
                 | WalRecord::Compact
-                | WalRecord::Quantize
-                | WalRecord::DropCollection => {
+                | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "kind store commit received an unsupported record".to_string(),
                     ));
@@ -296,8 +295,7 @@ impl KindStore {
                 WalRecord::Upsert { .. }
                 | WalRecord::PatchNamedVectors { .. }
                 | WalRecord::Compact
-                | WalRecord::Quantize
-                | WalRecord::DropCollection => {
+                | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "kind store commit received an unsupported record".to_string(),
                     ));

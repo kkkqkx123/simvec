@@ -4,8 +4,10 @@
 //! neighbors lose a useful shortcut when the node stops being a result. This
 //! pass reselects each former neighbor's adjacency from its existing links
 //! plus the other nodes that shared the removed node. It touches only the
-//! affected neighborhood and uses the same diversity heuristic as insert, so
-//! no segment-wide rebuild is needed for a single delete.
+//! neighborhood reachable from the deleted node and uses the same diversity
+//! heuristic as insert, so no segment-wide rebuild is needed for a single
+//! delete. Tombstone filtering keeps results correct even when an asymmetric
+//! incoming edge survives; compaction is the full topology repair.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

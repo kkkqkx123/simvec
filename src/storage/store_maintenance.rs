@@ -8,7 +8,6 @@ use super::{CollectionStore, StoreInner};
 use crate::error::{Result, VectorSearchError};
 use crate::types::{IndexConfig, QuantizationConfig};
 
-use super::store_open::threshold_met;
 use super::*;
 
 impl CollectionStore {
@@ -17,8 +16,9 @@ impl CollectionStore {
     /// The engine polls this after mutations and schedules a background
     /// compaction; visibility of data never depends on compaction having run.
     pub fn needs_compaction(&self) -> bool {
-        let inner = self.inner.read();
-        threshold_met(&inner.meta, self.storage.compaction_threshold)
+        !self
+            .segments_needing_compaction(self.storage.compaction_threshold)
+            .is_empty()
     }
 
     /// Whether the WAL has grown past the checkpoint threshold.

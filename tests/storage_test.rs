@@ -273,7 +273,7 @@ fn test_compact_checkpoint_truncates_wal() {
     // Compaction rewrote every derived file, so the WAL is wiped: no logged
     // transaction remains authoritative.
     let wal = Wal::open_or_create(&store_dir.join("wal"), DEFAULT_SEGMENT_BYTES).unwrap();
-    let (txns, _) = wal.read_all().unwrap();
+    let (txns, _) = wal.read_all_from(0).unwrap();
     assert!(txns.is_empty(), "WAL must be empty after compaction");
     assert_eq!(store.count(), 4);
 }
@@ -407,7 +407,7 @@ fn wal_segments_roll_over_and_a_checkpoint_unlinks_them() {
         1,
         "only the marker tail segment survives the checkpoint"
     );
-    let (txns, _) = store.wal().read_all_acked().unwrap();
+    let (txns, _) = store.wal().read_all_from(store.wal().acked_lsn()).unwrap();
     assert_eq!(txns.len(), 1);
     assert!(matches!(txns[0].ops.as_slice(), [WalRecord::Compact]));
     assert_eq!(store.wal().acked_lsn(), 24);

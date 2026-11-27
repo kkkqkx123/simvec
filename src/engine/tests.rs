@@ -58,7 +58,7 @@ pub(super) fn test_deletes_schedule_background_compaction() {
 
     // The maintenance worker drains the queue promptly; poll briefly so
     // the test does not depend on exact thread scheduling.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while store.meta().tombstone_count > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

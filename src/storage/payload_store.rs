@@ -17,11 +17,12 @@
 //! └── ...
 //! ```
 //!
-//! Each payload is stored as `[u32 crc32(JSON)][JSON bytes]` across one or
-//! more contiguous 128-byte blocks within a page. The CRC prevents a
-//! length-valid but overwritten page from being served as a different
-//! payload. The tracker provides direct O(1) slot → pointer lookup, and the
-//! bitmask enables fast free-space allocation without scanning.
+//! Each payload is stored as `[u32 crc32][u8 codec][data]` across one or
+//! more contiguous blocks within a page. The CRC covers the codec and the
+//! encoded bytes, so a length-valid but overwritten page cannot be served as
+//! a different payload. The tracker provides direct O(1) slot → pointer
+//! lookup, and the bitmask enables fast free-space allocation without
+//! scanning.
 //!
 //! All on-disk state is derived: the collection WAL carries every payload
 //! write durably before it is applied, so replay can rebuild tracker, bitmask
@@ -54,9 +55,7 @@ const PAYLOAD_CRC_LEN: usize = 4;
 const PAYLOAD_CODEC_LEN: usize = 1;
 /// Full header for newly written values: `[crc32][codec]`.
 const PAYLOAD_HEADER_LEN: usize = PAYLOAD_CRC_LEN + PAYLOAD_CODEC_LEN;
-/// Codec markers. JSON text never starts with these bytes, so a value whose
-/// first byte after the CRC is 0/1 is new format, anything else is legacy
-/// `[crc][JSON]`.
+/// Codec markers. Every page value carries one; anything else is damage.
 const CODEC_NONE: u8 = 0;
 const CODEC_LZ4: u8 = 1;
 
@@ -108,13 +107,12 @@ fn encode_payload_value(json: &[u8], codec: crate::types::PayloadCompression) ->
     out
 }
 
-/// Decode a page value to raw JSON bytes, accepting both the current
-/// `[crc][codec][data]` framing and the legacy `[crc][JSON]` framing.
+/// Decode a page value to raw JSON bytes. Both the codec byte and the
+/// encoded bytes are covered by the CRC checked here.
 fn decode_payload_json(stored: &[u8]) -> Result<Vec<u8>> {
-    use crate::types::PayloadCompression as C;
-    if stored.len() < PAYLOAD_CRC_LEN {
+    if stored.len() < PAYLOAD_HEADER_LEN {
         return Err(VectorSearchError::CorruptData(
-            "payload blob is shorter than its checksum".to_string(),
+            "payload blob is shorter than its header".to_string(),
         ));
     }
     let (crc_bytes, body) = stored.split_at(PAYLOAD_CRC_LEN);
@@ -124,22 +122,15 @@ fn decode_payload_json(stored: &[u8]) -> Result<Vec<u8>> {
             "payload blob failed its checksum".to_string(),
         ));
     }
-    if body.is_empty() {
-        return Ok(Vec::new());
-    }
-    let marker = body[0];
-    if marker == CODEC_NONE || marker == CODEC_LZ4 {
-        let data = &body[PAYLOAD_CODEC_LEN..];
-        match marker {
-            CODEC_NONE => Ok(data.to_vec()),
-            _ => lz4_flex::decompress_size_prepended(data).map_err(|e| {
-                VectorSearchError::CorruptData(format!("payload lz4 decode failed: {e}"))
-            }),
-        }
-    } else {
-        // Legacy value without a codec byte; the CRC above already matched.
-        let _ = C::None;
-        Ok(body.to_vec())
+    let (codec, data) = body.split_first().expect("header length checked");
+    match *codec {
+        CODEC_NONE => Ok(data.to_vec()),
+        CODEC_LZ4 => lz4_flex::decompress_size_prepended(data).map_err(|e| {
+            VectorSearchError::CorruptData(format!("payload lz4 decode failed: {e}"))
+        }),
+        other => Err(VectorSearchError::CorruptData(format!(
+            "payload blob has unsupported codec {other}"
+        ))),
     }
 }
 
@@ -340,6 +331,20 @@ impl PayloadStore {
         self.put_at(slot, payload, 0)
     }
 
+    /// Reject a JSON value whose encoded representation cannot fit one page.
+    /// The check uses the configured codec because LZ4 framing can make an
+    /// incompressible value larger than the raw JSON.
+    pub(super) fn validate_json_bytes(&self, json: &[u8]) -> Result<()> {
+        let encoded_len = encode_payload_value(json, self.config.compression).len();
+        if encoded_len > self.config.page_size {
+            return Err(VectorSearchError::InvalidConfig(format!(
+                "encoded payload of {} bytes exceeds the {} byte payload page",
+                encoded_len, self.config.page_size
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn put_at(&self, slot: u32, payload: Option<&Payload>, lsn: u64) -> Result<()> {
         let stored = match payload {
             Some(p) => {
@@ -475,16 +480,6 @@ impl PayloadStore {
         }
         new_store.checkpoint()?;
         Ok(new_store)
-    }
-
-    /// Largest payload blob that can be stored, in bytes.
-    ///
-    /// A value must fit inside a single page because a `ValuePointer` is
-    /// `(page, block_offset, len)`; callers validate against this before the
-    /// write is logged, so an oversized payload is a clean rejection rather
-    /// than a WAL record that can never be applied.
-    pub fn max_payload_bytes(&self) -> usize {
-        self.config.page_size.saturating_sub(PAYLOAD_HEADER_LEN)
     }
 
     /// Number of blocks needed for a given byte length.
@@ -789,20 +784,12 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_value_without_codec_still_reads() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = PayloadStore::create(dir.path(), StoreConfig::default()).expect("create");
-        // Hand-frame a legacy `[crc][JSON]` value without a codec byte.
+    fn test_missing_codec_is_rejected() {
         let json = serde_json::to_vec(&payload(&[("legacy", json!(true))])).unwrap();
         let mut blob = Vec::with_capacity(PAYLOAD_CRC_LEN + json.len());
         blob.extend_from_slice(&crc32fast::hash(&json).to_le_bytes());
         blob.extend_from_slice(&json);
-        let decoded = decode_payload_json(&blob).expect("legacy must decode");
-        assert_eq!(decoded, json);
-        // And a store written before the codec change keeps serving it: the
-        // first byte after the CRC is `{`, never a codec marker.
-        assert!(blob[PAYLOAD_CRC_LEN] != CODEC_NONE && blob[PAYLOAD_CRC_LEN] != CODEC_LZ4);
-        let _ = store;
+        assert!(decode_payload_json(&blob).is_err());
     }
 
     #[test]

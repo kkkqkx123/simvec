@@ -122,7 +122,20 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotInfo> {
             info.version
         )));
     }
+    let generation = super::generation::Generation::open(dir)?;
+    if generation.id() != info.generation || generation.lsn() != info.lsn {
+        return Err(VectorSearchError::CorruptData(format!(
+            "snapshot manifest describes generation {} at lsn {}, but generation.bin says {} at {}",
+            info.generation, info.lsn, generation.id(), generation.lsn()
+        )));
+    }
     for file in &info.files {
+        if file.version != info.generation {
+            return Err(VectorSearchError::CorruptData(format!(
+                "snapshot file {} is bound to generation {}, expected {}",
+                file.path, file.version, info.generation
+            )));
+        }
         let target = checked_path(dir, &file.path)?;
         let (len, crc32) = file_checksum(&target)?;
         if len != file.len || crc32 != file.crc32 {

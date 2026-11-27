@@ -223,8 +223,7 @@ impl NamedStore {
                 }
                 WalRecord::Upsert { .. }
                 | WalRecord::Compact
-                | WalRecord::Quantize
-                | WalRecord::DropCollection => {
+                | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "named store commit received an unsupported record".to_string(),
                     ));
@@ -316,8 +315,7 @@ impl NamedStore {
                 WalRecord::DeletePayloadKeys { .. } => {}
                 WalRecord::Upsert { .. }
                 | WalRecord::Compact
-                | WalRecord::Quantize
-                | WalRecord::DropCollection => {
+                | WalRecord::Quantize => {
                     return Err(VectorSearchError::Internal(
                         "named store commit received an unsupported record".to_string(),
                     ));

@@ -506,10 +506,6 @@ pub(super) fn validate_admission_locked(inner: &StoreInner, ops: &[WalRecord]) -
     Ok(())
 }
 
-pub(super) fn threshold_met(meta: &Meta, threshold: f64) -> bool {
-    meta.next_slot > 0 && meta.tombstone_count as f64 / meta.next_slot as f64 > threshold
-}
-
 /// Number of upserted and deleted points in a WAL operation batch.
 pub(super) fn count_ops(ops: &[WalRecord]) -> (u64, u64) {
     let mut upserts = 0u64;
@@ -521,7 +517,6 @@ pub(super) fn count_ops(ops: &[WalRecord]) -> (u64, u64) {
             WalRecord::DeleteBatch { point_ids } => deletes += point_ids.len() as u64,
             WalRecord::Compact
             | WalRecord::Quantize
-            | WalRecord::DropCollection
             | WalRecord::UpsertVectors { .. }
             | WalRecord::PatchNamedVectors { .. }
             | WalRecord::SetPayload { .. }

@@ -504,8 +504,7 @@ impl KindStore {
                 WalRecord::Compact => {}
                 WalRecord::Upsert { .. }
                 | WalRecord::PatchNamedVectors { .. }
-                | WalRecord::Quantize
-                | WalRecord::DropCollection => {
+                | WalRecord::Quantize => {
                     return Err(VectorSearchError::CorruptData(format!(
                         "unexpected WAL record in kind collection {}",
                         self.dir.display()
