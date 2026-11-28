@@ -4,11 +4,17 @@
 
 ## 一、完整性评估结论
 
-### 1.1 已完整落地（无需再动）
+> 修订（`342ba6d` 复核）：本节的"已完整落地"结论偏乐观。逐行核对结果见
+> `deferred-storage-completion.md`：七阶段的文件布局、段级 flush/ACK、引用式 WAL、dtype、
+> 快照 C ABI 成立，但"段级压实 + slot 稳定""段内 free offset 复用""per-segment blob
+> 与回收"三项未落地，阶段八（本文第二节）尚未开始。以 `AGENTS.md` 与
+> `deferred-storage-completion.md` 为准。
+
+### 1.1 文件布局与写入路径（实现成立）
 
 | 阶段 | 核心实现 | 验证状态 |
 | --- | --- | --- |
-| 一 CRC32C + HNSW 反向邻接 | 统一 CRC32C 信封；`Node.reverse` + 加载派生 + 删除清理全部入边 | `test_healing_removes_inbound_edges_absent_from_deleted_adjacency`；旧 CRC32 `legacy_crc32_envelope_is_rejected` |
+| 一 CRC32C + HNSW 反向邻接 | 统一 CRC32C 信封；`Node.reverse` + 加载派生 + 删除清理全部入边 | `test_healing_removes_inbound_edges_absent_from_deleted_adjacency`；信封 CRC 不匹配由 `test_corrupt_dtype_header_is_rejected` 覆盖（原 `legacy_crc32_envelope_is_rejected` 因 magic 写错、从未执行到 CRC 分支，已删除） |
 | 二 dense 物理段 + tracker | `segments/<start>/` + 段级 `id_tracker.bin`；删除 `dense_snapshot.rs` | `test_physical_segments_own_their_files`、`test_dense_snapshot_restores_id_directory`、`test_mismatched_id_tracker_is_rejected` |
 | 三 段级 flush + ACK | rayon 并行 flush；段水位独立；`MaintenanceStatus` 经 C ABI 暴露 | `test_segment_wal_ack_stops_at_a_live_pin`、`test_checkpoint_flush_runs_without_the_write_lock` |
 | 四 引用式 WAL + blob | `wal_blobs.rs` + `WalRecordOnDisk`；先 blob fsync 后写引用 | `test_corrupt_blob_is_reported`、`test_apply_txn_rejects_invalid_before_wal_append` |
@@ -16,7 +22,7 @@
 | 六 类型 + multivector | `VectorDataType` + `distance/dtype.rs` naive/SIMD + MaxSim + dense sidecar | `f16_dtype_is_applied_and_persisted`、`simd_kernel_matches_naive_on_decoded_dtypes`、`maxsim_matches_exact_baseline` |
 | 七 快照清单 + C ABI | WAL 段按首 lsn 绑定 version；cbindgen 重生成头文件；5 语言绑定同步 | `snapshot_c_abi_roundtrip`、`test_incremental_snapshot_reuses_unchanged_files`、`binding-matrix.md` |
 
-全量测试：414 单元测试 + 13 个集成套件全部通过（0 failed）；`cargo check` 与 `--features c_api` 均零警告。
+当时的全量结果：414 单元测试 + 13 个集成套件通过（0 failed）；`cargo check` 与 `--features c_api` 零警告。该数字只说明当时的用例通过，不代表下列缺口不存在。
 
 ### 1.2 剩余缺口（本阶段处理）
 
@@ -81,7 +87,7 @@ C ABI 侧 `src/c_api/tests.rs` 已有 `snapshot_c_abi_roundtrip`；补一个 `ma
 
 **G4 性能基线**
 
-在 `benches/quick.rs` 增加 `wal_bytes_vs_checkpoint` quick 档：比较引用式 WAL 与分段 checkpoint 的相对体积/耗时，仅记录相对数，不与完整 bench 或跨机器数据比较。
+新增 `wal_bytes_vs_checkpoint` quick 档：比较引用式 WAL 与分段 checkpoint 的相对体积/耗时，仅记录相对数，不与完整 bench 或跨机器数据比较。落点是具体 bench 文件（例如 `benches/concurrent_write_bench.rs`）：`benches/quick.rs` 是 `autobenches = false` 的共享助手模块，不能作为 bench 目标注册。
 
 **G5 Turbo 配置拒绝**
 

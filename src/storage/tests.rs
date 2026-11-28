@@ -509,6 +509,85 @@ fn test_incremental_snapshot_reuses_unchanged_files() {
     assert_eq!(restored.count(), 2);
 }
 
+/// A manifest entry whose file disappeared fails verification instead of
+/// producing a snapshot that only breaks at restore time.
+#[test]
+fn test_snapshot_verification_rejects_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_missing");
+    let snap_dir = dir.path().join("snap_missing");
+    let store = CollectionStore::create(&store_dir, "col_snap_missing", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    store.checkpoint().unwrap();
+    let info = store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    // `generation.bin` is validated separately, so delete a segment file to
+    // exercise the per-file check.
+    let victim = info
+        .files
+        .iter()
+        .find(|f| f.path.contains("/segments/"))
+        .expect("a segment file is described by the manifest");
+    std::fs::remove_file(snap_dir.join(&victim.path)).unwrap();
+
+    let err = verify_snapshot(&snap_dir).expect_err("a missing file must fail verification");
+    assert!(err.to_string().contains("No such file"), "{err}");
+}
+
+/// Restoring refuses an existing destination instead of merging into it.
+#[test]
+fn test_snapshot_rejects_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_target");
+    let snap_dir = dir.path().join("snap_target");
+    let restore_dir = dir.path().join("restore_target");
+    let store = CollectionStore::create(&store_dir, "col_snap_target", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    std::fs::create_dir_all(&restore_dir).unwrap();
+    std::fs::write(restore_dir.join("keep.txt"), b"not ours").unwrap();
+
+    let err = restore_snapshot(&snap_dir, &restore_dir).expect_err("must refuse an existing target");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    // The existing directory is left untouched.
+    assert_eq!(
+        std::fs::read(restore_dir.join("keep.txt")).unwrap(),
+        b"not ours"
+    );
+}
+
+/// A file entry stamped with another generation is rejected: the manifest must
+/// describe exactly the generation it ships.
+#[test]
+fn test_snapshot_verification_rejects_wrong_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_version");
+    let snap_dir = dir.path().join("snap_version");
+    let store = CollectionStore::create(&store_dir, "col_snap_version", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    store.checkpoint().unwrap();
+    store.snapshot_to(&snap_dir).unwrap();
+    drop(store);
+
+    let manifest = snap_dir.join(snapshot::SNAPSHOT_MANIFEST_FILE);
+    let mut info = snapshot::read::<snapshot::SnapshotInfo>(&manifest)
+        .unwrap()
+        .expect("snapshot manifest is readable");
+    let entry = info
+        .files
+        .iter_mut()
+        .find(|f| f.path.contains("/segments/"))
+        .expect("a segment file is described by the manifest");
+    entry.version += 1;
+    snapshot::write_info(&manifest, &info).unwrap();
+
+    let err = verify_snapshot(&snap_dir).expect_err("a foreign generation must be rejected");
+    assert!(err.to_string().contains("bound to generation"), "{err}");
+}
+
 #[test]
 fn test_search_payload_selector_projection() {
     use crate::types::{PayloadSelector, SearchQuery};
@@ -1235,6 +1314,32 @@ fn test_dense_snapshot_restores_id_directory() {
         Some(&serde_json::json!("red"))
     );
     assert!(reopened.get(&PointId::from("9999")).unwrap().is_none());
+}
+
+/// A staged tracker left behind by an interrupted checkpoint is invisible:
+/// only the published `id_tracker.bin` is read, so a crash between the
+/// unlocked flush and the publish rename cannot poison the next open.
+#[test]
+fn test_staged_id_tracker_is_invisible_until_published() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("col_tracker_staged");
+    let store = CollectionStore::create(&store_dir, "col_tracker_staged", &config(4)).unwrap();
+    upsert_logged(&store, &point(7, 4));
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let data = data_dir(&store_dir);
+    let seg = data.join("segments/0000000000");
+    // A published checkpoint leaves no staging file behind.
+    assert!(seg.join("id_tracker.bin").exists());
+    assert!(!seg.join("id_tracker.staged").exists());
+
+    // A leftover staging file (what a crash right after phase 1 looks like)
+    // is ignored by open, even when its contents are unusable.
+    std::fs::write(seg.join("id_tracker.staged"), b"garbage").unwrap();
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 1);
+    assert!(reopened.get(&PointId::from("7")).unwrap().is_some());
 }
 
 /// A tracker bound to a different generation is rejected by open: it belongs

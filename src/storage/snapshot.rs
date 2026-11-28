@@ -16,15 +16,20 @@ use crate::error::{Result, VectorSearchError};
 const SNAPSHOT_MAGIC: [u8; 4] = *b"SVPC";
 const SNAPSHOT_VERSION: u16 = 1;
 
-/// Write `value` to a temporary file, fsync it, then publish by rename.
-pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+/// Serialize `value` into a complete 10-byte-envelope payload.
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let bytes = postcard::to_stdvec(value)?;
     let mut payload = Vec::with_capacity(10 + bytes.len());
     payload.extend_from_slice(&SNAPSHOT_MAGIC);
     payload.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
     payload.extend_from_slice(&crate::checksum::hash(&bytes).to_le_bytes());
     payload.extend_from_slice(&bytes);
+    Ok(payload)
+}
 
+/// Write `value` to a temporary file, fsync it, then publish by rename.
+pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let payload = encode(value)?;
     let temp = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .write(true)
@@ -39,6 +44,25 @@ pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let dir = File::open(parent)?;
         dir.sync_all()?;
     }
+    Ok(())
+}
+
+/// Write the same envelope to `path` **without** renaming it into place.
+///
+/// Used by records that a later step in the same checkpoint publishes with an
+/// explicit rename: the file is durable but invisible to readers until then,
+/// which is what lets a flush run outside the queue gate (see the per-segment
+/// id tracker in `segments.rs`). The parent directory is not fsynced here —
+/// the publish step owns that.
+pub fn write_staged<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let payload = encode(value)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -218,23 +242,4 @@ pub(crate) fn file_checksum(path: &Path) -> Result<(u64, u32)> {
         len += read as u64;
     }
     Ok((len, hasher.finalize()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_crc32_envelope_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.bin");
-        let body = postcard::to_stdvec(&42u32).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"SVSP");
-        bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        std::fs::write(&path, bytes).unwrap();
-        assert!(read::<u32>(&path).unwrap().is_none());
-    }
 }

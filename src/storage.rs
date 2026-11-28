@@ -346,11 +346,16 @@ pub(super) struct DataFiles {
 
 impl DataFiles {
     /// Open every serving file of one generation.
+    ///
+    /// `generation` must be the manifest id the caller loaded: the segment
+    /// accounting in `segments.json` is bound to it, so a manifest left behind
+    /// by another generation is discarded instead of trusted.
     pub(super) fn open(
         dir: &Path,
         meta: &Meta,
         storage: &StorageConfig,
         replay_floor: u64,
+        generation: u64,
     ) -> Result<Self> {
         let dir = dir.to_path_buf();
         let vectors = Vectors::open(
@@ -360,7 +365,8 @@ impl DataFiles {
             meta.slot_capacity,
         )?;
         let keys = Keys::open(&dir, meta.segment_slots, meta.slot_capacity)?;
-        let segments = segments::read_or_derive(&dir, meta.segment_slots, meta.next_slot)?;
+        let segments =
+            segments::read_or_derive(&dir, generation, meta.segment_slots, meta.next_slot)?;
         let tombstones = TombstoneBits::load_segments(
             &dir,
             meta.segment_slots,
@@ -638,6 +644,7 @@ impl CollectionStore {
         crate::types::MaintenanceStatus {
             healthy: error.is_none(),
             persisted_lsn: inner.min_persisted(inner.meta.last_applied_txn),
+            wal_blob_bytes: self.wal.blob_bytes(),
             error,
             segments,
         }
@@ -680,10 +687,28 @@ impl CollectionStore {
     pub(crate) fn segment_entries(&self) -> Vec<segments::SegmentEntry> {
         let inner = self.inner.read();
         let tombstones = self.data_arc().tombstones.load();
-        let watermark = inner.meta.last_applied_txn;
+        let fallback = inner.meta.last_applied_txn;
         let next_slot = inner.meta.next_slot;
         let segment_slots = inner.meta.segment_slots;
-        segments::derive_entries(next_slot, segment_slots, |s| tombstones.bit(s), watermark)
+        segments::derive_entries(
+            next_slot,
+            segment_slots,
+            |s| tombstones.bit(s),
+            |index| {
+                (
+                    inner
+                        .segment_applied
+                        .get(index)
+                        .copied()
+                        .unwrap_or(fallback),
+                    inner
+                        .segment_persisted
+                        .get(index)
+                        .copied()
+                        .unwrap_or(fallback),
+                )
+            },
+        )
     }
 
     /// Starts of frozen segments whose garbage ratio meets `threshold`.

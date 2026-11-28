@@ -19,7 +19,8 @@
 //! [8..16)  total_blocks    u64
 //! [16..20) block_size      u32
 //! [20..24) page_blocks     u32 (blocks per page)
-//! [24..)   bitmap data     ceil(total_blocks / 8) bytes
+//! [24..28) crc32c          over [0..24) plus the bitmap bytes
+//! [28..)   bitmap data     ceil(total_blocks / 8) bytes
 //! ```
 
 use std::collections::HashSet;
@@ -32,7 +33,10 @@ use crate::error::{Result, VectorSearchError};
 use super::{StoreConfig, ValuePointer, BITMASK_MAGIC};
 
 const BITMASK_VERSION: u32 = 1;
-const BITMASK_HEADER_LEN: usize = 24;
+/// Bytes before the bitmap: magic + version + geometry + checksum.
+const BITMASK_HEADER_LEN: usize = 28;
+/// Bytes covered by the checksum: the header without the CRC field.
+const BITMASK_CRC_COVERED: usize = 24;
 
 /// In-memory state of the bitmask.
 #[derive(Debug, Clone)]
@@ -350,10 +354,30 @@ impl MmapBitmask {
         let total_blocks = u64::from_le_bytes(header[8..16].try_into().unwrap());
         let block_size = u32::from_le_bytes(header[16..20].try_into().unwrap());
         let page_blocks = u32::from_le_bytes(header[20..24].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(header[24..28].try_into().unwrap());
 
         let bitmap_len = total_blocks.div_ceil(8) as usize;
         let mut data = vec![0u8; bitmap_len];
         file.read_exact(&mut data)?;
+        // The bitmap is exactly `ceil(total_blocks/8)` bytes: a truncated or
+        // extended file is damage, not slack.
+        let mut trailing = Vec::new();
+        file.read_to_end(&mut trailing)?;
+        if !trailing.is_empty() {
+            return Err(VectorSearchError::CorruptData(format!(
+                "bitmask has {} trailing bytes",
+                trailing.len()
+            )));
+        }
+
+        let mut crc = crate::checksum::Hasher::new();
+        crc.update(&header[..BITMASK_CRC_COVERED]);
+        crc.update(&data);
+        if crc.finalize() != stored_crc {
+            return Err(VectorSearchError::CorruptData(
+                "bitmask checksum mismatch".to_string(),
+            ));
+        }
 
         Ok(BitmaskInner {
             data,
@@ -366,12 +390,21 @@ impl MmapBitmask {
 
     fn write_file(file: &mut File, inner: &BitmaskInner) -> Result<()> {
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&BITMASK_MAGIC)?;
-        file.write_all(&BITMASK_VERSION.to_le_bytes())?;
-        file.write_all(&inner.total_blocks.to_le_bytes())?;
-        file.write_all(&inner.block_size.to_le_bytes())?;
-        file.write_all(&inner.page_blocks.to_le_bytes())?;
+        let mut header = Vec::with_capacity(BITMASK_HEADER_LEN);
+        header.extend_from_slice(&BITMASK_MAGIC);
+        header.extend_from_slice(&BITMASK_VERSION.to_le_bytes());
+        header.extend_from_slice(&inner.total_blocks.to_le_bytes());
+        header.extend_from_slice(&inner.block_size.to_le_bytes());
+        header.extend_from_slice(&inner.page_blocks.to_le_bytes());
+        let mut crc = crate::checksum::Hasher::new();
+        crc.update(&header[..BITMASK_CRC_COVERED]);
+        crc.update(&inner.data);
+        header.extend_from_slice(&crc.finalize().to_le_bytes());
+        file.write_all(&header)?;
         file.write_all(&inner.data)?;
+        // A shrinking bitmap must not leave stale bytes behind: the reader
+        // treats anything past `ceil(total_blocks/8)` as damage.
+        file.set_len((header.len() + inner.data.len()) as u64)?;
         Ok(())
     }
 }
@@ -471,6 +504,51 @@ mod tests {
         let bm = MmapBitmask::create(dir.path(), &config).unwrap();
         let err = bm.allocate(9, &config).expect_err("must reject");
         assert!(err.to_string().contains("exceeds one"), "{err}");
+    }
+
+    #[test]
+    fn a_flipped_bit_fails_the_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        {
+            let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+            bm.allocate(2, &config).unwrap();
+            bm.persist().unwrap();
+        }
+        let path = dir.path().join("bitmask.bin");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip one bit of the bitmap: geometry still looks fine, so only the
+        // checksum can catch it.
+        bytes[BITMASK_HEADER_LEN] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match MmapBitmask::open(dir.path(), &config) {
+            Ok(_) => panic!("must reject a flipped bit"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("checksum"), "{err}");
+    }
+
+    #[test]
+    fn a_version_one_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        {
+            let bm = MmapBitmask::create(dir.path(), &config).unwrap();
+            bm.allocate(2, &config).unwrap();
+            bm.persist().unwrap();
+        }
+        let path = dir.path().join("bitmask.bin");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Version 1 had no checksum field; it must not be read as version 2.
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match MmapBitmask::open(dir.path(), &config) {
+            Ok(_) => panic!("must reject a version-1 file"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("version"), "{err}");
     }
 
     #[test]

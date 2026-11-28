@@ -650,19 +650,27 @@ impl CollectionStore {
         segments::write_trackers_from_points(
             dir,
             staged.id(),
+            meta.last_applied_txn,
             meta.segment_slots,
             &tracker_points,
         )?;
         // Freshly compacted generations carry no tombstones: every segment
         // is fully live, so the manifest can record zero garbage directly.
         {
+            let watermark = meta.last_applied_txn;
             let entries = segments::derive_entries(
                 meta.next_slot,
                 meta.segment_slots,
                 |_| false,
-                meta.last_applied_txn,
+                |_| (watermark, watermark),
             );
-            segments::write_with_entries(dir, meta.segment_slots, meta.next_slot, &entries)?;
+            segments::write_with_entries(
+                dir,
+                staged.id(),
+                meta.segment_slots,
+                meta.next_slot,
+                &entries,
+            )?;
         }
         meta.save(dir)?;
 
@@ -697,7 +705,13 @@ impl CollectionStore {
         // Validate the staged files before publication: a failure here leaves
         // the old generation serving and the staging directory unpublished.
         let staged_files =
-            DataFiles::open(staged.path(), &meta, &self.storage, meta.last_applied_txn)?;
+            DataFiles::open(
+                staged.path(),
+                &meta,
+                &self.storage,
+                meta.last_applied_txn,
+                staged.id(),
+            )?;
         drop(staged_files);
         let old_files_view = self.data_arc();
         let had_index = !old_files_view.hnsw_segments.load().is_empty()
@@ -716,7 +730,13 @@ impl CollectionStore {
         self.wal.bind_generation(next_generation.id());
         // Reopen from the published path so every handle's path stays valid
         // for later growth and checkpoint writes.
-        let new_files = DataFiles::open(&next_generation.path(), &meta, &self.storage, watermark)?;
+        let new_files = DataFiles::open(
+            &next_generation.path(),
+            &meta,
+            &self.storage,
+            watermark,
+            next_generation.id(),
+        )?;
         new_files.ivf_segments.store(Arc::new(staged_index.ivf));
         new_files.hnsw_segments.store(Arc::new(staged_index.hnsw));
         let has_new_index =

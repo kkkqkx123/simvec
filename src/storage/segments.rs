@@ -27,10 +27,14 @@ pub(crate) struct SegmentEntry {
     pub start: u32,
     /// One past the last slot covered by this entry.
     pub end: u32,
+    /// Slot capacity of the segment, independent of how much is used.
+    pub capacity: u32,
     /// Live slots in `[start, end)`.
     pub live_count: u64,
     /// Tombstoned slots in `[start, end)`.
     pub tombstone_count: u64,
+    /// Highest LSN applied to slots of this segment.
+    pub applied_lsn: u64,
     /// Highest LSN known durable for this segment at publish time.
     pub persisted_lsn: u64,
 }
@@ -49,6 +53,9 @@ impl SegmentEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
+    /// Generation this accounting describes. A manifest left behind by another
+    /// generation is discarded instead of being trusted.
+    generation: u64,
     segment_slots: u32,
     next_slot: u64,
     #[serde(default)]
@@ -147,11 +154,15 @@ pub(crate) fn segment_range(index: usize, segment_slots: u32, next_slot: u64) ->
 ///
 /// The caller passes a slot predicate so this module stays decoupled from the
 /// tombstone representation; production passes the live tombstone bits.
+/// `watermarks(index)` returns `(applied_lsn, persisted_lsn)` for the segment,
+/// because a flush advances each segment independently — stamping every entry
+/// with one global number would claim durability a lagging segment does not
+/// have.
 pub(crate) fn derive_entries(
     next_slot: u64,
     segment_slots: u32,
     mut is_tombstoned: impl FnMut(usize) -> bool,
-    persisted_lsn: u64,
+    watermarks: impl Fn(usize) -> (u64, u64),
 ) -> Vec<SegmentEntry> {
     if segment_slots == 0 || next_slot == 0 {
         return Vec::new();
@@ -169,20 +180,28 @@ pub(crate) fn derive_entries(
                 live += 1;
             }
         }
+        let (applied_lsn, persisted_lsn) = watermarks(index);
         entries.push(SegmentEntry {
             start,
             end,
+            capacity: segment_slots,
             live_count: live,
             tombstone_count: tomb,
+            applied_lsn,
             persisted_lsn,
         });
     }
     entries
 }
 
-/// Segments whose garbage ratio meets `threshold`. The appendable tail is
-/// never selected: it is still receiving writes, so compacting it would race
-/// the write path without reclaiming stable garbage.
+/// Segments whose garbage ratio meets `threshold`.
+///
+/// The appendable tail is excluded while a frozen segment exists in front of
+/// it: it is still receiving writes, so compacting it would race the write path
+/// without reclaiming stable garbage. A collection that has **only** the tail
+/// (never filled one segment) is the exception — excluding it would mean a
+/// small collection could never reclaim garbage at all, so the tail is
+/// eligible when it is the sole entry.
 pub(crate) fn select_for_compaction(entries: &[SegmentEntry], threshold: f64) -> Vec<u32> {
     if entries.is_empty() {
         return Vec::new();
@@ -209,6 +228,13 @@ pub(crate) struct IdTrackerEntry {
 #[derive(Debug, Serialize, Deserialize)]
 struct IdTracker {
     generation: u64,
+    /// Applied frontier this tracker describes.
+    ///
+    /// A published tracker is only visible after every byte it names is
+    /// durable, so `lsn` doubles as the "trust ceiling" for the per-id water
+    /// marks below: a point newer than `lsn` cannot be assumed durable, and
+    /// [`read_id_trackers`] caps its version so WAL replay re-applies it.
+    lsn: u64,
     entries: Vec<IdTrackerEntry>,
 }
 
@@ -216,13 +242,24 @@ struct IdTracker {
 ///
 /// `generation` is the id of the generation the tracker belongs to; binding it
 /// (rather than a slot water mark) lets open reject a tracker that was left
-/// behind by an aborted staging attempt.
+/// behind by an aborted staging attempt. `lsn` is the segment's applied
+/// frontier at the moment the tracker was built; because the publish rename
+/// only happens with the queue gate closed, every entry it names is at or
+/// below that frontier and already durable.
+///
+/// The file is written to [`ID_TRACKER_STAGED_FILE`], never over the published
+/// one: checkpoints flush outside the queue gate, where writers may still
+/// append to this segment, so a tracker built there can name a point whose
+/// bytes are not yet fsynced. [`publish_id_trackers`] renames the staged file
+/// into place from inside the gate, after the re-flush, which makes "visible
+/// tracker ⇒ durable bytes" an invariant instead of a hope.
 pub(super) fn write_id_tracker(
     data: &DataFiles,
     start: u32,
     end: u32,
     inner: &StoreInner,
     generation: u64,
+    lsn: u64,
 ) -> Result<()> {
     let keys = data.keys.snapshot();
     let tombstones = data.tombstones.load();
@@ -244,10 +281,11 @@ pub(super) fn write_id_tracker(
             free: !live || deleted,
         });
     }
-    snapshot::write(
-        &segment_dir(data.dir(), start).join(ID_TRACKER_FILE),
+    snapshot::write_staged(
+        &segment_dir(data.dir(), start).join(ID_TRACKER_STAGED_FILE),
         &IdTracker {
             generation,
+            lsn,
             entries,
         },
     )
@@ -256,6 +294,31 @@ pub(super) fn write_id_tracker(
 /// File name of a segment's authoritative id directory.
 pub(crate) const ID_TRACKER_FILE: &str = "id_tracker.bin";
 
+/// File name of a tracker waiting for its publish rename.
+pub(crate) const ID_TRACKER_STAGED_FILE: &str = "id_tracker.staged";
+
+/// Publish the staged trackers of a checkpoint.
+///
+/// Runs inside the queue gate after the re-flush: every staged tracker now
+/// describes exactly the bytes on disk, so renaming them visible is safe. A
+/// partially published set is still consistent — each segment's tracker is
+/// self-contained, and the ACK is the minimum over segments.
+pub(crate) fn publish_id_trackers(dir: &Path, segment_slots: u32, count: usize) -> Result<()> {
+    if segment_slots == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        let seg_dir = segment_path(dir, index as u32 * segment_slots);
+        let staged = seg_dir.join(ID_TRACKER_STAGED_FILE);
+        if !staged.exists() {
+            continue;
+        }
+        std::fs::rename(&staged, seg_dir.join(ID_TRACKER_FILE))?;
+        std::fs::File::open(&seg_dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// One point's directory entry handed to a tracker writer (id, global slot,
 /// point lsn, delete lsn, free).
 pub(crate) type TrackerPoint = (String, u32, u64, u64, bool);
@@ -263,9 +326,13 @@ pub(crate) type TrackerPoint = (String, u32, u64, u64, bool);
 /// Write id trackers for a freshly built generation from an explicit list of
 /// points, grouped by their segment. Used by compaction, which knows the final
 /// slot of every live point but has no live `StoreInner` to read from.
+///
+/// The whole staging directory is unpublished, so these trackers are written
+/// directly rather than staged.
 pub(crate) fn write_trackers_from_points(
     dir: &Path,
     generation: u64,
+    lsn: u64,
     segment_slots: u32,
     points: &[TrackerPoint],
 ) -> Result<()> {
@@ -288,6 +355,7 @@ pub(crate) fn write_trackers_from_points(
             &segment_dir(dir, start).join(ID_TRACKER_FILE),
             &IdTracker {
                 generation,
+                lsn,
                 entries,
             },
         )?;
@@ -343,12 +411,13 @@ pub(crate) fn read_id_trackers(
         found = true;
         for entry in tracker.entries {
             let id = PointId::from(entry.id.as_str());
-            let version = entry.point_lsn.max(entry.delete_lsn);
+            // Cap the point water mark at the tracker's own frontier: a point
+            // newer than that is not guaranteed durable, so replay must be
+            // allowed to re-apply it instead of skipping it as stale.
+            let point_lsn = entry.point_lsn.min(tracker.lsn);
+            let version = point_lsn.max(entry.delete_lsn);
             versions.insert_value(&id, version);
             if entry.free {
-                if entry.delete_lsn > 0 {
-                    versions.insert_value(&id, entry.delete_lsn);
-                }
                 continue;
             }
             reverse.insert(&id, start + entry.offset);
@@ -362,11 +431,12 @@ pub(crate) fn read_id_trackers(
 }
 
 /// Publish the derived segment manifest for a generation.
-pub(crate) fn write(dir: &Path, segment_slots: u32, next_slot: u64) -> Result<()> {
+pub(crate) fn write(dir: &Path, generation: u64, segment_slots: u32, next_slot: u64) -> Result<()> {
     snapshot::write(
         &dir.join(SEGMENTS_FILE),
         &Manifest {
             version: FORMAT_VERSION,
+            generation,
             segment_slots,
             next_slot,
             segments: Vec::new(),
@@ -377,6 +447,7 @@ pub(crate) fn write(dir: &Path, segment_slots: u32, next_slot: u64) -> Result<()
 /// Publish the manifest together with per-segment accounting.
 pub(crate) fn write_with_entries(
     dir: &Path,
+    generation: u64,
     segment_slots: u32,
     next_slot: u64,
     entries: &[SegmentEntry],
@@ -385,6 +456,7 @@ pub(crate) fn write_with_entries(
         &dir.join(SEGMENTS_FILE),
         &Manifest {
             version: FORMAT_VERSION,
+            generation,
             segment_slots,
             next_slot,
             segments: entries.to_vec(),
@@ -393,11 +465,21 @@ pub(crate) fn write_with_entries(
 }
 
 /// Load persisted per-segment accounting, if the manifest carries current data.
-pub(crate) fn read_entries(dir: &Path, segment_slots: u32, next_slot: u64) -> Vec<SegmentEntry> {
+///
+/// Any disagreement — generation, layout marker, segment width, slot frontier —
+/// makes the whole accounting stale, which the caller resolves by falling back
+/// to the generation floor.
+pub(crate) fn read_entries(
+    dir: &Path,
+    generation: u64,
+    segment_slots: u32,
+    next_slot: u64,
+) -> Vec<SegmentEntry> {
     let Ok(Some(manifest)) = snapshot::read::<Manifest>(&dir.join(SEGMENTS_FILE)) else {
         return Vec::new();
     };
     if manifest.version != FORMAT_VERSION
+        || manifest.generation != generation
         || manifest.segment_slots != segment_slots
         || manifest.next_slot != next_slot
     {
@@ -407,11 +489,19 @@ pub(crate) fn read_entries(dir: &Path, segment_slots: u32, next_slot: u64) -> Ve
 }
 
 /// Load the segment manifest, refreshing it when it disagrees with `meta.bin`.
-pub(crate) fn read_or_derive(dir: &Path, segment_slots: u32, next_slot: u64) -> Result<SegmentSet> {
-    let valid = snapshot::read::<Manifest>(&dir.join(SEGMENTS_FILE))?
-        .filter(|m| m.version == FORMAT_VERSION && m.segment_slots == segment_slots);
+pub(crate) fn read_or_derive(
+    dir: &Path,
+    generation: u64,
+    segment_slots: u32,
+    next_slot: u64,
+) -> Result<SegmentSet> {
+    let valid = snapshot::read::<Manifest>(&dir.join(SEGMENTS_FILE))?.filter(|m| {
+        m.version == FORMAT_VERSION
+            && m.generation == generation
+            && m.segment_slots == segment_slots
+    });
     if !valid.is_some_and(|m| m.next_slot == next_slot) {
-        write(dir, segment_slots, next_slot)?;
+        write(dir, generation, segment_slots, next_slot)?;
     }
     Ok(SegmentSet::new(next_slot, segment_slots))
 }
@@ -431,8 +521,8 @@ mod tests {
     #[test]
     fn manifest_reports_a_stale_slot_count() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), 4, 5).unwrap();
-        let set = read_or_derive(dir.path(), 4, 8).unwrap();
+        write(dir.path(), 3, 4, 5).unwrap();
+        let set = read_or_derive(dir.path(), 3, 4, 8).unwrap();
         assert_eq!(set.immutable_end, 8);
         let stored = snapshot::read::<Manifest>(&dir.path().join(SEGMENTS_FILE))
             .unwrap()
@@ -443,11 +533,16 @@ mod tests {
     #[test]
     fn entries_split_slots_and_report_garbage() {
         let tomb = [false, true, false, false, true, true, false, false];
-        let entries = derive_entries(8, 4, |s| tomb[s], 9);
+        let entries = derive_entries(8, 4, |s| tomb[s], |index| {
+            (9 + index as u64, 8 + index as u64)
+        });
         assert_eq!(entries.len(), 2);
         assert_eq!((entries[0].start, entries[0].end), (0, 4));
+        assert_eq!(entries[0].capacity, 4);
         assert_eq!(entries[0].live_count, 3);
         assert_eq!(entries[0].tombstone_count, 1);
+        assert_eq!(entries[0].applied_lsn, 9);
+        assert_eq!(entries[0].persisted_lsn, 8);
         assert_eq!((entries[1].start, entries[1].end), (4, 8));
         assert_eq!(entries[1].live_count, 2);
         assert_eq!(entries[1].tombstone_count, 2);
@@ -456,12 +551,28 @@ mod tests {
     }
 
     #[test]
+    fn the_appendable_tail_is_selected_only_as_the_sole_segment() {
+        // A single-segment collection is all tail: it must stay eligible, or
+        // a small collection could never reclaim garbage.
+        let tomb = [true, true, false, false];
+        let single = derive_entries(4, 4, |s| tomb[s], |_| (5, 5));
+        assert_eq!(select_for_compaction(&single, 0.10), vec![0]);
+        // With a frozen segment in front, only that one is eligible; the tail
+        // keeps receiving writes.
+        let tomb = [true, true, false, false, true, true, false, false];
+        let two = derive_entries(8, 4, |s| tomb[s], |_| (9, 9));
+        assert_eq!(select_for_compaction(&two, 0.10), vec![0]);
+    }
+
+    #[test]
     fn entries_round_trip_through_the_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let entries = derive_entries(4, 4, |_| false, 7);
-        write_with_entries(dir.path(), 4, 4, &entries).unwrap();
-        let loaded = read_entries(dir.path(), 4, 4);
+        let entries = derive_entries(4, 4, |_| false, |_| (7, 6));
+        write_with_entries(dir.path(), 3, 4, 4, &entries).unwrap();
+        let loaded = read_entries(dir.path(), 3, 4, 4);
         assert_eq!(loaded, entries);
-        assert!(read_entries(dir.path(), 4, 8).is_empty());
+        // A different frontier or generation makes the accounting stale.
+        assert!(read_entries(dir.path(), 3, 4, 8).is_empty());
+        assert!(read_entries(dir.path(), 4, 4, 4).is_empty());
     }
 }

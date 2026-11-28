@@ -82,6 +82,7 @@ impl LocalVectorEngine {
             return Ok(crate::types::MaintenanceStatus {
                 healthy: true,
                 persisted_lsn: 0,
+                wal_blob_bytes: 0,
                 error: None,
                 segments: Vec::new(),
             });

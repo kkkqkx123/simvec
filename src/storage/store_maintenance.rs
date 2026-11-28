@@ -95,33 +95,50 @@ impl CollectionStore {
         self.flush_data_files(second_capacity)?;
         let mut inner = self.inner.write();
         let data_dir = self.data_dir();
+        // Publish the id trackers now that the gate is closed and every dirty
+        // byte has been re-flushed: a visible tracker then always names bytes
+        // that are already durable. Phase 1 only staged them, precisely
+        // because writers were still allowed to append there.
+        let generation_id = self.generation.read().id();
+        segments::publish_id_trackers(
+            &data_dir,
+            inner.meta.segment_slots,
+            inner.segment_persisted.len(),
+        )?;
         inner.meta.save(&data_dir)?;
         {
             let tombstones = self.data_arc().tombstones.load();
             let watermark = inner.meta.last_applied_txn;
+            let applied = &inner.segment_applied;
+            let persisted = &inner.segment_persisted;
             let entries = segments::derive_entries(
                 inner.meta.next_slot,
                 inner.meta.segment_slots,
                 |s| tombstones.bit(s),
-                watermark,
+                |index| {
+                    (
+                        applied.get(index).copied().unwrap_or(watermark),
+                        persisted.get(index).copied().unwrap_or(watermark),
+                    )
+                },
             );
             segments::write_with_entries(
                 &data_dir,
+                generation_id,
                 inner.meta.segment_slots,
                 inner.meta.next_slot,
                 &entries,
             )?;
         }
-        // Per-segment id trackers were written by flush_segment above and are
-        // the authoritative directory for this generation. They are written
-        // before the manifest advances, so a crash can only leave them ahead
-        // of the manifest; open rejects a tracker bound to another generation
-        // and the WAL stays intact at that point.
+        // The published trackers are the authoritative id directory for this
+        // generation and were renamed in above, before the manifest advances.
+        // A crash can therefore only leave them ahead of the manifest, which
+        // open tolerates: it caps each point's water mark at the tracker's own
+        // frontier and replay re-applies anything newer.
         // The field posting file is derived too, but keeping it at the same
         // generation/lsn as the checkpoint avoids a full rebuild at open. A
         // crash before the manifest advance leaves it ahead of the manifest
         // and open discards it.
-        let generation_id = self.generation.read().id();
         inner
             .payload_indexes
             .save(&data_dir, generation_id, inner.meta.last_applied_txn)?;
@@ -207,12 +224,16 @@ impl CollectionStore {
         Ok(())
     }
 
-    /// Flush one segment's dirty files and publish its durable LSN.
+    /// Flush one segment's dirty files and stage its id tracker.
     ///
     /// The frontier is captured in a short metadata read; fsyncs run outside
     /// the store lock so writers in other segments keep going. A failure
     /// leaves this segment's persisted mark untouched, so the WAL ack cannot
     /// advance past bytes this segment has not written.
+    ///
+    /// The tracker is **staged only**: this pass may run without the queue
+    /// gate, where a concurrent write could enter the tracker before its bytes
+    /// are fsynced. `publish_id_trackers` renames it in from inside the gate.
     fn flush_segment(&self, index: usize, segment_slots: u32, slot_capacity: u64) -> Result<()> {
         let (frontier, start, end) = {
             let inner = self.inner.read();
@@ -237,7 +258,7 @@ impl CollectionStore {
             .load()
             .save_segment(data.dir(), start, segment_slots, slot_capacity)?;
         let generation = self.generation.read().id();
-        segments::write_id_tracker(&data, start, end, &self.inner.read(), generation)?;
+        segments::write_id_tracker(&data, start, end, &self.inner.read(), generation, frontier)?;
         let mut inner = self.inner.write();
         inner.ensure_segment_len(index + 1);
         inner.segment_persisted[index] = inner.segment_persisted[index].max(frontier);

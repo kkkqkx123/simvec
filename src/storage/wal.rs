@@ -830,8 +830,13 @@ impl Wal {
     }
 
     /// Remove the whole log: every segment is unlinked and the next append
-    /// starts a fresh one. Used by the paths that rewrite every derived file
-    /// (compaction), where no logged transaction remains authoritative.
+    /// starts a fresh one.
+    ///
+    /// Test teardown only. Production paths — checkpoint and compaction —
+    /// truncate through a water mark ([`Wal::truncate_through`]) so a live
+    /// snapshot pin keeps the segments it still needs; neither of them wipes
+    /// the log, which is why `blobs.reset()` below never runs in production
+    /// and blob space is not reclaimed outside a full wipe.
     pub fn truncate(&self) -> Result<()> {
         let mut state = self.state.lock();
         // Every segment is being dropped because the data files already
@@ -944,6 +949,16 @@ impl Wal {
     pub fn appended_bytes(&self) -> u64 {
         self.appended_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes held by the append-only blob file (`wal/blobs.bin`).
+    ///
+    /// Kept separate from [`Wal::appended_bytes`] on purpose: truncating WAL
+    /// segments does not reclaim blobs, so folding this into the checkpoint
+    /// trigger would add fsyncs without freeing anything. Reported instead, so
+    /// unbounded growth is observable.
+    pub fn blob_bytes(&self) -> u64 {
+        self.blobs.len()
     }
 
     /// Segment names currently present, ascending. Observability only.

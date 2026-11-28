@@ -81,6 +81,11 @@ pub struct MaintenanceStatus {
     pub healthy: bool,
     /// Lowest LSN durable in every segment (the WAL ACK floor before pins).
     pub persisted_lsn: u64,
+    /// Bytes held by `wal/blobs.bin`. The blob file is append-only for the
+    /// lifetime of a log, so this grows with every upsert and is *not* bounded
+    /// by the WAL segment truncation; it is reported so growth is visible.
+    #[serde(default)]
+    pub wal_blob_bytes: u64,
     /// Last flush failure, cleared by the next successful checkpoint.
     pub error: Option<String>,
     /// Per-segment applied/persisted water marks. Empty for non-dense stores.

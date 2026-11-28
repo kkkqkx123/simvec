@@ -140,7 +140,7 @@ impl CollectionStore {
         let generation = Generation::create(dir)?;
         let data_dir = generation.path();
         meta.save(&data_dir)?;
-        super::segments::write(&data_dir, meta.segment_slots, 0)?;
+        super::segments::write(&data_dir, generation.id(), meta.segment_slots, 0)?;
 
         let dtype = config
             .default_space()
@@ -272,6 +272,7 @@ impl CollectionStore {
             &meta,
             storage,
             generation.lsn(),
+            generation.id(),
         )?);
 
         let mut reverse = IdMap::with_capacity(meta.slot_capacity as usize);
@@ -450,8 +451,12 @@ impl CollectionStore {
             // Prefer per-segment marks published by the last checkpoint;
             // fall back to the generation floor when the manifest carries
             // no current accounting.
-            let persisted =
-                super::segments::read_entries(&self.data_dir(), segment_slots, next_slot);
+            let persisted = super::segments::read_entries(
+                &self.data_dir(),
+                self.generation.read().id(),
+                segment_slots,
+                next_slot,
+            );
             if persisted.len() == count && count > 0 {
                 for (cell, entry) in inner.segment_persisted.iter_mut().zip(persisted.iter()) {
                     *cell = entry.persisted_lsn;

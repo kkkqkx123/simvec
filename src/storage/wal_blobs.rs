@@ -15,7 +15,7 @@
 //! references are simply never replayed again.
 
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::{Result, VectorSearchError};
 
@@ -64,7 +64,6 @@ fn aligned(len: usize) -> usize {
 /// positional I/O so replay never disturbs the append cursor.
 pub(crate) struct WalBlobs {
     file: File,
-    path: PathBuf,
 }
 
 impl WalBlobs {
@@ -77,7 +76,7 @@ impl WalBlobs {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        Ok(Self { file, path })
+        Ok(Self { file })
     }
 
     /// Append a batch of blobs with a single fsync, returning their refs.
@@ -172,17 +171,21 @@ impl WalBlobs {
         Ok(framed[HEADER_LEN..HEADER_LEN + length as usize].to_vec())
     }
 
-    /// Reset the blob file. Used only by full WAL truncation (compaction),
-    /// where every outstanding reference is discarded with the old log.
+    /// Reset the blob file. Used only by full WAL truncation (test teardown:
+    /// a full wipe discards every outstanding reference at once).
     pub(crate) fn reset(&self) -> Result<()> {
         self.file.set_len(0)?;
         self.file.sync_all()?;
         Ok(())
     }
 
-    /// Path of the blob file, for validation/debugging.
-    #[allow(dead_code)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    /// Current length of the blob file.
+    ///
+    /// Blobs are appended for the lifetime of a log and are only reclaimed by
+    /// a full wipe, so this figure grows with every upsert: it is reported
+    /// through [`crate::types::MaintenanceStatus`] so the growth is visible
+    /// instead of silent.
+    pub(crate) fn len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 }
