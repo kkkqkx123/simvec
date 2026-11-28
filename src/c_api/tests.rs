@@ -340,8 +340,10 @@ fn maintenance_status_reports_segment_shape() {
             collections::simvec_create_collection(handle, name.as_ptr(), config.as_ptr()),
             OK
         );
-        // Two segments with an explicit width, so the array has more than one
-        // entry and the starts are more than "0".
+        // Eight points at the default segment width fill a single partial
+        // segment. The assertion below checks the array's shape (numeric
+        // fields, increasing starts) rather than its length, so a future
+        // width change that splits it does not false-fail here.
         let ops: String = (1..=8u64)
             .map(|id| {
                 format!(

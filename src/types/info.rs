@@ -32,8 +32,10 @@ pub struct IndexInfo {
     /// reloaded). Combined with `built_at_live_count` this yields the stale
     /// position ratio consumed by `HnswConfig::stale_rebuild_ratio`.
     pub stale_overwrite_count: u64,
-    /// HNSW only: combined staleness ratio `max(count_ratio, delta_ratio)`.
-    /// When present, preferred over raw `stale_overwrite_count / built_at_live_count`.
+    /// HNSW only: count-based staleness ratio
+    /// `stale_overwrite_count / built_at_live_count`. When present, preferred
+    /// over recomputing the ratio from the raw fields. A distance-delta leg
+    /// was removed with N1a (overwrites now go to appended slots).
     pub stale_ratio: Option<f64>,
     /// IVF only: last measured cluster drift ratio.
     pub last_drift_ratio: Option<f64>,
@@ -88,9 +90,11 @@ pub struct MaintenanceStatus {
     pub wal_blob_bytes: u64,
     /// Milliseconds the last checkpoint held the queue gate.
     ///
-    /// Reported so a regression that moves an fsync back inside the gated
-    /// publication section is visible without profiling. Zero for a
-    /// collection that has never checkpointed.
+    /// The gated section is publication only (tracker renames plus small
+    /// metadata fsyncs), never a data-segment re-flush, so this spans the
+    /// in-flight drain and a handful of small fsyncs. It is reported so a
+    /// regression that moves a data flush back inside the gate is visible
+    /// without profiling. Zero for a collection that has never checkpointed.
     #[serde(default)]
     pub gate_wait_ms: u64,
     /// Last flush failure, cleared by the next successful checkpoint.

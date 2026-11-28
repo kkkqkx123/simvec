@@ -15,16 +15,17 @@ impl HnswIndex {
         nodes.len() >= slots && nodes[..slots].iter().all(|n| n.is_some())
     }
 
-    /// Staleness ratio combining overwrite count and distance delta.
-    /// Returns `max(count_ratio, delta_ratio)` where:
-    /// - `count_ratio = overwrites / built_at_live_count`
-    /// - `delta_ratio = distance_delta / built_at_live_count`
+    /// Staleness ratio: overwrite upserts relative to the live count at
+    /// build time (`overwrites / built_at_live_count`).
+    ///
+    /// This is a count-based ratio only. A distance-delta leg existed while
+    /// overwritten slots kept their graph position, but N1a routes live
+    /// overwrites to freshly appended slots (`register_slot` pushes them to
+    /// `pending`), so the already-present branch that fed the delta is no
+    /// longer reached on the live path and the delta was removed.
     pub(crate) fn stale_ratio(&self) -> f64 {
         let count = self.overwrites_since_build.load(Ordering::Relaxed);
-        let delta = self.overwrites_distance_delta.load(Ordering::Relaxed) as f64 / 1e6;
         let base = self.built_at_live_count.load(Ordering::Relaxed).max(1) as f64;
-        let count_ratio = count as f64 / base;
-        let delta_ratio = delta / base;
-        count_ratio.max(delta_ratio)
+        count as f64 / base
     }
 }

@@ -603,7 +603,7 @@ pub(super) fn test_iterative_scan_improves_recall() {
 }
 
 #[test]
-pub(super) fn test_stale_ratio_combines_count_and_delta() {
+pub(super) fn test_stale_ratio_tracks_overwrite_count() {
     let data = blobs(6);
     let vectors: Vec<Vec<f32>> = data.iter().map(|(v, _)| v.clone()).collect();
     let (_dir, mmaps) = mmap_from(&vectors);
@@ -615,15 +615,14 @@ pub(super) fn test_stale_ratio_combines_count_and_delta() {
     .unwrap();
     assert_eq!(index.stale_ratio(), 0.0);
 
-    // Overwrite with the same vector: count increases, delta stays ~0.
+    // Each already-present insert bumps the count, so the ratio is count /
+    // built_at_live_count. Magnitude no longer matters: the distance-delta
+    // leg was removed with N1a (overwrites go to appended slots).
     index.insert(0, &vectors[0], &mmaps, 64, 0);
-    assert!(index.stale_ratio() > 0.0, "count-based ratio should be > 0");
+    assert!((index.stale_ratio() - 1.0 / 6.0).abs() < 1e-9);
 
-    // Overwrite with a very different vector: delta should dominate.
-    let far = vec![1000.0; DIM];
-    index.insert(1, &far, &mmaps, 64, 0);
-    let ratio = index.stale_ratio();
-    assert!(ratio > 0.1, "delta should push ratio up, got {ratio}");
+    index.insert(1, &vectors[1], &mmaps, 64, 0);
+    assert!((index.stale_ratio() - 2.0 / 6.0).abs() < 1e-9);
 }
 
 #[test]

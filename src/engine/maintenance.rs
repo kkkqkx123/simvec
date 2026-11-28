@@ -430,8 +430,7 @@ pub(super) fn sweep_hnsw(
             }
         }
         // Staleness upkeep: overwrite upserts since the build, relative to
-        // the live count at build time. Prefer the combined `stale_ratio`
-        // (count + distance delta) when available.
+        // the live count at build time. `stale_ratio` is count-based.
         if let (Some(threshold), Some(info)) = (config.stale_rebuild_ratio, store.index_info()) {
             if info.built_at_live_count > 0 {
                 let ratio = info

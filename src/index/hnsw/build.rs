@@ -136,16 +136,6 @@ impl HnswIndex {
     ) {
         if self.node(slot).is_some() {
             self.overwrites_since_build.fetch_add(1, Ordering::Relaxed);
-            // Track the distance delta: how far the new vector is from the
-            // old one. A large delta means the node's graph position is more
-            // likely stale.
-            if let Some(old_v) =
-                Vectors::read_slot(vectors, (slot + slot_base) as u64, segment_slots, self.dim)
-            {
-                let delta = (self.distance(vector, old_v) * 1e6) as u64;
-                self.overwrites_distance_delta
-                    .fetch_add(delta, Ordering::Relaxed);
-            }
             return;
         }
 

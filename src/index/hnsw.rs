@@ -344,10 +344,6 @@ pub(crate) struct HnswIndex {
     /// `HnswConfig::stale_rebuild_ratio`. It resets when a persisted graph
     /// is reloaded, i.e. the baseline restarts with the process.
     overwrites_since_build: AtomicU64,
-    /// Sum of absolute distance changes from overwrite upserts since build,
-    /// in fixed-point (× 1e6). Combined with `overwrites_since_build` this
-    /// gives a more precise staleness signal than raw counts alone.
-    overwrites_distance_delta: AtomicU64,
     /// Iterative-scan expansion round cap, resolved from
     /// `HnswConfig::iterative_max_rounds` at construction (baked in like the
     /// other graph parameters; changes take effect on the next rebuild).
@@ -386,7 +382,6 @@ impl HnswIndex {
             promote_lock: Mutex::new(()),
             built_at_live_count: AtomicU64::new(0),
             overwrites_since_build: AtomicU64::new(0),
-            overwrites_distance_delta: AtomicU64::new(0),
             iterative_max_rounds: config
                 .iterative_max_rounds
                 .unwrap_or(DEFAULT_ITERATIVE_MAX_ROUNDS)

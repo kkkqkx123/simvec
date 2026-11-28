@@ -480,9 +480,13 @@ pub struct CollectionStore {
     /// cost; the WAL guarantees crash safety independently.
     txns_since_last_save: AtomicU64,
     /// Microseconds the last checkpoint held the queue gate. The gated
-    /// section is publication only (renames, `meta.bin`, the log marker and
-    /// the truncate), never an fsync storm, so this stays in the microsecond
-    /// range and a jump means a regression that moves work back inside it.
+    /// section is publication only: tracker renames plus small metadata
+    /// writes (`meta.bin`, indexes, generation lsn, the log marker). Those
+    /// metadata writes still fsync, so this is bounded by the in-flight
+    /// drain and a handful of small fsyncs — milliseconds, not microseconds
+    /// — and `truncate_through` runs after the gate reopens. A jump into the
+    /// seconds range means a data-segment flush was moved back inside the
+    /// gate, which is the regression this counter exists to catch.
     last_gate_wait_us: AtomicU64,
     /// In-flight index build progress: slots incorporated so far / total
     /// slots targeted. Reset at build start, finalized at completion;

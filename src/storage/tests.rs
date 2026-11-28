@@ -1626,10 +1626,11 @@ fn test_checkpoint_racing_writers_keeps_every_acknowledged_point() {
     let written: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
     let expected = 1 + written;
     assert_eq!(store.count(), expected);
-    // The gated section is publication only. The wait it reports is the time
-    // it took the in-flight transactions to drain (the gate must not publish a
-    // tracker while an apply is running), never an fsync storm — a second
-    // flush of a hot segment would show up here as seconds, not milliseconds.
+    // The gated section is publication only: tracker renames plus small
+    // metadata fsyncs (meta.bin, indexes, generation lsn, the log marker),
+    // never a re-flush of a data segment. The reported wait is therefore the
+    // in-flight drain plus those small fsyncs — milliseconds, not seconds —
+    // and a jump into seconds would mean a data flush was moved back inside.
     let status = store.maintenance_status();
     assert!(
         status.gate_wait_ms < 5_000,
