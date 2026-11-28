@@ -32,6 +32,7 @@ use crate::error::{Result, VectorSearchError};
 
 use super::{StoreConfig, ValuePointer, BITMASK_MAGIC};
 
+/// Layout version written into every header.
 const BITMASK_VERSION: u32 = 1;
 /// Bytes before the bitmap: magic + version + geometry + checksum.
 const BITMASK_HEADER_LEN: usize = 28;
@@ -530,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_one_file_is_rejected() {
+    fn an_unsupported_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config();
         {
@@ -540,12 +541,12 @@ mod tests {
         }
         let path = dir.path().join("bitmask.bin");
         let mut bytes = std::fs::read(&path).unwrap();
-        // Version 1 had no checksum field; it must not be read as version 2.
-        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // A version this build does not write must be refused.
+        bytes[4..8].copy_from_slice(&(BITMASK_VERSION + 1).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
 
         let err = match MmapBitmask::open(dir.path(), &config) {
-            Ok(_) => panic!("must reject a version-1 file"),
+            Ok(_) => panic!("must reject an unsupported version"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("version"), "{err}");

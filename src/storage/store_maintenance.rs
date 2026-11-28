@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -10,6 +11,25 @@ use crate::error::{Result, VectorSearchError};
 use crate::types::{IndexConfig, QuantizationConfig};
 
 use super::*;
+
+/// Deletes to accumulate before `after_mutation` runs a whole-store HNSW
+/// repair. The sweep takes `build_mutex` and counts tombstones across every
+/// segment; each delete already heals the graph that held the deleted slot.
+const HNSW_REPAIR_TOMBSTONE_BATCH: u64 = 256;
+
+/// Segments whose applied frontier is ahead of their durable one.
+///
+/// A segment with no entry in either table is treated as dirty: the marks are
+/// grown lazily, so a missing persisted mark means "never flushed", not "clean".
+fn raced_segments(applied: &[u64], persisted: &[u64], count: usize, floor: u64) -> Vec<usize> {
+    (0..count)
+        .filter(|index| {
+            let applied = applied.get(*index).copied().unwrap_or(floor);
+            let persisted = persisted.get(*index).copied().unwrap_or(0);
+            applied > persisted
+        })
+        .collect()
+}
 
 impl CollectionStore {
     /// Whether the tombstone ratio has crossed the compaction threshold.
@@ -33,31 +53,27 @@ impl CollectionStore {
     /// Checkpoint: make every derived file durable, persist the payload
     /// store and truncate the WAL.
     ///
-    /// Two phases, and the split is the point:
+    /// The bulk flush runs without the store lock and without the queue gate:
+    /// it fsyncs the payload pages, the payload tracker/bitmask, `keys.bin`
+    /// and `vectors.bin`, then persists the tombstone table, while appendable
+    /// segments keep receiving writes. Whatever a writer changes meanwhile
+    /// stays in the WAL. Readers keep taking the read lock throughout, so a
+    /// multi-second fsync storm does not freeze search or scroll.
     ///
-    /// 1. **Flush without the store lock.** Inside the queue gate (so no
-    ///    transaction can be applied) but *not* holding `inner`, this fsyncs
-    ///    the payload pages, the payload tracker/bitmask, `keys.bin` and
-    ///    `vectors.bin`, then persists the tombstone table. The gate is what
-    ///    makes the unlocked flush safe: with it closed nothing mutates the
-    ///    data files, so the bytes being flushed are stable. Readers keep
-    ///    taking the read lock the whole time, so a multi-second fsync storm
-    ///    no longer freezes search or scroll.
-    /// 2. **Durable water marks under the write lock** (microseconds, not
-    ///    seconds): `meta.bin` is written from the *live* state rather than
-    ///    from a phase-1 snapshot, so a concurrent `set_quantization_config`
-    ///    or `set_hnsw_config` cannot be overwritten by a stale copy, then a
-    ///    WAL checkpoint marker (its own append fsyncs everything preceding
-    ///    it) and finally the truncate.
+    /// The queue gate is closed only for the part that must not race a
+    /// transaction: re-syncing the segments a writer touched, publishing the
+    /// id trackers, `meta.bin` (written from the *live* state, so a concurrent
+    /// `set_quantization_config` or `set_hnsw_config` is not overwritten by a
+    /// stale copy), the WAL checkpoint marker (its own append fsyncs
+    /// everything preceding it) and the truncate.
     ///
-    /// Ordering still matters: data files, then tombstones, then `meta.bin`,
-    /// then the marker, then the truncate. A crash at any point leaves the
-    /// log intact, so recovery replays forward from a state that is already
-    /// consistent.
+    /// Ordering: data files, then tombstones, then `meta.bin`, then the
+    /// marker, then the truncate. A crash at any point leaves the log intact,
+    /// so recovery replays forward from a state that is already consistent.
     ///
     /// The `compact_mutex` is held for the whole call: it is the collection's
-    /// maintenance-exclusive lock, so compaction (which rewrites the very
-    /// files phase 1 reads) cannot swap them under the flush.
+    /// maintenance-exclusive lock, so compaction (which rewrites the files
+    /// this pass flushes) cannot swap them under the flush.
     ///
     /// A published ANN index is not rebuilt here: it is a derived structure
     /// refreshed by the maintenance worker on its own schedule, exactly like
@@ -72,33 +88,29 @@ impl CollectionStore {
         // Compaction and index builds rewrite or replace the files flushed
         // below, so they must not run concurrently with this pass.
         let _maintenance = self.compact_mutex.lock();
-        // Phase 1 runs without the queue gate so appendable segments keep
-        // receiving writes while the bulk of the files is flushed. Only the
-        // tail delta is flushed under the gate in phase 2, which bounds the
-        // stop-the-world window to a re-sync plus the water mark publish.
+        // The bulk flush runs before the gate: appendable segments keep
+        // receiving writes while the expensive fsyncs happen, and whatever
+        // lands meanwhile stays in the WAL until the gated re-sync below.
         // The live count is reported from the publish point, after the gate
         // drained the queue, so a checkpoint racing queued writes still
         // reports every transaction it waited for.
-        let first_capacity = self.inner.read().meta.slot_capacity;
+        let bulk_capacity = self.inner.read().meta.slot_capacity;
 
-        // Phase 1: the expensive part, without the store lock and without the
-        // gate. Writes that land concurrently stay in the WAL; phase 2
-        // re-flushes the delta under the gate before publishing.
         on_flush();
-        self.flush_data_files(first_capacity)?;
+        self.flush_data_files(bulk_capacity)?;
 
-        // Phase 2: gate the queue, re-flush the raced tail, then publish.
-        // The log is truncated below, so no transaction may be queued — or
-        // halfway through the worker — while the marks are published.
+        // Close the queue gate, re-sync the segments a writer touched since
+        // the flush, then publish. The log is truncated below, so no
+        // transaction may be queued — or halfway through the worker — while
+        // the marks are published.
         let _gate = self.queue.quiesce();
-        let second_capacity = self.inner.read().meta.slot_capacity;
-        self.flush_data_files(second_capacity)?;
+        let gated_capacity = self.inner.read().meta.slot_capacity;
+        self.flush_raced_segments(gated_capacity)?;
         let mut inner = self.inner.write();
         let data_dir = self.data_dir();
-        // Publish the id trackers now that the gate is closed and every dirty
-        // byte has been re-flushed: a visible tracker then always names bytes
-        // that are already durable. Phase 1 only staged them, precisely
-        // because writers were still allowed to append there.
+        // A visible tracker must always name bytes that are already durable,
+        // so the staged files are published only now that the gate is closed
+        // and every dirty byte has been re-synced.
         let generation_id = self.generation.read().id();
         segments::publish_id_trackers(
             &data_dir,
@@ -198,11 +210,9 @@ impl CollectionStore {
 
     /// Flush every data file touched since the last checkpoint.
     ///
-    /// Takes no store lock, so readers are unaffected. The bulk pass runs
-    /// without the queue gate while appendable segments keep receiving
-    /// writes; the gate-time re-flush in phase 2 covers the raced tail
-    /// before any water mark is published, so the WAL stays authoritative
-    /// for whatever the first pass missed.
+    /// Takes no store lock, so readers are unaffected and appendable segments
+    /// keep receiving writes. Whatever this pass misses stays in the WAL until
+    /// the gated re-sync that precedes the water mark publish.
     fn flush_data_files(&self, slot_capacity: u64) -> Result<()> {
         let segment_slots = self.inner.read().meta.segment_slots;
         if segment_slots == 0 {
@@ -224,6 +234,38 @@ impl CollectionStore {
         Ok(())
     }
 
+    /// Flush the segments whose applied frontier is ahead of their durable one.
+    ///
+    /// Runs with the queue gate closed. A segment that is already durable has
+    /// nothing to sync, and syncing it anyway would lengthen the window for
+    /// every segment of the collection.
+    fn flush_raced_segments(&self, slot_capacity: u64) -> Result<()> {
+        let inner = self.inner.read();
+        let segment_slots = inner.meta.segment_slots;
+        if segment_slots == 0 {
+            return Ok(());
+        }
+        let count = slot_capacity.div_ceil(segment_slots as u64) as usize;
+        let raced = raced_segments(
+            &inner.segment_applied,
+            &inner.segment_persisted,
+            count,
+            inner.meta.last_applied_txn,
+        );
+        drop(inner);
+        if raced.is_empty() {
+            return Ok(());
+        }
+        let result: Result<()> = raced
+            .into_par_iter()
+            .try_for_each(|index| self.flush_segment(index, segment_slots, slot_capacity));
+        if let Err(err) = result {
+            self.record_maintenance_error(&err.to_string());
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Flush one segment's dirty files and stage its id tracker.
     ///
     /// The frontier is captured in a short metadata read; fsyncs run outside
@@ -231,10 +273,12 @@ impl CollectionStore {
     /// leaves this segment's persisted mark untouched, so the WAL ack cannot
     /// advance past bytes this segment has not written.
     ///
-    /// The tracker is **staged only**: this pass may run without the queue
-    /// gate, where a concurrent write could enter the tracker before its bytes
-    /// are fsynced. `publish_id_trackers` renames it in from inside the gate.
+    /// The tracker is **staged only**: while the queue gate is open a
+    /// concurrent write could enter it before its bytes are fsynced.
+    /// `publish_id_trackers` renames it in under the gate.
     fn flush_segment(&self, index: usize, segment_slots: u32, slot_capacity: u64) -> Result<()> {
+        #[cfg(test)]
+        self.segment_flushes.fetch_add(1, AtomicOrdering::Relaxed);
         let (frontier, start, end) = {
             let inner = self.inner.read();
             (
@@ -282,6 +326,24 @@ impl CollectionStore {
             }
             None => false,
         }
+    }
+
+    /// Test-only: whether the store read lock is currently free.
+    #[cfg(test)]
+    pub(crate) fn read_lock_free(&self) -> bool {
+        match self.inner.try_read() {
+            Some(guard) => {
+                drop(guard);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test-only: how many segment flush passes have run, counted per segment.
+    #[cfg(test)]
+    pub(crate) fn segment_flushes(&self) -> u64 {
+        self.segment_flushes.load(AtomicOrdering::Relaxed)
     }
 
     /// Estimated resident index footprint in bytes.
@@ -341,6 +403,9 @@ impl CollectionStore {
         let data = self.data_arc();
         let segments = data.hnsw_segments.load();
         if segments.is_empty() {
+            // No published graph: nothing can be stale, so the backlog that
+            // triggers the next sweep stays empty as well.
+            self.hnsw_tombstones_pending.store(0, AtomicOrdering::Relaxed);
             return Ok(0);
         }
         let (dim, metric, segment_slots, name, config) = {
@@ -401,7 +466,18 @@ impl CollectionStore {
             graphs.push(segment.clone());
         }
         data.hnsw_segments.store(Arc::new(graphs));
+        // The sweep consumed every tombstone that existed when it started.
+        // Deletes applied while it ran re-increment the counter, so the next
+        // batch is still detected.
+        self.hnsw_tombstones_pending.store(0, AtomicOrdering::Relaxed);
         Ok(repaired)
+    }
+
+    /// Whether enough deletes accumulated to justify a whole-store graph
+    /// repair. Cheap: one relaxed load, no locks.
+    pub(crate) fn hnsw_repair_due(&self) -> bool {
+        self.hnsw_tombstones_pending.load(AtomicOrdering::Relaxed)
+            >= HNSW_REPAIR_TOMBSTONE_BATCH
     }
 
     /// Grow storage to accommodate `needed_slots` slots (0-indexed high water).
@@ -507,13 +583,6 @@ impl CollectionStore {
             return Ok(false);
         }
         let vsnap = data.vectors.snapshot();
-        let quant = data
-            .quant
-            .read()
-            .as_ref()
-            .expect("quant present")
-            .meta_snapshot();
-        let _ = quant;
         // Delegate training to QuantStore. No external cancellation source is
         // wired yet; rebuild checks the flag cooperatively.
         let stopped = std::sync::atomic::AtomicBool::new(false);

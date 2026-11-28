@@ -8,10 +8,10 @@
 //! one `flush_range` per group-commit batch, and replay walks read-only
 //! mappings sequentially instead of buffering decoded transactions.
 //!
-//! On-disk segment format (version 2):
+//! On-disk segment format (version 1):
 //!
 //! ```text
-//! header (32 B): [magic 4 = "SVWL"][version u32 = 2][seed u32]
+//! header (32 B): [magic 4 = "SVWC"][version u32 = 1][seed u32]
 //!                [first_lsn u64][reserved u64][reserved u64]
 //! record:       [u32 len][u32 crc][postcard bytes][0..7 zero padding]
 //! ```
@@ -94,8 +94,8 @@ const ACK_HEADER_LEN: usize = 28;
 pub const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Segment format version written into every header.
-const SEG_VERSION: u32 = 2;
-/// Segment magic: `SVWL`.
+const SEG_VERSION: u32 = 1;
+/// Segment magic: `SVWC`.
 const SEG_MAGIC: [u8; 4] = *b"SVWC";
 /// Segment header length in bytes.
 const SEG_HEADER_LEN: u64 = 32;
@@ -387,6 +387,20 @@ impl Wal {
                     .read(true)
                     .write(true)
                     .open(segment_path(dir, *name))?;
+                // `mmap` refuses a zero-length file and a short file would
+                // remap on every append. Both are expected: a crash between
+                // creating a segment and writing its header, and a snapshot
+                // that copied only the valid prefix. Replay treats either as
+                // an empty tail, so extend back to the preallocated capacity;
+                // `append_batch` rewrites a missing header.
+                let len = file.metadata()?.len();
+                if len < capacity {
+                    file.set_len(capacity)?;
+                    if len < SEG_HEADER_LEN {
+                        tail_valid = 0;
+                        tail_crc = None;
+                    }
+                }
                 // The mapping must cover the whole file (including slack) so
                 // appends never remap on the fast path.
                 let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -404,7 +418,7 @@ impl Wal {
             generation: AtomicU64::new(0),
             state: parking_lot::Mutex::new(WalState {
                 // An existing tail segment may hold transactions this process
-                // has not read; `replay`/`read_all` refines the bound.
+                // has not read; `replay_after` refines the bound.
                 active_last_lsn: if segments.is_empty() { 0 } else { u64::MAX },
                 active_valid_len: if segments.is_empty() {
                     None
@@ -719,7 +733,12 @@ impl Wal {
                 active.file.set_len(closed_valid)?;
                 active.file.sync_all()?;
             }
-            state.sealed_valid.push(closed_valid);
+            // `sealed_valid` stays parallel to `segments[..len-1]`. A failed
+            // truncate can leave a listed segment without an open handle, in
+            // which case the entry is already there and must not be doubled.
+            if state.sealed_valid.len() < state.segments.len() {
+                state.sealed_valid.push(closed_valid);
+            }
         }
         let name = next_segment_name(&state.segments, first_txn);
         let capacity = normalize_capacity(self.segment_bytes.max(SEG_HEADER_LEN + batch_total));
@@ -898,38 +917,64 @@ impl Wal {
         self.ack_generation
             .store(generation, AtomicOrdering::Release);
         self.acked_lsn.store(new_ack, AtomicOrdering::Release);
-        let segments = std::mem::take(&mut state.segments);
-        let sealed = std::mem::take(&mut state.sealed_valid);
+        let segments = state.segments.clone();
+        let sealed = state.sealed_valid.clone();
+        let tail_open = state.active.is_some();
         let mut kept: Vec<u64> = Vec::with_capacity(segments.len());
         let mut kept_valid: Vec<u64> = Vec::with_capacity(sealed.len());
         let mut removed_bytes = 0u64;
+        let mut removed_tail = false;
+        let mut removal_error: Option<VectorSearchError> = None;
         for (index, name) in segments.iter().enumerate() {
-            // Valid bytes of segment `index`: sealed table for heads, the
-            // live tail counter for the last segment.
-            let valid = match sealed.get(index) {
-                Some(valid) => *valid,
-                None => state.active_valid_len.unwrap_or(0),
+            // Valid bytes of segment `index`: the sealed table covers closed
+            // segments, the live counter covers the open tail (which the table
+            // never describes).
+            let valid = if index + 1 == segments.len() {
+                state
+                    .active_valid_len
+                    .or_else(|| sealed.get(index).copied())
+                    .unwrap_or(0)
+            } else {
+                sealed.get(index).copied().unwrap_or(0)
             };
             let covered = match segments.get(index + 1) {
                 Some(next) => next.saturating_sub(1) <= watermark,
                 None => state.active.is_none() || state.active_last_lsn <= watermark,
             };
             if covered {
-                removed_bytes += valid;
-                remove_segment(&self.dir, *name)?;
-                if index + 1 == segments.len() {
-                    // The tail segment is gone: retire the handle so the next
-                    // append creates a new one.
-                    state.active = None;
-                    state.active_last_lsn = 0;
-                    state.active_valid_len = None;
+                match remove_segment(&self.dir, *name) {
+                    Ok(()) => {
+                        removed_bytes += valid;
+                        removed_tail |= index + 1 == segments.len();
+                    }
+                    // The registry must stay a subset of what is on disk, so a
+                    // segment that would not unlink stays listed and keeps
+                    // serving: dropping it here would leave `active` pointing
+                    // at an unlisted segment (the next append panics on
+                    // `expect("active segment is listed")`) and could seal a
+                    // slack-carrying file into a middle segment.
+                    Err(error) => {
+                        kept.push(*name);
+                        kept_valid.push(valid);
+                        removal_error.get_or_insert(error);
+                    }
                 }
             } else {
                 kept.push(*name);
-                if index + 1 < segments.len() {
-                    kept_valid.push(valid);
-                }
+                kept_valid.push(valid);
             }
+        }
+        if removed_tail {
+            // The tail segment is gone: retire the handle so the next append
+            // creates a new one.
+            state.active = None;
+            state.active_last_lsn = 0;
+            state.active_valid_len = None;
+        }
+        // `sealed_valid` is parallel to `segments[..len-1]`: the open tail
+        // keeps its length in `active_valid_len` instead.
+        if tail_open && !removed_tail {
+            kept_valid.pop();
         }
         state.segments = kept;
         state.sealed_valid = kept_valid;
@@ -941,7 +986,10 @@ impl Wal {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        Ok(())
+        match removal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Valid data bytes currently held in the log. Drives the size-based
@@ -964,6 +1012,15 @@ impl Wal {
     /// Segment names currently present, ascending. Observability only.
     pub fn segment_names(&self) -> Vec<u64> {
         self.state.lock().segments.clone()
+    }
+
+    /// Name and valid byte length of the segment being appended to, if any.
+    ///
+    /// Everything past the valid length is preallocated slack.
+    pub(crate) fn tail_valid_len(&self) -> Option<(u64, u64)> {
+        let state = self.state.lock();
+        let name = *state.segments.last()?;
+        Some((name, state.active_valid_len.unwrap_or(0)))
     }
 
     /// Path of the segment the log is currently appending to, if any. Used by
@@ -1893,6 +1950,80 @@ mod tests {
         .unwrap();
         assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(*seen.last().unwrap(), *ids.last().unwrap());
+    }
+
+    #[test]
+    fn test_truncate_through_keeps_a_segment_that_will_not_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_or_create(&path, 128).unwrap();
+        let ids = append_until_segments(&wal, 3);
+        assert_eq!(wal.replay(|_| Ok(())).unwrap(), *ids.last().unwrap());
+        let names = wal.segment_names();
+        // Replace the covered head segment with a directory of the same name:
+        // `remove_file` then fails with EISDIR, which is the error path this
+        // test is about (a permission failure behaves the same way).
+        let head = segment_path(&path, names[0]);
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir(&head).unwrap();
+
+        let err = wal.truncate_through(u64::MAX).expect_err("must report it");
+        assert!(!err.to_string().is_empty(), "{err}");
+
+        // The registry must still name every segment that is still there. If
+        // it dropped the failed one, `active` would point at an unlisted
+        // segment and the next append would panic on
+        // `expect("active segment is listed")`.
+        let kept = wal.segment_names();
+        assert!(
+            kept.contains(&names[0]),
+            "a segment that would not unlink must stay listed: {kept:?}"
+        );
+        for name in &kept {
+            assert!(
+                segment_path(&path, *name).exists(),
+                "{name} is listed but missing on disk"
+            );
+        }
+        // The log stays usable after the failed unlink.
+        wal.append(&txn(99, 990)).unwrap();
+        assert!(wal.segment_names().len() > kept.len());
+    }
+
+    #[test]
+    fn test_open_tolerates_an_empty_tail_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        // Large enough that the follow-up append does not roll over: a
+        // rollover would seal the damaged segment, and a middle segment has
+        // stricter replay rules than the tail.
+        let capacity = 1 << 20;
+        let segment = {
+            let wal = Wal::open_or_create(&path, capacity).unwrap();
+            wal.append(&txn(1, 10)).unwrap();
+            segment_path(&path, wal.segment_names()[0])
+        };
+        // A crash between creating the segment and writing its header leaves
+        // an empty file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let wal = Wal::open_or_create(&path, capacity).expect("an empty tail is not corruption");
+        assert_eq!(wal.replay(|_| Ok(())).unwrap(), 0);
+        assert_eq!(wal.appended_bytes(), 0);
+        // The mapping exists and the header is rewritten on the next append.
+        wal.append(&txn(2, 20)).unwrap();
+        let mut seen = Vec::new();
+        wal.replay(|t| {
+            seen.push(t.txn_id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![2]);
     }
 
     #[test]

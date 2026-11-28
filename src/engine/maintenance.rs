@@ -180,15 +180,18 @@ impl LocalVectorEngine {
     /// tombstoned slots.
     pub(super) fn after_mutation(&self, collection: &str, store: &Arc<CollectionStore>) {
         self.maybe_schedule_drain(collection, store);
-        // Incrementally repair HNSW graph references to tombstoned slots.
-        // This avoids a full rebuild when tombstones accumulate; the repair
-        // is local and idempotent.
-        if let Err(e) = store.repair_hnsw() {
-            tracing::warn!(
-                collection = %collection,
-                error = %e,
-                "HNSW graph repair failed; will rebuild on next compaction"
-            );
+        // Repair HNSW references to tombstoned slots in batches: the sweep
+        // takes `build_mutex` and walks every segment, while
+        // `apply_delete_slot_locked` already heals the graph that held the
+        // deleted slot.
+        if store.hnsw_repair_due() {
+            if let Err(e) = store.repair_hnsw() {
+                tracing::warn!(
+                    collection = %collection,
+                    error = %e,
+                    "HNSW graph repair failed; will rebuild on next compaction"
+                );
+            }
         }
         self.maybe_schedule_compaction(collection, store);
         self.maybe_schedule_checkpoint(collection, store);

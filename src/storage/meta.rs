@@ -23,12 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, VectorSearchError};
 use crate::types::{DistanceMetric, IndexConfig, QuantizationConfig, StorageHints};
 
-/// Current on-disk format version.
+/// On-disk format version written into `meta.bin`.
 ///
-/// Development stage: locked at 1.  `Meta::validate` rejects any file whose
-/// version differs, so a stale directory is rebuilt instead of misread.
-/// Version evolution starts with the first production release, following the
-/// same policy as `INDEX_VERSION` / `HNSW_VERSION` in `index::persist`.
+/// `Meta::validate` rejects any file whose version differs.
 pub(crate) const FORMAT_VERSION: u32 = 1;
 
 /// Envelope format for `meta.bin` itself (independent of `FORMAT_VERSION`,

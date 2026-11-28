@@ -130,6 +130,10 @@ const DEFINITIONS = {
     arguments: ["pointer", "string", "pointer"],
     return: "int32",
   },
+  simvec_maintenance_status: {
+    arguments: ["pointer", "string", "pointer"],
+    return: "int32",
+  },
   simvec_run_maintenance_sweep: { arguments: ["pointer"], return: "int32" },
   simvec_promote_temp_collection: {
     arguments: ["pointer", "string", "string", "string"],

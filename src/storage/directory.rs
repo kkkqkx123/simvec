@@ -35,7 +35,8 @@ use memmap2::{Mmap, MmapOptions};
 use crate::error::{Result, VectorSearchError};
 
 const HEADER_LEN: usize = 32;
-const FILE_VERSION: u32 = 2;
+/// Directory-file layout version written into every header.
+const FILE_VERSION: u32 = 1;
 
 /// Byte offsets of the header fields.
 const OFF_VERSION: u64 = 4;

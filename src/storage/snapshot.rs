@@ -229,12 +229,28 @@ fn wal_segment_version(rel: &str) -> Option<u64> {
 
 /// Stream a file's length and CRC without holding the whole file in memory.
 pub(crate) fn file_checksum(path: &Path) -> Result<(u64, u32)> {
+    file_checksum_prefix(path, None)
+}
+
+/// Checksum the first `limit` bytes of `path` (every byte when `None`).
+///
+/// WAL segments are preallocated, so a snapshot stores only their valid
+/// prefix; the manifest entry has to describe exactly those bytes.
+pub(crate) fn file_checksum_prefix(path: &Path, limit: Option<u64>) -> Result<(u64, u32)> {
     let mut file = File::open(path)?;
     let mut hasher = crate::checksum::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut len = 0u64;
     loop {
-        let read = file.read(&mut buffer)?;
+        let remaining = match limit {
+            Some(limit) => limit.saturating_sub(len),
+            None => u64::MAX,
+        };
+        if remaining == 0 {
+            break;
+        }
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..want])?;
         if read == 0 {
             break;
         }

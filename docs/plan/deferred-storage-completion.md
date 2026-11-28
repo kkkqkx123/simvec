@@ -9,7 +9,7 @@
 | ID | 优先级 | 缺口 | 证据 | 本轮状态 |
 | --- | --- | --- | --- | --- |
 | T1 | P1 | `bitmask.bin` 无校验，位翻转只能靠上层重建兜底 | `payload_store/bitmask.rs` 写 `magic/version/几何/位图`，无 CRC | **已落地** §2.1 |
-| T2 | P1 | id tracker 无 LSN 绑定，phase-1 无门发布存在丢数据窗口 | `store_maintenance.rs` phase 1 无队列门即 `write_id_tracker`；`IdTracker` 只有 `{generation, entries}` | **已落地** §2.2 |
+| T2 | P1 | id tracker 无 LSN 绑定，无门刷盘阶段发布存在丢数据窗口 | `store_maintenance.rs` 不关队列门批量刷盘时即 `write_id_tracker`；`IdTracker` 只有 `{generation, entries}` | **已落地** §2.2 |
 | T3 | P2 | `select_for_compaction` 在单段集合会选中 appendable 尾段，与注释和 `AGENTS.md` 矛盾 | `segments.rs` 过滤条件 `e.start != appendable \|\| entries.len() == 1` | **已落地（改文档、改注释，不改行为）** §2.3 |
 | T4 | P2 | `segments.json` 条目缺 capacity/applied lsn，manifest 缺 generation，`persisted_lsn` 由全局 watermark 统一盖章 | `SegmentEntry` 五个字段；`derive_entries` 单值入参 | **已落地** §2.4 |
 | T5 | P2 | `wal/blobs.bin` 体积不可观测（只有 WAL 记录字节进 checkpoint 触发） | `wal.rs::appended_bytes` 不统计 blob；`MaintenanceStatus` 无该字段 | **已落地** §2.5 |
@@ -23,11 +23,11 @@
 
 ### 2.1 T1 — `bitmask.bin` 统一到 CRC32C
 
-格式（版本 2，一次性生效，不保留 v1 读取路径）：
+格式（版本 1；读到其他版本一律 `CorruptData`）：
 
 ```text
 [0..4)   magic        "VBMP"
-[4..8)   version      u32 = 2
+[4..8)   version      u32 = 1
 [8..16)  total_blocks u64
 [16..20) block_size   u32
 [20..24) page_blocks  u32
@@ -41,18 +41,18 @@
 
 ### 2.2 T2 — id tracker 绑定 LSN，改为 phase-2 发布
 
-问题窗口：checkpoint phase 1 在不关队列门的前提下 flush（这是缩短停写窗口的设计），`flush_segment` 在此阶段无条件重写 `id_tracker.bin`，其内容取自**当前**内存态。掉电后重开时，tracker 里 `point_lsn` 已推进到新值，但该点的 vectors/payload 字节未 fsync，`stale_for_id` 会跳过重放记录，点以旧/空字节复活。
+问题窗口：checkpoint 的批量刷盘不关队列门（这是缩短停写窗口的设计），`flush_segment` 在此阶段无条件重写 `id_tracker.bin`，其内容取自**当前**内存态。掉电后重开时，tracker 里 `point_lsn` 已推进到新值，但该点的 vectors/payload 字节未 fsync，`stale_for_id` 会跳过重放记录，点以旧/空字节复活。
 
 方案：
 
 1. `IdTracker` 增加 `lsn`：该 tracker 内容对应的**段级 applied 前沿**。
 2. `segments::write_id_tracker` 只写 `segments/<start>/id_tracker.staged`（同信封、同 fsync），不覆盖已发布文件。
-3. `segments::publish_id_trackers(dir, segment_slots, count)` 在 checkpoint **phase 2**（队列门内、re-flush 之后、`meta.bin` 之前）统一 rename `.staged → id_tracker.bin` 并 fsync 段目录。
+3. `segments::publish_id_trackers(dir, segment_slots, count)` 在队列门内、re-flush 之后、`meta.bin` 之前统一 rename `.staged → id_tracker.bin` 并 fsync 段目录。
 4. `read_id_trackers` 读已发布文件，并用 `tracker.lsn` 给 `point_lsn` 封顶（`min(point_lsn, lsn)`），`delete_lsn` 保持原值。
 
 不变量：**tracker 一旦可见，该段所有字节已经 durable**。崩溃点：
 
-- phase 1 后崩：只有 `.staged`，open 忽略；已发布 tracker 仍是上一轮的一致状态，replay 从旧 floor 补齐。
+- 批量刷盘后崩：只有 `.staged`，open 忽略；已发布 tracker 仍是上一轮的一致状态，replay 从旧 floor 补齐。
 - publish 后、`meta.bin`/generation lsn 前崩：tracker 已一致且数据已 durable，replay 从旧 floor 重放，`stale_for_id` 跳过重复应用，结果幂等。
 - 部分段 publish 完成：每段的可见状态都自洽，`persisted` 由 `min_persisted` 决定，ACK 不会越过未刷新的段。
 
@@ -97,7 +97,7 @@
   一个字节 → `read_strict` 返回 `CorruptData`），删掉旧测试不损失任何覆盖。
   依赖图与两个 `Cargo.lock` 中的 `crc32fast` 条目一并消失。
 - 删除 `WalBlobs::path`（含 `#[allow(dead_code)]`）。
-- `TombstoneBits::load`（整代加载器）收为 `#[cfg(test)]`，生产只有 `load_segments`。
+- `TombstoneBits::load` / `save` 保留：`load_segments` 与 `save_segment` 内部就调用它们，不是整代遗留加载器，不能收为 `#[cfg(test)]`（登记于 `storage-remediation-tasks.md` C3）。
 - `Wal::truncate` 注释改为"仅测试/整库重建辅助，生产 checkpoint 与压实都走 `truncate_through`"。
 
 ### 2.7 T7 / T8 — 文档事实修正
@@ -156,7 +156,7 @@ T9 必须一次做完"段级压实 + free list"，只做一半会出现"slot 稳
 
 1. **G1 绑定端到端**：python/js/go/java/r 的 smoke 各加 `maintenance_status` + 四个 snapshot API 的调用链；`src/c_api/tests.rs` 补 `maintenance_status_c_abi` 断言 `segments` 数组。
 2. **G2 快照拒绝**：`test_snapshot_verification_rejects_missing_file`、`test_snapshot_rejects_existing_target`、`test_snapshot_verification_rejects_wrong_version`。
-3. **G3 WAL/blob 崩溃注入**：blob fsync 前/后、WAL 后 apply 前、ACK 后 truncate 中四窗口；连同本轮 T2 新增的"phase-1 后崩 / publish 后崩"两窗口。
+3. **G3 WAL/blob 崩溃注入**：blob fsync 前/后、WAL 后 apply 前、ACK 后 truncate 中四窗口；连同本轮 T2 新增的"批量刷盘后崩 / publish 后崩"两窗口。
 4. **G4 性能基线**：`wal_bytes_vs_checkpoint` quick 档；注意 `benches/quick.rs` 是 `autobenches = false` 的共享助手模块，新档必须落到具体 bench 文件（原文档的落点写错了）。
 5. **G5 Turbo 配置拒绝**：`VectorDataType::Turbo` 在 create 时报 `InvalidConfig`。
 

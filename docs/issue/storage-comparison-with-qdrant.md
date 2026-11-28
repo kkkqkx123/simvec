@@ -4,6 +4,8 @@
 
 参照版本：simvec `0ce056a`，qdrant `7c59b2d`。范围只包括本地引擎的原生存储；wasm 内存引擎不在讨论范围内。
 
+> **基线提示（2026-11）**：本文记录的是存储改造**之前**的基线与当时的判断，部分描述（WAL 用 `write_all` + `sync_all`、dense 数据整代单文件、CRC32、payload 无压缩等）已经过期。当前实现以 `AGENTS.md` 的存储章节为唯一事实源，本轮整改清单见 `docs/plan/storage-remediation-tasks.md`。历史结论保留原样，不再按代码回填。
+
 ## 结论
 
 simvec 当前采用“单集合单发布代 + 集合级 WAL/LSN”的模型，换取了单一提交点和较短的实现路径；qdrant 采用“shard 内多 segment + 每 segment 独立版本、id tracker、向量存储、payload 存储和索引”的模型，换取增量压实、并发 flush、按 segment 回收 WAL 和更强的扩展能力。

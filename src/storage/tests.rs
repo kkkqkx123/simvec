@@ -256,6 +256,53 @@ fn test_snapshot_pins_generation_and_wal() {
 }
 
 #[test]
+fn test_snapshot_copies_only_the_wal_valid_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_prefix");
+    let snap_dir = dir.path().join("snapshot_prefix");
+    let restored_dir = dir.path().join("restored_prefix");
+    let store = CollectionStore::create(&store_dir, "col_prefix", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    upsert_logged(&store, &point(2, 4));
+
+    let (tail, valid) = store.wal.tail_valid_len().expect("a segment exists");
+    let rel = format!("wal/{tail:020}.bin");
+    let live_len = std::fs::metadata(store_dir.join(&rel)).unwrap().len();
+    assert!(
+        live_len > valid,
+        "the live tail must carry preallocated slack ({live_len} vs {valid})"
+    );
+    // A prebuilt spare next to it must not travel either.
+    std::fs::write(store_dir.join("wal/.spare"), vec![0u8; 4096]).unwrap();
+
+    let info = store.snapshot_to(&snap_dir).unwrap();
+    assert_eq!(
+        std::fs::metadata(snap_dir.join(&rel)).unwrap().len(),
+        valid,
+        "the snapshot stores the valid prefix, not the slack"
+    );
+    let entry = info
+        .files
+        .iter()
+        .find(|file| file.path == rel)
+        .expect("the tail segment is in the manifest");
+    assert_eq!(entry.len, valid);
+    assert!(
+        !info.files.iter().any(|file| file.path.contains(".spare")),
+        "the preallocation scratch is not part of a snapshot"
+    );
+    assert!(!snap_dir.join("wal/.spare").exists());
+    drop(store);
+
+    // A short tail is not damage: open re-extends it and appends keep working.
+    restore_snapshot(&snap_dir, &restored_dir).unwrap();
+    let restored = CollectionStore::open(&restored_dir).unwrap();
+    assert_eq!(restored.count(), 2);
+    upsert_logged(&restored, &point(3, 4));
+    assert_eq!(restored.count(), 3);
+}
+
+#[test]
 fn test_restore_snapshot_creates_an_openable_collection() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_restore");
@@ -271,6 +318,38 @@ fn test_restore_snapshot_creates_an_openable_collection() {
     restore_snapshot(&snap_dir, &restored_dir).unwrap();
     let restored = CollectionStore::open(&restored_dir).unwrap();
     assert_eq!(restored.count(), 2);
+}
+
+/// A snapshot copies the serving file tree and never reads the store's
+/// in-memory state, so the store read lock is not taken while it runs.
+#[test]
+fn test_snapshot_does_not_hold_the_store_read_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_snap_lock");
+    let snap_dir = dir.path().join("snapshot_lock");
+    let store = CollectionStore::create(&store_dir, "col_snap_lock", &config(4)).unwrap();
+    for id in 1..=6 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+
+    let mut probed = false;
+    let info = store
+        .snapshot_with_probe(&snap_dir, |store| {
+            probed = true;
+            assert!(
+                store.read_lock_free(),
+                "the capture window must not hold the store read lock"
+            );
+            // Readers keep working while the copy runs; this would deadlock
+            // if the read lock were held.
+            assert_eq!(store.count(), 6);
+            assert_eq!(store.scroll(10, None, None, None).unwrap().0.len(), 6);
+        })
+        .unwrap();
+    assert!(probed, "the probe must run inside the copy window");
+    assert!(!info.files.is_empty());
+    assert_eq!(store.count(), 6);
 }
 
 #[test]
@@ -1065,6 +1144,37 @@ fn test_repair_skips_graph_without_tombstones() {
     );
 }
 
+/// The whole-store graph repair takes `build_mutex` and walks every segment,
+/// so it runs per batch of deletes rather than per mutation.
+#[test]
+fn test_hnsw_repair_is_batched_by_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_repair_batch");
+    let store = CollectionStore::create(&store_dir, "col_repair_batch", &config(4)).unwrap();
+    for id in 0..300u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    assert!(
+        !store.hnsw_repair_due(),
+        "upserts alone must never schedule a graph repair"
+    );
+
+    // One below the batch threshold still leaves the repair to the per-delete
+    // local heal in `apply_delete_slot_locked`.
+    for id in 0..255u64 {
+        delete_logged(&store, &PointId::Num(id));
+    }
+    assert!(!store.hnsw_repair_due(), "255 tombstones are still batched");
+    delete_logged(&store, &PointId::Num(255));
+    assert!(store.hnsw_repair_due(), "the 256th delete must trip it");
+
+    store.repair_hnsw().unwrap();
+    assert!(
+        !store.hnsw_repair_due(),
+        "a completed sweep consumes the backlog"
+    );
+}
+
 /// meta.bin is force-saved only when capacity grows, so a store that stops
 /// with a stale meta.bin must still reopen with every logged point: the
 /// slot water marks and counts are replayed from the WAL.
@@ -1144,8 +1254,7 @@ fn test_max_points_cap_rejects_write_and_keeps_data() {
 
 /// The bulk of a checkpoint (payload pages, tracker, `keys.bin`,
 /// `vectors.bin`, tombstone table) must run *without* the store write lock:
-/// holding it across those fsyncs freezes readers as well as writers. Phase 2
-/// then takes the lock only for the water marks, which are microseconds.
+/// holding it across those fsyncs freezes readers as well as writers.
 #[test]
 fn test_checkpoint_flush_runs_without_the_write_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -1162,7 +1271,7 @@ fn test_checkpoint_flush_runs_without_the_write_lock() {
             probed = true;
             assert!(
                 store.write_lock_free(),
-                "phase 1 must not hold the store write lock"
+                "the bulk flush must not hold the store write lock"
             );
             // Reads keep working while the flush is in progress: this would
             // deadlock if the write lock were held.
@@ -1177,6 +1286,40 @@ fn test_checkpoint_flush_runs_without_the_write_lock() {
     drop(store);
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(reopened.count(), 8);
+}
+
+/// The gated pass must re-sync only the segments a writer touched, not the
+/// whole collection. Two checkpoints in a row therefore cost exactly one
+/// flush per segment each.
+#[test]
+fn test_checkpoint_resyncs_only_segments_a_writer_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_ckpt_delta");
+    let store =
+        CollectionStore::create_with_segment_slots(&store_dir, "col_ckpt_delta", &config(2), 4)
+            .unwrap();
+    for id in 1..=12 {
+        upsert_logged(&store, &point(id, 2));
+    }
+    let meta = store.meta();
+    let segments = meta.slot_capacity.div_ceil(meta.segment_slots as u64);
+    assert!(segments >= 3, "the fixture must span several segments");
+
+    let mut flushes = store.segment_flushes();
+    store.checkpoint().unwrap();
+    assert_eq!(
+        store.segment_flushes() - flushes,
+        segments,
+        "with no concurrent writer every segment flushes exactly once"
+    );
+
+    // Nothing was written in between, so the second checkpoint repeats the
+    // same single flush per segment.
+    flushes = store.segment_flushes();
+    store.checkpoint().unwrap();
+    assert_eq!(store.segment_flushes() - flushes, segments);
+
+    assert_eq!(store.count(), 12);
 }
 
 #[test]
@@ -1334,8 +1477,8 @@ fn test_staged_id_tracker_is_invisible_until_published() {
     assert!(seg.join("id_tracker.bin").exists());
     assert!(!seg.join("id_tracker.staged").exists());
 
-    // A leftover staging file (what a crash right after phase 1 looks like)
-    // is ignored by open, even when its contents are unusable.
+    // A leftover staging file from a crash between staging and publish is
+    // ignored by open, even when its contents are unusable.
     std::fs::write(seg.join("id_tracker.staged"), b"garbage").unwrap();
     let reopened = CollectionStore::open(&store_dir).unwrap();
     assert_eq!(reopened.count(), 1);

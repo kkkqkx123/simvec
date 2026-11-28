@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use serde_json::json;
-use simvec::{LocalVectorEngine, PointId};
+use simvec::storage::verify_snapshot;
+use simvec::{restore_snapshot, LocalVectorEngine, PointId};
 
 use crate::dto;
 use crate::error::{CliError, Result};
@@ -42,6 +45,20 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact <collection>", "reclaim tombstoned slots"),
     ("drain_pending <collection>", "drain pending HNSW slots"),
     ("metrics <collection>", "print the collection metrics snapshot"),
+    (
+        "maintenance_status <collection>",
+        "print per-segment durability and the last maintenance failure",
+    ),
+    (
+        "snapshot <collection> <dest>",
+        "copy a collection's serving generation and WAL into a new directory",
+    ),
+    (
+        "snapshot_incremental <collection> <base> <dest>",
+        "snapshot that hard-links unchanged files from a verified base",
+    ),
+    ("verify_snapshot <src>", "validate a snapshot manifest and every file it names"),
+    ("restore_snapshot <src> <dest>", "restore a verified snapshot into a new directory"),
     ("maintenance", "run one maintenance sweep"),
     ("promote <live> <temp> <suffix>", "promote a temporary collection"),
     ("restore <live>", "restore the newest promote backup"),
@@ -335,6 +352,34 @@ pub fn execute(engine: &LocalVectorEngine, output: &mut Output, argv: &[String])
         "metrics" => {
             require(args, 1, 1, "metrics <collection>")?;
             output.print_json(&engine.collection_metrics(&args[0])?)
+        }
+        "maintenance_status" => {
+            require(args, 1, 1, "maintenance_status <collection>")?;
+            output.print_json(&engine.maintenance_status(&args[0])?)
+        }
+        "snapshot" => {
+            require(args, 2, 2, "snapshot <collection> <dest>")?;
+            output.print_json(&engine.snapshot_collection(&args[0], &args[1])?)
+        }
+        "snapshot_incremental" => {
+            require(
+                args,
+                3,
+                3,
+                "snapshot_incremental <collection> <base> <dest>",
+            )?;
+            output.print_json(&engine.snapshot_collection_incremental(
+                &args[0], &args[1], &args[2],
+            )?)
+        }
+        "verify_snapshot" => {
+            require(args, 1, 1, "verify_snapshot <src>")?;
+            output.print_json(&verify_snapshot(Path::new(&args[0]))?)
+        }
+        "restore_snapshot" => {
+            require(args, 2, 2, "restore_snapshot <src> <dest>")?;
+            restore_snapshot(&args[0], &args[1])?;
+            Ok(())
         }
         "maintenance" => {
             require(args, 0, 0, "maintenance")?;

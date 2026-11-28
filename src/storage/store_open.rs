@@ -232,6 +232,9 @@ impl CollectionStore {
             building: AtomicBool::new(false),
             needs_rebuild: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
+            hnsw_tombstones_pending: AtomicU64::new(0),
+            #[cfg(test)]
+            segment_flushes: AtomicU64::new(0),
             maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),
@@ -396,6 +399,9 @@ impl CollectionStore {
             building: AtomicBool::new(false),
             needs_rebuild: AtomicBool::new(false),
             mutations: AtomicU64::new(0),
+            hnsw_tombstones_pending: AtomicU64::new(0),
+            #[cfg(test)]
+            segment_flushes: AtomicU64::new(0),
             maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),

@@ -2,6 +2,8 @@
 
 本文把当前明确延后的存储能力整理成一次可执行的重构方案。它只描述模块职责、数据布局、状态转换、不变量和验收边界，不展开完整代码。本文是临时执行清单，不作为项目事实源；落地后应把仍然成立的事实写回 `AGENTS.md`。
 
+> **基线提示（2026-11）**：本文记录的是存储改造**之前**的基线与当时的判断，部分描述（WAL 用 `write_all` + `sync_all`、dense 数据整代单文件、CRC32、payload 无压缩等）已经过期。当前实现以 `AGENTS.md` 的存储章节为唯一事实源，本轮整改清单见 `docs/plan/storage-remediation-tasks.md`。历史结论保留原样，不再按代码回填。
+
 ## 范围与原则
 
 本轮重构覆盖以下能力：统一 CRC32C、HNSW 反向邻接与完整删除修复、dense 物理段与段级 id tracker、段级 flush 与 ACK 推进、引用式 WAL 与 blob 持久化、named/sparse 段级存储与 ANN、向量类型扩展与 multivector、按段快照清单与 C ABI 暴露。

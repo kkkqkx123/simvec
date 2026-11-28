@@ -43,7 +43,9 @@ use crate::index::{persist, HnswIndex, IndexBuildParams, IvfIndex};
 use crate::types::{HnswConfig, IndexConfig, IvfConfig, PointId};
 
 const HEADER_LEN: usize = 32;
-const FILE_VERSION: u32 = 2;
+/// Directory-file layout version written into every header. It must match
+/// [`super::directory`]'s reader, which opens the files this module writes.
+const FILE_VERSION: u32 = 1;
 
 /// How often the lock-free rewrite is retried when a write races it before
 /// falling back to the whole-rewrite critical section.

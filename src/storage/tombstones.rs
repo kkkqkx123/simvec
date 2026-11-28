@@ -119,10 +119,12 @@ impl TombstoneBits {
         bits
     }
 
-    /// Persist the table to `tombstones.bin` (tmp + fsync + rename).
+    /// Persist the table to one `tombstones.bin` (tmp + fsync + rename).
     ///
-    /// Must run before `meta.bin` is written and before the WAL is truncated:
-    /// once the log is cleared this file is the only evidence of the deletes.
+    /// [`TombstoneBits::save_segment`] is the per-segment writer and reaches
+    /// this function. The caller must have this durable before `meta.bin` is
+    /// written and before the WAL is truncated: once the log is cleared this
+    /// file is the only evidence of the deletes.
     pub(super) fn save(&self, dir: &Path, slot_capacity: u64) -> Result<()> {
         let bits = self.to_bits();
         let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
@@ -236,13 +238,15 @@ impl TombstoneBits {
         Ok(Some(Self::from_bits(bits)))
     }
 
-    /// Load `tombstones.bin` and resize it to the capacity declared by meta.
+    /// Load a single `tombstones.bin` and resize it to the capacity declared by
+    /// meta.
     ///
-    /// A missing file is only acceptable when the metadata claims no
-    /// tombstones (fresh collection, or a collection that never deleted).
-    /// Otherwise the file is the authority for deletes and its absence or a
-    /// checksum mismatch is corruption: falling back to "nothing deleted"
-    /// would silently resurrect points.
+    /// [`TombstoneBits::load_segments`] is the per-segment reader and goes
+    /// through this function. A missing file is only acceptable when the
+    /// metadata claims no tombstones (fresh collection, or a collection that
+    /// never deleted). Otherwise the file is the authority for deletes and its
+    /// absence or a checksum mismatch is corruption: falling back to "nothing
+    /// deleted" would silently resurrect points.
     pub(super) fn load(
         dir: &Path,
         slot_capacity: usize,

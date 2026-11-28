@@ -122,6 +122,11 @@
 | `compact <collection>` | `compact_collection` |
 | `drain_pending <collection>` | `drain_pending` |
 | `metrics <collection>` | `collection_metrics` |
+| `maintenance_status <collection>` | `maintenance_status`；输出 `MaintenanceStatus`（分段持久化水位与最近一次维护失败）。 |
+| `snapshot <collection> <dest>` | `snapshot_collection`；`dest` 必须不存在，且不能落在引擎根目录下（带 `generation.bin` 的目录会被当成集合加载）。 |
+| `snapshot_incremental <collection> <base> <dest>` | `snapshot_collection_incremental`；未变化的文件硬链接，`reused_files` 反映复用数。 |
+| `verify_snapshot <src>` | `storage::verify_snapshot`；校验清单、长度与 CRC，拒绝逃逸路径。 |
+| `restore_snapshot <src> <dest>` | `restore_snapshot`；`dest` 必须不存在，恢复后打开一次做校验。 |
 | `maintenance` | `run_maintenance_sweep` |
 | `promote <live> <temp> <suffix>` | `promote_temp_collection` |
 | `restore <live>` | `restore_promote_backup` |

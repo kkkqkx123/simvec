@@ -17,15 +17,13 @@ use crate::error::{Result, VectorSearchError};
 use crate::types::DistanceMetric;
 
 pub(crate) const INDEX_MAGIC: [u8; 4] = *b"VICF";
-/// Development stage: version locked at 1. No backward compatibility is
-/// maintained (see the `FORMAT_VERSION` note in `storage::meta`): older files
-/// fail version / checksum validation and are discarded in favor of exact
-/// scan, exactly like the pgvector "corrupt index file is deleted and search
-/// falls back" contract. The format is CRC32-protected tag
-/// `[magic 4][version u16 LE][crc32 u32 LE][postcard payload]`.
+/// Index file format version. The file is a CRC32-protected tag
+/// `[magic 4][version u16 LE][crc32 u32 LE][postcard payload]`; a file whose
+/// version or checksum does not match is discarded and search falls back to
+/// exact scan.
 pub(crate) const INDEX_VERSION: u16 = 1;
 const HNSW_MAGIC: [u8; 4] = *b"VHSC";
-/// Same dev-stage policy as `INDEX_VERSION`; version locked at 1.
+/// HNSW graph file format version.
 const HNSW_VERSION: u16 = 1;
 
 /// The persisted subset of the IVF index.

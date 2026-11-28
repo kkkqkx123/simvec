@@ -17,9 +17,9 @@ simvec 现状：`write_all + sync_all` 追加、段懒创建、无预分配、�
 回放把事务读进 `Vec`；`segment_bytes` 阈值用物理长度判断，torn 尾会污染滚动
 决策（已有 valid-prefix 修复）；CRC 为无 seed 的单记录 CRC32。
 
-## 新段格式（版本 2，不保留旧版兼容）
+## 段格式（版本 1）
 
-- 段头 32 字节：magic `SVWL`、格式版本 `2`、随机 seed `u32`、首 LSN `u64`、
+- 段头 32 字节：magic `SVWC`、格式版本 `1`、随机 seed `u32`、首 LSN `u64`、
   保留位。段名仍为首 LSN 的 20 位零填充十进制；头内首 LSN 必须与段名一致，
   否则按 `CorruptData` 处理。
 - 记录：`[u32 len][u32 crc][postcard bytes][0~7 零填充]`，总长 8 字节对齐。

@@ -505,5 +505,12 @@ impl CollectionStore {
         let data = self.data_arc();
         let next = data.tombstones.load().with_slot(slot, value);
         data.tombstones.store(Arc::new(next));
+        if value {
+            // Counted here, not in the delete paths: replay and undo also flip
+            // bits, and only a real accumulate-then-repair cycle should wake
+            // the whole-store graph repair.
+            self.hnsw_tombstones_pending
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }

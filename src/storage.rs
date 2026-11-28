@@ -458,6 +458,11 @@ pub struct CollectionStore {
     /// uses it to detect that no write raced its temp-file rewrite phase, so
     /// the commit can swap the files without re-validating every slot.
     mutations: AtomicU64,
+    /// Tombstones added since the last whole-store HNSW repair.
+    hnsw_tombstones_pending: AtomicU64,
+    /// Segment flushes since open, counted per segment.
+    #[cfg(test)]
+    segment_flushes: AtomicU64,
     /// Last failed maintenance flush. Reads and writes continue; the WAL
     /// watermark stays put until a later flush succeeds.
     maintenance_error: Mutex<Option<String>>,
@@ -486,7 +491,6 @@ impl CollectionStore {
         self.files.load_full()
     }
 
-    /// Directory holding the serving generation's files.
     /// Directory holding the currently published generation's data files.
     pub fn data_dir(&self) -> PathBuf {
         self.data_arc().dir.clone()
@@ -495,13 +499,12 @@ impl CollectionStore {
     /// Copy the serving generation and every surviving WAL segment into
     /// `dest`, with a checksummed manifest.
     ///
-    /// The maintenance lock, queue gate and store read lock are held for the
-    /// whole copy: no checkpoint can truncate the log, no compaction can swap
-    /// the generation and no config write can replace `meta.bin` while files
-    /// are being read. A WAL acknowledge pin is also registered over the
-    /// copy window, so a future concurrent checkpoint that no longer holds
-    /// the gate for the whole copy still cannot unlink the segments being
-    /// read. Because the copied WAL is complete at that point, the
+    /// The maintenance lock and the queue gate are held for the whole copy: no
+    /// checkpoint can truncate the log, no compaction can swap the generation
+    /// and no config write can replace `meta.bin` while files are being read.
+    /// The store read lock is not taken, because the copy reads the file tree
+    /// only. A WAL acknowledge pin covers the same window, so no segment being
+    /// copied can be unlinked. Because the copied WAL is complete, the
     /// manifest's replay floor pins a self-consistent restore point.
     pub fn snapshot_to(&self, dest: impl AsRef<Path>) -> Result<SnapshotInfo> {
         self.snapshot_capture(None, dest)
@@ -527,7 +530,15 @@ impl CollectionStore {
         base: Option<(&Path, SnapshotInfo)>,
         dest: impl AsRef<Path>,
     ) -> Result<SnapshotInfo> {
-        let dest = dest.as_ref();
+        self.snapshot_capture_inner(base, dest.as_ref(), |_| {})
+    }
+
+    fn snapshot_capture_inner(
+        &self,
+        base: Option<(&Path, SnapshotInfo)>,
+        dest: &Path,
+        on_copy: impl FnOnce(&Self),
+    ) -> Result<SnapshotInfo> {
         if dest.exists() {
             return Err(VectorSearchError::InvalidConfig(format!(
                 "snapshot destination {} already exists",
@@ -537,7 +548,9 @@ impl CollectionStore {
         self.ensure_not_poisoned()?;
         let _maintenance = self.compact_mutex.lock();
         let _gate = self.queue.quiesce();
-        let _inner = self.inner.read();
+        // The copy reads the file tree only. Compaction, checkpoint and index
+        // builds all take `compact_mutex` first and the gate has stopped the
+        // applier, so the tree stays stable without the store read lock.
         let generation = self.generation.read().clone();
         let pin = self.pin_wal_ack(generation.lsn());
         pin.set(generation.lsn());
@@ -560,6 +573,7 @@ impl CollectionStore {
             )
         };
         copy(&self.dir.join("generation.bin"), "generation.bin")?;
+        on_copy(self);
         let generation_rel = format!("{}/g{:020}", generation::GENERATIONS_DIR, generation.id());
         copy(&generation.path(), &generation_rel)?;
         drop(copy);
@@ -567,6 +581,10 @@ impl CollectionStore {
         // generation id: recording the name as `version` lets an incremental
         // snapshot reuse an unchanged segment across generation advances.
         let wal_dir = self.dir.join("wal");
+        let wal_copy = WalCopy {
+            root: &wal_dir,
+            tail: self.wal.tail_valid_len(),
+        };
         copy_snapshot_file(
             &wal_dir,
             dest,
@@ -575,7 +593,7 @@ impl CollectionStore {
             base.as_ref(),
             &mut files,
             &mut reused_files,
-            Some(&wal_dir),
+            Some(&wal_copy),
         )?;
 
         let info = SnapshotInfo {
@@ -588,6 +606,16 @@ impl CollectionStore {
         snapshot::write_info(&dest.join(snapshot::SNAPSHOT_MANIFEST_FILE), &info)?;
         generation::sync_tree(dest)?;
         Ok(info)
+    }
+
+    /// Test-only: `snapshot_to` with `probe` invoked inside the copy window.
+    #[cfg(test)]
+    pub(crate) fn snapshot_with_probe(
+        &self,
+        dest: impl AsRef<Path>,
+        probe: impl FnOnce(&Self),
+    ) -> Result<SnapshotInfo> {
+        self.snapshot_capture_inner(None, dest.as_ref(), probe)
     }
 
     /// Whether a generation publish left the in-memory switch unfinished.
@@ -656,19 +684,19 @@ impl CollectionStore {
         self.wal_pins.pin(version)
     }
 
-    /// Lowest pinned acknowledge version, if any pin is live.
+    /// Test-only: lowest live pin.
+    #[cfg(test)]
     pub(crate) fn lowest_wal_pin(&self) -> Option<u64> {
         self.wal_pins.lowest()
     }
 
     /// Truncate the WAL through `watermark`, clamped by live pins.
-    /// A pin at or below the watermark holds the truncate back so a
-    /// snapshot or copy window keeps the segments it still needs.
+    ///
+    /// A live pin at or below the watermark holds the truncate back to just
+    /// below that pin, so a snapshot or copy window keeps the segments it
+    /// still reads. A clamped value of zero truncates nothing.
     pub(crate) fn truncate_wal_through(&self, watermark: u64) -> Result<()> {
-        let effective = match self.lowest_wal_pin() {
-            Some(lowest) if lowest <= watermark => lowest.saturating_sub(1),
-            _ => watermark,
-        };
+        let effective = self.wal_pins.clamp(watermark);
         if effective == 0 && watermark != 0 {
             return Ok(());
         }
@@ -762,12 +790,28 @@ pub fn restore_snapshot(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(snapshot::checked_path(src, &file.path)?, &target)?;
+        copy_snapshot_bytes(&snapshot::checked_path(src, &file.path)?, &target)?;
     }
     generation::sync_tree(dest)?;
     let restored = CollectionStore::open(dest)?;
     drop(restored);
     Ok(())
+}
+
+/// How the WAL subtree is copied into a snapshot.
+struct WalCopy<'a> {
+    /// Directory being walked. Only its direct children are treated as
+    /// segments; everything below stays generation-bound.
+    root: &'a Path,
+    /// Tail segment name and its valid byte length.
+    tail: Option<(u64, u64)>,
+}
+
+/// Preallocation scratch inside `wal/`: a full-capacity hole consumed by the
+/// next rollover and rebuilt on demand. `.spare.tmp` is its half-written
+/// precursor.
+fn is_wal_scratch(name: &str) -> bool {
+    name == ".spare" || name == ".spare.tmp"
 }
 
 fn copy_snapshot_file(
@@ -778,13 +822,17 @@ fn copy_snapshot_file(
     base: Option<&(&Path, SnapshotInfo)>,
     files: &mut Vec<snapshot::SnapshotFile>,
     reused: &mut usize,
-    wal_dir: Option<&Path>,
+    wal: Option<&WalCopy<'_>>,
 ) -> Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dest_root.join(rel))?;
+        let skip_scratch = wal.is_some_and(|wal| src == wal.root);
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if skip_scratch && is_wal_scratch(&name) {
+                continue;
+            }
             let child = if rel.is_empty() {
                 name
             } else {
@@ -798,7 +846,7 @@ fn copy_snapshot_file(
                 base,
                 files,
                 reused,
-                wal_dir,
+                wal,
             )?;
         }
         return Ok(());
@@ -806,23 +854,30 @@ fn copy_snapshot_file(
     // A WAL segment directly under `wal/` is named by its first lsn. Bind its
     // manifest version to that lsn instead of the generation id so unchanged
     // segments stay reusable across generation advances. Other wal files
-    // (`acked-lsn`, `.spare`, `blobs.bin`) stay bound to the generation.
-    let file_version = wal_dir
-        .filter(|root| src.parent() == Some(*root))
+    // (`acked-lsn`, `blobs.bin`) stay bound to the generation.
+    let segment = wal
+        .filter(|wal| src.parent() == Some(wal.root))
         .and_then(|_| {
             src.file_name()?
                 .to_str()?
                 .strip_suffix(".bin")?
                 .parse::<u64>()
                 .ok()
-        })
-        .unwrap_or(version);
-    let version = file_version;
+        });
+    let version = segment.unwrap_or(version);
+    // The tail segment is copied to its valid prefix: the rest is
+    // preallocated slack, which replay treats as the end of the log.
+    // `CollectionStore::open` extends a short tail back to capacity.
+    let limit = segment.and_then(|segment| {
+        wal.and_then(|wal| wal.tail)
+            .filter(|(tail, _)| *tail == segment)
+            .map(|(_, valid)| valid)
+    });
     let target = dest_root.join(rel);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let (len, crc32) = snapshot::file_checksum(src)?;
+    let (len, crc32) = snapshot::file_checksum_prefix(src, limit)?;
     let reusable = base.and_then(|(base_dir, info)| {
         info.files.iter().find(|file| {
             file.path == rel && file.version == version && file.len == len && file.crc32 == crc32
@@ -836,7 +891,10 @@ fn copy_snapshot_file(
         }
     }
     if !linked {
-        std::fs::copy(src, &target)?;
+        match limit {
+            Some(limit) => copy_prefix(src, &target, limit)?,
+            None => copy_snapshot_bytes(src, &target)?,
+        }
     } else {
         *reused += 1;
     }
@@ -847,6 +905,60 @@ fn copy_snapshot_file(
         crc32,
     });
     Ok(())
+}
+
+/// Copy the first `limit` bytes of `src` into a new file at `target`.
+///
+/// Used for WAL segments, whose trailing preallocated slack is not part of the
+/// log. The destination is a fresh file, so it ends exactly at `limit`.
+fn copy_prefix(src: &Path, target: &Path, limit: u64) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::File::create(target)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut copied = 0u64;
+    while copied < limit {
+        let want = (limit - copied).min(buffer.len() as u64) as usize;
+        let read = input.read(&mut buffer[..want])?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+    Ok(())
+}
+
+/// Copy a whole file into a fresh destination, preferring a copy-on-write
+/// clone: a reflink shares the source's extents instead of reading them, and
+/// `std::fs::copy` covers filesystems that cannot clone.
+fn copy_snapshot_bytes(src: &Path, target: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if clone_file(src, target).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, target)?;
+    Ok(())
+}
+
+/// Ask the filesystem to clone `src` into `target` (`FICLONE`).
+#[cfg(target_os = "linux")]
+fn clone_file(src: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // `FICLONE` from <linux/fs.h>: `_IOW(0x94, 9, int)`.
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let source = std::fs::File::open(src)?;
+    let dest = std::fs::File::create(target)?;
+    let rc = unsafe { libc::ioctl(dest.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    drop(dest);
+    let _ = std::fs::remove_file(target);
+    Err(err)
 }
 
 #[cfg(test)]
