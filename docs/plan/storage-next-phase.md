@@ -6,6 +6,8 @@
 - **前序文档**：`docs/plan/storage-remediation-tasks.md`（A/B/C/D 缺陷与遗留清理，已完成）、`docs/plan/storage-remaining-tasks.md`（E1–E4 的阶段性记录）。
 - **本文对前序结论的修订**：`storage-remaining-tasks.md` §E1 断言"段目录（catalog）是段级压实的前置条件"。重新核对布局后该结论**不成立**：段目录名已经是 slot base，只要段内紧凑、段地址不变，读写公式完全不用改，无需 catalog。本文 §2.3 给出推导与取舍，catalog 降级为"地址空间回收"的可选后续项。
 
+> **实施状态（2026-11）**：N1a（点级追加写 + 派生 free list）、N7（`Turbo` create 期拒绝）、N4 的 Rust 侧（`maintenance_status` 的 C ABI 形状断言）、N6 的 I/O 计分骨架、N5 的六窗口注入骨架、N2 的「门内只剩发布」（tracker 自封顶 + `gate_wait_ms`）已落地；N1b/N1c/N1d/N3/N4b 仍待实施。代码级拆分、逐条验收用例、以及实施中对本文的 **8 处修订**（其中 4 处改变结论：free list 收窄到尾段、重放槽号不再保证一致、payload 段内不可变必须早于 N1b 的硬链接、`quant.bin` 必须与 N1b 同里程碑）见 [`storage-next-phase-impl.md`](./storage-next-phase-impl.md)，分阶段执行顺序与逐阶段状态见 [`storage-next-phase-stages.md`](./storage-next-phase-stages.md)（含实施后新增的 2 条修订 R9/R10）。
+
 ---
 
 ## 0. 现状基线（进入本阶段时的代码事实）

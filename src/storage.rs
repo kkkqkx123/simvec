@@ -35,6 +35,7 @@
 
 mod compaction;
 mod directory;
+pub(crate) mod fault;
 mod filter_bitmap;
 pub(crate) mod generation;
 mod index_lifecycle;
@@ -265,6 +266,15 @@ struct StoreInner {
     /// once the segment files covering it are synced; the WAL ack is the
     /// minimum over all segments, clamped by live pins.
     segment_persisted: Vec<u64>,
+    /// Scan hint for reclaiming dead slots of the appendable tail. Not
+    /// persisted: it is derived state, rebuilt identically by WAL replay, and
+    /// reset at every durable boundary (open, checkpoint, compaction) so live
+    /// and replay never diverge on a slot number.
+    free_cursor: u32,
+    /// True while [`CollectionStore::replay_wal`] runs. Replay rebuilds the
+    /// state the log already produced, so an upsert of a known id writes back
+    /// into its own slot instead of appending a new one.
+    replaying: bool,
 }
 
 impl StoreInner {
@@ -469,6 +479,11 @@ pub struct CollectionStore {
     /// Transactions since the last meta.bin save. Used to amortize fsync
     /// cost; the WAL guarantees crash safety independently.
     txns_since_last_save: AtomicU64,
+    /// Microseconds the last checkpoint held the queue gate. The gated
+    /// section is publication only (renames, `meta.bin`, the log marker and
+    /// the truncate), never an fsync storm, so this stays in the microsecond
+    /// range and a jump means a regression that moves work back inside it.
+    last_gate_wait_us: AtomicU64,
     /// In-flight index build progress: slots incorporated so far / total
     /// slots targeted. Reset at build start, finalized at completion;
     /// surfaced through [`crate::types::IndexInfo`].
@@ -673,6 +688,7 @@ impl CollectionStore {
             healthy: error.is_none(),
             persisted_lsn: inner.min_persisted(inner.meta.last_applied_txn),
             wal_blob_bytes: self.wal.blob_bytes(),
+            gate_wait_ms: self.last_gate_wait_us.load(AtomicOrdering::Relaxed) / 1000,
             error,
             segments,
         }

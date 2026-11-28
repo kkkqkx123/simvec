@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::{Result, VectorSearchError};
+use std::sync::atomic::Ordering;
 use crate::types::{CollectionConfig, DistanceMetric, VectorPoint};
 
 fn config(dim: usize) -> CollectionConfig {
@@ -710,6 +711,234 @@ fn test_upsert_overwrite_reuses_slot() {
     assert_eq!(got2.vector(), point(2, 4).vector());
 }
 
+/// Bytes of one slot as stored in its segment file.
+fn slot_bytes(store: &CollectionStore, slot: u32) -> Vec<u8> {
+    let meta = store.meta();
+    let vectors = store.data_arc();
+    let snapshot = vectors.vectors.snapshot();
+    let values =
+        super::vectors::Vectors::read_slot(&snapshot, slot as u64, meta.segment_slots, meta.vector_size)
+            .expect("slot readable")
+            .to_vec();
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+/// An upsert of an id that is already live appends a new slot and tombstones
+/// the old one instead of rewriting the published bytes in place.
+#[test]
+fn test_upsert_overwrite_appends_and_tombstones_the_old_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_append");
+    let store = CollectionStore::create(&store_dir, "col_append", &config(4)).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    upsert_logged(&store, &point(2, 4));
+    let old_slot = store.slot_of(&PointId::Num(1)).unwrap();
+    let old_bytes = slot_bytes(&store, old_slot);
+    // Keep a live neighbour right after the overwritten slot so the reclaimed
+    // dead slot cannot simply be handed back to the same id.
+    upsert_logged(&store, &point(3, 4));
+
+    let overwritten = VectorPoint::new(1u64, vec![9.0; 4]);
+    upsert_logged(&store, &overwritten);
+
+    let new_slot = store.slot_of(&PointId::Num(1)).unwrap();
+    assert_ne!(new_slot, old_slot, "overwrite must not reuse the live slot");
+    assert_eq!(
+        store.get(&PointId::Num(1)).unwrap().unwrap().vector(),
+        vec![9.0; 4]
+    );
+    assert_eq!(store.count(), 3, "an overwrite keeps the live count");
+    assert!(
+        store.data_arc().tombstones.load().bit(old_slot as usize),
+        "the superseded slot must be tombstoned"
+    );
+    // The dead slot is reclaimed by a later insert of a *new* id, so its bytes
+    // only change then; right after the overwrite they are still the old ones.
+    assert_eq!(slot_bytes(&store, old_slot), old_bytes);
+    assert_eq!(store.meta().tombstone_count, 1);
+
+    // Reopen: the appended slot is the live one, the count and payload agree.
+    store.checkpoint().unwrap();
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 3);
+    assert_eq!(reopened.slot_of(&PointId::Num(1)), Some(new_slot));
+    assert_eq!(
+        reopened.get(&PointId::Num(1)).unwrap().unwrap().vector(),
+        vec![9.0; 4]
+    );
+}
+
+/// Repeated overwrites of one id reclaim the dead tail slot instead of growing
+/// the slot address space without bound.
+#[test]
+fn test_repeated_overwrites_reclaim_the_dead_tail_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_churn");
+    let store = CollectionStore::create(&store_dir, "col_churn", &config(4)).unwrap();
+    for round in 0..200u64 {
+        let vector = vec![(round % 97) as f32 / 100.0; 4];
+        upsert_logged(&store, &VectorPoint::new(7u64, vector));
+    }
+    let meta = store.meta();
+    assert_eq!(store.count(), 1, "churn on one id stays one live point");
+    assert!(
+        meta.next_slot <= 2,
+        "the dead slot of the tail must be reused, next_slot = {}",
+        meta.next_slot
+    );
+    assert!(meta.tombstone_count <= 1);
+    store.checkpoint().unwrap();
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), 1);
+    assert_eq!(
+        reopened.get(&PointId::Num(7)).unwrap().unwrap().vector(),
+        vec![(199 % 97) as f32 / 100.0; 4]
+    );
+}
+
+/// Overwriting a point that lives in a complete segment leaves that segment's
+/// files byte-identical: the new version goes to the tail instead.
+#[test]
+fn test_overwrite_never_rewrites_a_complete_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_immutable");
+    let store =
+        CollectionStore::create_with_segment_slots(&store_dir, "col_immutable", &config(4), 4)
+            .unwrap();
+    for id in 1..=8u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+    let segment = store.data_dir().join("segments").join(format!("{:010}", 0));
+    let before: Vec<(String, Vec<u8>)> = ["vectors.bin", "keys.bin", "tombstones.bin"]
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                std::fs::read(segment.join(name)).unwrap(),
+            )
+        })
+        .collect();
+
+    upsert_logged(&store, &VectorPoint::new(2u64, vec![5.0; 4]));
+
+    for (name, bytes) in &before {
+        assert_eq!(
+            &std::fs::read(segment.join(name)).unwrap(),
+            bytes,
+            "{name} of a complete segment must not change on overwrite"
+        );
+    }
+    assert_eq!(store.slot_of(&PointId::Num(2)), Some(8));
+    assert_eq!(store.count(), 8);
+    assert_eq!(
+        store.get(&PointId::Num(2)).unwrap().unwrap().vector(),
+        vec![5.0; 4]
+    );
+}
+
+/// The reclaim scan never touches a frozen (published) segment: its bytes are
+/// shared with later generations, so a dead slot in it waits for compaction.
+#[test]
+fn test_frozen_segment_slots_are_never_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_frozen");
+    let store =
+        CollectionStore::create_with_segment_slots(&store_dir, "col_frozen", &config(4), 4).unwrap();
+    for id in 1..=8u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    // Both segments are full, so the whole address space is frozen.
+    assert_eq!(super::segments::immutable_end(8, 4), 8);
+    delete_logged(&store, &PointId::from(1u64));
+    let dead_bytes = slot_bytes(&store, 1);
+    let tombs_before = store.data_arc().tombstones.load().count_ones();
+
+    for id in 9..=20u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+
+    assert_eq!(
+        store.slot_of(&PointId::from(9u64)),
+        Some(8),
+        "the first insert after the frozen segments takes the tail, not the freed slot"
+    );
+    assert_eq!(
+        slot_bytes(&store, 1),
+        dead_bytes,
+        "a frozen segment must not be written again"
+    );
+    assert_eq!(
+        store.data_arc().tombstones.load().count_ones(),
+        tombs_before,
+        "no dead slot of the frozen area was reclaimed"
+    );
+}
+
+/// A crash after a checkpoint replays the tail into a directory that still
+/// agrees with itself: every live slot holds exactly the id the map names, the
+/// vectors are the last written ones and the counts match.
+///
+/// Slot *numbers* may differ from the live run: a post-checkpoint overwrite is
+/// re-applied into the slot the published tracker names instead of appending a
+/// second one, which is what keeps replay idempotent (see `apply_upsert_locked`).
+#[test]
+fn test_replay_keeps_the_directory_consistent_after_an_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_replay_slots");
+    let store = CollectionStore::create(&store_dir, "col_replay_slots", &config(4)).unwrap();
+    for id in 1..=6u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    store.checkpoint().unwrap();
+    // Overwrites, a delete and fresh inserts after the checkpoint: the mix
+    // exercises reclaim + append in one log.
+    upsert_logged(&store, &VectorPoint::new(2u64, vec![7.0; 4]));
+    delete_logged(&store, &PointId::from(4u64));
+    for id in 7..=9u64 {
+        upsert_logged(&store, &point(id, 4));
+    }
+    upsert_logged(&store, &VectorPoint::new(7u64, vec![3.0; 4]));
+
+    let expected: Vec<(PointId, Vec<f32>)> = (1..=9u64)
+        .filter_map(|id| {
+            let id = PointId::from(id);
+            store
+                .get(&id)
+                .unwrap()
+                .map(|point| (id, point.vector().to_vec()))
+        })
+        .collect();
+    let count = store.count();
+    drop(store);
+
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(reopened.count(), count);
+    let mut seen = std::collections::HashSet::new();
+    for (id, vector) in &expected {
+        let got = reopened.get(id).unwrap().expect("point must replay");
+        assert_eq!(got.vector(), vector.as_slice(), "id {id} vector drifted");
+        let slot = reopened.slot_of(id).expect("slot must exist");
+        assert!(seen.insert(slot), "slot {slot} is handed out twice");
+    }
+    // Every live slot must be named by the key stored for it: a directory that
+    // disagrees with `keys.bin` returns the wrong id from a scan.
+    let inner = reopened.inner.read();
+    let keys = reopened.data_arc().keys.snapshot();
+    for (slot, id) in seen.iter().map(|slot| (*slot, ())) {
+        let _ = (slot, id);
+    }
+    for (id, slot) in inner.reverse.iter() {
+        let key = super::Keys::read_key(&keys, slot as usize)
+            .unwrap()
+            .expect("live slot has a key");
+        assert_eq!(key, id.to_string());
+    }
+}
+
 #[test]
 fn test_grow_across_segments() {
     let dir = tempfile::tempdir().unwrap();
@@ -791,17 +1020,17 @@ fn test_upsert_then_delete_then_reinsert() {
     upsert_logged(&store, &point(1, 4));
     assert!(delete_logged(&store, &PointId::Num(1)));
 
-    // Without an intervening compaction the re-insert takes a fresh slot:
-    // the stale tombstone stays pending and flags the collection for
-    // background compaction, while visibility is already correct.
+    // The re-insert reclaims the dead slot of the appendable tail instead of
+    // growing the address space, so no garbage is left to compact and
+    // visibility is correct immediately.
     upsert_logged(&store, &point(1, 4));
     assert_eq!(store.count(), 1);
     let meta = store.meta();
-    assert_eq!(meta.next_slot, 2);
-    assert_eq!(meta.tombstone_count, 1);
-    assert!(store.needs_compaction());
-    store.compact().unwrap();
+    assert_eq!(meta.next_slot, 1, "the dead tail slot is reused");
+    assert_eq!(meta.tombstone_count, 0);
     assert!(!store.needs_compaction());
+    assert!(store.get(&PointId::Num(1)).unwrap().is_some());
+    store.compact().unwrap();
     assert!(store.get(&PointId::Num(1)).unwrap().is_some());
 }
 
@@ -859,6 +1088,46 @@ fn test_create_validates_inputs() {
     let manhattan_dir = dir.path().join("manhattan_ok");
     let store = CollectionStore::create(&manhattan_dir, "col", &cfg).unwrap();
     assert_eq!(store.meta().distance, DistanceMetric::Manhattan);
+}
+
+/// `Turbo` has no storage encoding and no distance mapping, so a collection
+/// configured with it is rejected at create time — before anything is written
+/// to disk, rather than on its first upsert.
+#[test]
+fn test_turbo_dtype_is_rejected_at_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(4);
+    cfg.vectors.insert(
+        crate::types::DEFAULT_VECTOR_NAME.to_string(),
+        crate::types::VectorSpaceConfig::dense_typed(
+            4,
+            DistanceMetric::Cosine,
+            crate::types::VectorDataType::Turbo,
+        ),
+    );
+    let store_dir = dir.path().join("col_turbo");
+    let err = CollectionStore::create(&store_dir, "col_turbo", &cfg).unwrap_err();
+    assert!(
+        matches!(err, VectorSearchError::InvalidConfig(ref message) if message.contains("turbo")),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !store_dir.exists(),
+        "a rejected create must not leave a collection directory behind"
+    );
+    // The same directory stays usable with a dtype that has an encoding.
+    let mut cfg = config(4);
+    cfg.vectors.insert(
+        crate::types::DEFAULT_VECTOR_NAME.to_string(),
+        crate::types::VectorSpaceConfig::dense_typed(
+            4,
+            DistanceMetric::Cosine,
+            crate::types::VectorDataType::F16,
+        ),
+    );
+    let store = CollectionStore::create(&store_dir, "col_turbo", &cfg).unwrap();
+    upsert_logged(&store, &point(1, 4));
+    assert_eq!(store.count(), 1);
 }
 
 #[test]
@@ -1288,11 +1557,11 @@ fn test_checkpoint_flush_runs_without_the_write_lock() {
     assert_eq!(reopened.count(), 8);
 }
 
-/// The gated pass must re-sync only the segments a writer touched, not the
-/// whole collection. Two checkpoints in a row therefore cost exactly one
-/// flush per segment each.
+/// A checkpoint flushes every segment exactly once: the published tracker
+/// caps its own entries at the frontier its segment already fsynced, so there
+/// is no second pass over the segments a writer touched.
 #[test]
-fn test_checkpoint_resyncs_only_segments_a_writer_touched() {
+fn test_checkpoint_flushes_each_segment_once() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("col_ckpt_delta");
     let store =
@@ -1310,16 +1579,77 @@ fn test_checkpoint_resyncs_only_segments_a_writer_touched() {
     assert_eq!(
         store.segment_flushes() - flushes,
         segments,
-        "with no concurrent writer every segment flushes exactly once"
+        "every segment flushes exactly once"
     );
 
     // Nothing was written in between, so the second checkpoint repeats the
-    // same single flush per segment.
+    // same single flush per segment — never a second pass for a race.
     flushes = store.segment_flushes();
     store.checkpoint().unwrap();
     assert_eq!(store.segment_flushes() - flushes, segments);
-
     assert_eq!(store.count(), 12);
+}
+
+/// Writers racing a checkpoint: the gated publication section only renames and
+/// appends, so every acknowledged transaction must survive the reopen even
+/// though the trackers it published deliberately leave the racing writes out.
+#[test]
+fn test_checkpoint_racing_writers_keeps_every_acknowledged_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("col_ckpt_race");
+    let store = CollectionStore::create(&store_dir, "col_ckpt_race", &config(4)).unwrap();
+    upsert_logged(&store, &point(0, 4));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4u64)
+        .map(|worker| {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut next = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    upsert_logged(&store, &point(1_000 + worker * 100 + next, 4));
+                    next += 1;
+                    if next == 100 {
+                        break;
+                    }
+                }
+                next
+            })
+        })
+        .collect();
+
+    for _ in 0..3 {
+        store.checkpoint().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let written: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    let expected = 1 + written;
+    assert_eq!(store.count(), expected);
+    // The gated section is publication only. The wait it reports is the time
+    // it took the in-flight transactions to drain (the gate must not publish a
+    // tracker while an apply is running), never an fsync storm — a second
+    // flush of a hot segment would show up here as seconds, not milliseconds.
+    let status = store.maintenance_status();
+    assert!(
+        status.gate_wait_ms < 5_000,
+        "the gated section must stay bounded by renames and small appends: {status:?}"
+    );
+
+    drop(store);
+    let reopened = CollectionStore::open(&store_dir).unwrap();
+    assert_eq!(
+        reopened.count(),
+        expected,
+        "every acknowledged point must survive a racing checkpoint"
+    );
+    assert!(reopened.get(&PointId::Num(0)).unwrap().is_some());
+    let scanned = reopened
+        .scroll(expected as usize, None, None, None)
+        .unwrap()
+        .0
+        .len() as u64;
+    assert_eq!(scanned, expected, "the directory and the scan must agree");
 }
 
 #[test]

@@ -222,7 +222,13 @@ impl CollectionStore {
                         continue;
                     }
                     let point = point.to_point()?;
+                    // An overwrite moves the id to a new slot and tombstones
+                    // the old one, so both segments have dirty bytes to flush.
+                    let previous = inner.reverse.get(&id);
                     self.apply_upsert_locked(inner, &point, lsn)?;
+                    if let Some(old) = previous {
+                        applied_slots.push(old);
+                    }
                     if let Some(slot) = inner.reverse.get(&id) {
                         applied_slots.push(slot);
                     }
@@ -321,6 +327,20 @@ impl CollectionStore {
         Ok(())
     }
 
+    /// Apply one upsert.
+    ///
+    /// An upsert of an id that already lives somewhere never rewrites that
+    /// slot: the new bytes are appended at a fresh slot (tail, or a reclaimed
+    /// dead slot of the appendable tail) and the previous slot is tombstoned.
+    /// A published segment therefore only ever receives appends, which is what
+    /// lets a later generation reuse its files instead of rewriting them.
+    ///
+    /// Replay is the exception and writes back into the slot the id already
+    /// owns: it reconstructs a state the same log produced, so re-deriving the
+    /// slot keeps the log's numbering stable instead of moving every
+    /// re-applied id forward. A re-applied record is exactly a record whose
+    /// bytes may be missing from the files, so rewriting that slot is also
+    /// what makes replay idempotent.
     pub(super) fn apply_upsert_locked(
         &self,
         inner: &mut StoreInner,
@@ -329,15 +349,30 @@ impl CollectionStore {
     ) -> Result<()> {
         validate_point(&inner.meta, point)?;
         let data = self.data_arc();
-        let slot = self.resolve_upsert_slot_locked(inner, &point.id)?;
+        let id = point.id.clone();
+        // The id keeps its water mark but not its slot. `reserved` only marks
+        // presence for new ids, so a consumed reservation is cleared here.
+        let previous = inner.reverse.get(&id);
+        inner.reserved.remove_value(&id);
+        let slot = match previous {
+            Some(old) if inner.replaying => old,
+            _ => self.allocate_slot_locked(inner)?,
+        };
+        match previous {
+            Some(old) if old == slot => {
+                // Replay path: the slot and the live count are unchanged.
+                data.keys.append_key(slot as usize, &id.to_string())?;
+            }
+            Some(old) => {
+                // Retiring the old slot also unregisters its filter/index
+                // entries and heals the segment graph that held it.
+                self.apply_delete_slot_locked(inner, old)?;
+                self.publish_slot_locked(inner, &id, slot)?;
+            }
+            None => self.publish_slot_locked(inner, &id, slot)?,
+        }
 
-        // The old bytes are readable only before the write below; afterwards
-        // the snapshot holds the new vector and any later comparison reads
-        // zero. The overwrite count stays with graph insertion at drain time,
-        // so only the distance leg is recorded here.
-        self.note_overwrite_distance(inner, slot as u32, point.vector());
-
-        data.vectors.write_slot(slot, point.vector())?;
+        data.vectors.write_slot(slot as u64, point.vector())?;
         // Mirror the vector into quantized storage when ready.
         if let Some(q) = data.quant.read().as_ref() {
             let attempt = q.is_ready()
@@ -347,7 +382,7 @@ impl CollectionStore {
                         | crate::types::QuantizationType::Binary { .. }
                 );
             if attempt {
-                if let Err(e) = q.write_slot(slot, point.vector()) {
+                if let Err(e) = q.write_slot(slot as u64, point.vector()) {
                     // A stale code can drop the true nearest neighbour from
                     // the candidate set even when rescore is on. Disable the
                     // quantized path persistently instead of only warning.
@@ -358,45 +393,73 @@ impl CollectionStore {
                 }
             }
         }
-        self.write_payload_at(slot as u32, point.payload.as_ref(), lsn)?;
-        self.register_slot(slot as u32, point.vector(), inner.meta.segment_slots);
-        inner
-            .filter_bitmap
-            .register_slot(slot as u32, point.payload.as_ref());
-        inner
-            .payload_indexes
-            .register_slot(slot as u32, point.payload.as_ref());
+        self.write_payload_at(slot, point.payload.as_ref(), lsn)?;
+        self.register_slot(slot, point.vector(), inner.meta.segment_slots);
+        inner.filter_bitmap.register_slot(slot, point.payload.as_ref());
+        inner.payload_indexes.register_slot(slot, point.payload.as_ref());
         Ok(())
     }
 
-    /// Record the overwrite distance leg for an in-graph slot.
-    /// Fresh slots and slots outside every published segment graph have no
-    /// graph position to go stale, so the segment graph decides via presence
-    /// whether the leg counts. Runs under the store write lock; the graph
-    /// read lock is leaf-level, matching the store-then-graph order of every
-    /// reader.
-    fn note_overwrite_distance(&self, inner: &StoreInner, slot: u32, new_vector: &[f32]) {
-        let data = self.data_arc();
-        let segments = data.hnsw_segments.load();
-        let Some(target) = segments
-            .iter()
-            .find(|segment| slot >= segment.start && slot < segment.end)
-        else {
-            return;
-        };
-        let vsnap = data.vectors.snapshot();
-        let Some(old) = super::vectors::Vectors::read_slot(
-            &vsnap,
-            slot as u64,
-            inner.meta.segment_slots,
-            inner.meta.vector_size,
-        ) else {
-            return;
-        };
-        let delta = (crate::distance::distance(inner.meta.distance, new_vector, old) * 1e6) as u64;
-        target
-            .index
-            .note_overwrite_delta(slot - target.start, delta);
+    /// Resolve a slot for the next upsert.
+    ///
+    /// A dead slot of the **appendable tail** is reclaimed first; otherwise the
+    /// slot address space grows by one. Frozen segments are never reclaimed
+    /// from: they are published, may be shared with a later generation
+    /// byte-for-byte, and stay read-only.
+    ///
+    /// The scan is a pure function of the tombstone table plus `free_cursor`,
+    /// and the cursor only advances through applied (logged) upserts, so live
+    /// application and WAL replay pick the identical slot for the identical
+    /// record sequence.
+    pub(super) fn allocate_slot_locked(&self, inner: &mut StoreInner) -> Result<u32> {
+        if inner.meta.tombstone_count > 0 {
+            let segment_slots = inner.meta.segment_slots;
+            let tail_start =
+                super::segments::tail_base(inner.meta.next_slot, segment_slots) as usize;
+            let end = inner.meta.next_slot as usize;
+            if end > tail_start {
+                let cursor = (inner.free_cursor as usize).clamp(tail_start, end);
+                let tombstones = self.data_arc().tombstones.load();
+                let found = tombstones
+                    .first_free_in(cursor, end)
+                    .or_else(|| tombstones.first_free_in(tail_start, cursor));
+                if let Some(slot) = found {
+                    inner.free_cursor = slot as u32 + 1;
+                    self.reclaim_slot_locked(inner, slot as u32);
+                    return Ok(slot as u32);
+                }
+            }
+        }
+        let slot = inner.meta.next_slot as u32;
+        self.ensure_capacity(inner, slot as u64 + 1)?;
+        inner.meta.next_slot = slot as u64 + 1;
+        Ok(slot)
+    }
+
+    /// Take a dead slot back into service: clear its tombstone and undo the
+    /// delete accounting. Its key, vector and payload are overwritten by the
+    /// caller.
+    fn reclaim_slot_locked(&self, inner: &mut StoreInner, slot: u32) {
+        self.update_tombstone_bit(slot as usize, false);
+        inner.meta.tombstone_count = inner.meta.tombstone_count.saturating_sub(1);
+    }
+
+    /// Publish one slot for `id`: write the key and record the mapping.
+    ///
+    /// Capacity and the slot frontier are the allocator's business, so this
+    /// only handles the directory side of a slot that already exists.
+    pub(super) fn publish_slot_locked(
+        &self,
+        inner: &mut StoreInner,
+        id: &PointId,
+        slot: u32,
+    ) -> Result<()> {
+        self.data_arc()
+            .keys
+            .append_key(slot as usize, &id.to_string())?;
+        inner.reverse.insert(id, slot);
+        inner.meta.live_count += 1;
+        Ok(())
     }
 
     /// Resolve the id a payload mutation targets. Shared by the pre-logging
@@ -410,52 +473,6 @@ impl CollectionStore {
             return None;
         }
         Some(slot)
-    }
-
-    /// Resolve the slot an upsert writes to.
-    ///
-    /// Slot numbers are assigned here, in log order: a consumed reservation
-    /// takes the next free slot, an existing id reuses its slot, and anything
-    /// else (replay, or a reservation lost to a failed batch) takes the next
-    /// free slot as a new id. Reads never observe an id before this point,
-    /// because only `reverse` publishes it.
-    pub(super) fn resolve_upsert_slot_locked(
-        &self,
-        inner: &mut StoreInner,
-        id: &PointId,
-    ) -> Result<u64> {
-        if inner.reserved.remove_value(id).is_some() {
-            let slot = inner.meta.next_slot as u32;
-            self.init_slot_locked(inner, id, slot)?;
-            return Ok(slot as u64);
-        }
-        if let Some(slot) = inner.reverse.get(id) {
-            return Ok(slot as u64);
-        }
-        let slot = inner.meta.next_slot as u32;
-        self.init_slot_locked(inner, id, slot)?;
-        Ok(slot as u64)
-    }
-
-    /// Publish one new slot: grow the files if needed, write the id into
-    /// `keys.bin`, and record the mapping and the counters.
-    pub(super) fn init_slot_locked(
-        &self,
-        inner: &mut StoreInner,
-        id: &PointId,
-        slot: u32,
-    ) -> Result<()> {
-        self.ensure_capacity(inner, slot as u64 + 1)?;
-        self.data_arc()
-            .keys
-            .append_key(slot as usize, &id.to_string())?;
-        inner.reverse.insert(id, slot);
-        // Slots are assigned in log order, so the new slot is always exactly
-        // the high-water mark; the mark only ever moves forward.
-        debug_assert_eq!(slot as u64, inner.meta.next_slot);
-        inner.meta.next_slot = slot as u64 + 1;
-        inner.meta.live_count += 1;
-        Ok(())
     }
 
     pub(super) fn apply_delete_locked(&self, inner: &mut StoreInner, id: &PointId) -> Result<()> {

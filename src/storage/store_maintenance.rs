@@ -17,20 +17,6 @@ use super::*;
 /// segment; each delete already heals the graph that held the deleted slot.
 const HNSW_REPAIR_TOMBSTONE_BATCH: u64 = 256;
 
-/// Segments whose applied frontier is ahead of their durable one.
-///
-/// A segment with no entry in either table is treated as dirty: the marks are
-/// grown lazily, so a missing persisted mark means "never flushed", not "clean".
-fn raced_segments(applied: &[u64], persisted: &[u64], count: usize, floor: u64) -> Vec<usize> {
-    (0..count)
-        .filter(|index| {
-            let applied = applied.get(*index).copied().unwrap_or(floor);
-            let persisted = persisted.get(*index).copied().unwrap_or(0);
-            applied > persisted
-        })
-        .collect()
-}
-
 impl CollectionStore {
     /// Whether the tombstone ratio has crossed the compaction threshold.
     ///
@@ -98,26 +84,44 @@ impl CollectionStore {
 
         on_flush();
         self.flush_data_files(bulk_capacity)?;
+        // Every dirty byte is fsynced, but the tracker rename and the manifest
+        // advance have not happened yet: a crash here must leave the log able
+        // to replay the difference.
+        fault::fault_point("checkpoint_after_flush");
 
-        // Close the queue gate, re-sync the segments a writer touched since
-        // the flush, then publish. The log is truncated below, so no
-        // transaction may be queued — or halfway through the worker — while
-        // the marks are published.
+        // Close the queue gate for the publication itself: the log is
+        // truncated below, so no transaction may be queued — or halfway
+        // through the worker — while the marks are published. No fsync
+        // happens here any more: each staged tracker caps its own entries at
+        // the frontier its segment had already fsynced (`write_id_tracker`),
+        // so a writer that raced the bulk flush is replayed instead of being
+        // waited for. That is what keeps this section bounded by renames and
+        // small appends rather than by a second flush of the hot segment.
+        let gate_started = std::time::Instant::now();
         let _gate = self.queue.quiesce();
-        let gated_capacity = self.inner.read().meta.slot_capacity;
-        self.flush_raced_segments(gated_capacity)?;
         let mut inner = self.inner.write();
+        // Everything at or below this mark is durable in every segment. It is
+        // the checkpoint's publishable frontier, and it is what the generation
+        // and the truncate below may claim: a racing write above it stays in
+        // the log even though it is already applied in memory.
+        let durable = inner.min_persisted(inner.meta.last_applied_txn);
         let data_dir = self.data_dir();
-        // A visible tracker must always name bytes that are already durable,
-        // so the staged files are published only now that the gate is closed
-        // and every dirty byte has been re-synced.
+        // A visible tracker must always name bytes that are already durable.
+        // The staged files satisfy that by construction, so the rename needs
+        // no re-flush behind it.
         let generation_id = self.generation.read().id();
         segments::publish_id_trackers(
             &data_dir,
             inner.meta.segment_slots,
             inner.segment_persisted.len(),
         )?;
+        // The trackers are visible but the manifest still names the old
+        // frontier: open must tolerate a tracker that is ahead of it.
+        fault::fault_point("checkpoint_after_tracker_publish");
         inner.meta.save(&data_dir)?;
+        // A checkpoint is a durable boundary: dropping the reclaim hint keeps
+        // live allocation and WAL replay starting from the same scan point.
+        inner.free_cursor = 0;
         {
             let tombstones = self.data_arc().tombstones.load();
             let watermark = inner.meta.last_applied_txn;
@@ -155,10 +159,10 @@ impl CollectionStore {
             .payload_indexes
             .save(&data_dir, generation_id, inner.meta.last_applied_txn)?;
         // Publish the generation's lsn before the WAL watermark: recovery
-        // never replays past what this generation's files contain.
-        self.generation
-            .write()
-            .set_lsn(inner.meta.last_applied_txn)?;
+        // never replays past what this generation's files contain. It is the
+        // durable frontier, not the applied one, because the trackers above
+        // were allowed to leave racing writes unpublished.
+        self.generation.write().set_lsn(durable)?;
         self.txns_since_last_save.store(0, AtomicOrdering::Relaxed);
         // Marker first (this append itself fsyncs the log), then truncate
         // through the water mark clamped by live pins. A snapshot pin holds
@@ -191,10 +195,13 @@ impl CollectionStore {
         // exactly that); the marker is a no-op whose LSN was consumed from
         // `next_lsn`, so a back-to-back checkpoint naturally allocates a new
         // one. Replay converges on the same numbering.
-        let effective = self.wal_pins.clamp(inner.min_persisted(watermark));
+        let effective = self.wal_pins.clamp(durable);
         let live_now = inner.meta.live_count;
         let collection = inner.meta.collection.clone();
         drop(inner);
+        drop(_gate);
+        self.last_gate_wait_us
+            .store(gate_started.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
         if effective != 0 || watermark == 0 {
             self.wal.truncate_through(effective)?;
         }
@@ -225,38 +232,6 @@ impl CollectionStore {
         // recorded once and aborts the pass; already-durable segments keep
         // their advanced persisted marks.
         let result: Result<()> = (0..count)
-            .into_par_iter()
-            .try_for_each(|index| self.flush_segment(index, segment_slots, slot_capacity));
-        if let Err(err) = result {
-            self.record_maintenance_error(&err.to_string());
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    /// Flush the segments whose applied frontier is ahead of their durable one.
-    ///
-    /// Runs with the queue gate closed. A segment that is already durable has
-    /// nothing to sync, and syncing it anyway would lengthen the window for
-    /// every segment of the collection.
-    fn flush_raced_segments(&self, slot_capacity: u64) -> Result<()> {
-        let inner = self.inner.read();
-        let segment_slots = inner.meta.segment_slots;
-        if segment_slots == 0 {
-            return Ok(());
-        }
-        let count = slot_capacity.div_ceil(segment_slots as u64) as usize;
-        let raced = raced_segments(
-            &inner.segment_applied,
-            &inner.segment_persisted,
-            count,
-            inner.meta.last_applied_txn,
-        );
-        drop(inner);
-        if raced.is_empty() {
-            return Ok(());
-        }
-        let result: Result<()> = raced
             .into_par_iter()
             .try_for_each(|index| self.flush_segment(index, segment_slots, slot_capacity));
         if let Err(err) = result {
@@ -492,11 +467,16 @@ impl CollectionStore {
             return Ok(());
         }
         if let Some(cap) = meta.max_points {
-            if needed_slots > cap {
+            // The cap bounds live points, not the slot address space: a
+            // reclaimed or tombstoned slot still occupies an address, so
+            // comparing the frontier would reject writes the admission path
+            // already accepted.
+            let live = meta.live_count + 1;
+            if live > cap {
                 return Err(VectorSearchError::CapacityExceeded {
                     collection: meta.collection.clone(),
                     max_points: cap,
-                    requested: needed_slots,
+                    requested: live,
                 });
             }
         }

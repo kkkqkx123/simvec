@@ -346,8 +346,13 @@ impl CommitQueue {
             return;
         }
         store.metrics().record_wal_flush(batch.len());
+        // The record is durable but not applied: replay must reconstruct it.
+        super::fault::fault_point("wal_after_append");
         for (index, ticket) in batch.iter().enumerate() {
             let outcome = store.apply_queued_txn(base + index as u64, &ticket.ops);
+            // Applied but not acknowledged: the caller must still see the
+            // transaction after a crash, and replay must not double-count it.
+            super::fault::fault_point("apply_before_ack");
             let failure = outcome.as_ref().err().map(|e| e.to_string());
             self.settle(&ticket.completion, outcome);
             if let Some(message) = failure {

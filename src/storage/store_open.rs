@@ -104,6 +104,10 @@ impl CollectionStore {
         if let Some(qc) = &config.quantization_config {
             qc.validate(config.vector_size)?;
         }
+        // Reject an element dtype the storage layer cannot serve (`Turbo` has
+        // no distance mapping) at creation time instead of on the first write,
+        // where the collection would already exist on disk.
+        config.validate_element_types()?;
         if config.max_points == Some(0) {
             return Err(VectorSearchError::InvalidConfig(
                 "max_points must be >= 1 when set".to_string(),
@@ -222,6 +226,8 @@ impl CollectionStore {
                 payload_indexes: PayloadIndexManager::new(),
                 segment_applied: Vec::new(),
                 segment_persisted: Vec::new(),
+                free_cursor: 0,
+                replaying: false,
             }),
             wal,
             wal_pins: WalAckPins::new(),
@@ -237,6 +243,7 @@ impl CollectionStore {
             segment_flushes: AtomicU64::new(0),
             maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
+            last_gate_wait_us: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),
             metrics: Arc::new(Metrics::default()),
@@ -389,6 +396,8 @@ impl CollectionStore {
                 payload_indexes,
                 segment_applied: Vec::new(),
                 segment_persisted: Vec::new(),
+                free_cursor: 0,
+                replaying: false,
             }),
             wal,
             wal_pins: WalAckPins::new(),
@@ -404,6 +413,7 @@ impl CollectionStore {
             segment_flushes: AtomicU64::new(0),
             maintenance_error: Mutex::new(None),
             txns_since_last_save: AtomicU64::new(0),
+            last_gate_wait_us: AtomicU64::new(0),
             build_inserted: AtomicU64::new(0),
             build_points_total: AtomicU64::new(0),
             metrics: Arc::new(Metrics::default()),
@@ -433,9 +443,14 @@ impl CollectionStore {
         let floor = generation_lsn.max(ack);
         let (txns, last) = self.wal.read_all_from(floor)?;
         let mut inner = self.inner.write();
+        inner.replaying = true;
         for txn in &txns {
-            self.apply_records_locked(&mut inner, txn.txn_id, &txn.ops)?;
+            if let Err(err) = self.apply_records_locked(&mut inner, txn.txn_id, &txn.ops) {
+                inner.replaying = false;
+                return Err(err);
+            }
         }
+        inner.replaying = false;
         // Even an empty WAL carries information: the floor tells us how far
         // the data files have been checkpointed. Starting new lsns at 1 after
         // that point would collide with records that were truncated.
@@ -454,6 +469,13 @@ impl CollectionStore {
                 next_slot.div_ceil(segment_slots as u64) as usize
             };
             inner.ensure_segment_len(count);
+            // Everything up to the generation floor is in the files, so every
+            // segment starts applied there. Without this a checkpoint right
+            // after open would see a frontier of 0 and publish a tracker that
+            // declares the whole collection unknown.
+            for cell in inner.segment_applied.iter_mut() {
+                *cell = (*cell).max(floor);
+            }
             // Prefer per-segment marks published by the last checkpoint;
             // fall back to the generation floor when the manifest carries
             // no current accounting.
@@ -527,7 +549,10 @@ pub(super) fn validate_admission_locked(inner: &StoreInner, ops: &[WalRecord]) -
         if !new_ids.insert(point.id.as_str()) {
             continue;
         }
-        let needed = inner.meta.next_slot + inner.reserved.len() as u64 + new_ids.len() as u64;
+        // Live points, not the slot frontier: an overwrite tombstones the old
+        // slot instead of growing the live set, so `next_slot` outruns the
+        // admitted count by design.
+        let needed = inner.meta.live_count + inner.reserved.len() as u64 + new_ids.len() as u64;
         if needed > cap {
             return Err(VectorSearchError::CapacityExceeded {
                 collection: inner.meta.collection.clone(),

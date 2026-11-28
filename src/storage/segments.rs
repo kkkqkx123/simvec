@@ -87,6 +87,21 @@ pub(crate) fn immutable_end(next_slot: u64, segment_slots: u32) -> u32 {
     }
 }
 
+/// First slot of the segment still being appended to.
+///
+/// Everything below it belongs to a **complete** segment: the segment filled
+/// every slot it covers, so its files are final and may be shared with a later
+/// generation byte-for-byte. Unlike [`immutable_end`], a collection that has
+/// not filled its first segment counts the whole thing as the tail — it has no
+/// complete segment yet, so its dead slots are reclaimable.
+pub(crate) fn tail_base(next_slot: u64, segment_slots: u32) -> u32 {
+    if segment_slots == 0 {
+        return next_slot.min(u32::MAX as u64) as u32;
+    }
+    let base = (next_slot / segment_slots as u64) * segment_slots as u64;
+    base.min(u32::MAX as u64) as u32
+}
+
 impl SegmentSet {
     pub(crate) fn new(next_slot: u64, segment_slots: u32) -> Self {
         let end = immutable_end(next_slot, segment_slots);
@@ -249,10 +264,12 @@ struct IdTracker {
 ///
 /// The file is written to [`ID_TRACKER_STAGED_FILE`], never over the published
 /// one: checkpoints flush outside the queue gate, where writers may still
-/// append to this segment, so a tracker built there can name a point whose
-/// bytes are not yet fsynced. [`publish_id_trackers`] renames the staged file
-/// into place from inside the gate, after the re-flush, which makes "visible
-/// tracker ⇒ durable bytes" an invariant instead of a hope.
+/// append to this segment. Rather than waiting for those writers and flushing
+/// again, every entry newer than `lsn` is published as *unknown* (free, zero
+/// water marks) — replay then re-derives it from the log, and the checkpoint
+/// publishes a generation frontier that stops below it. That is what makes
+/// "visible tracker ⇒ the bytes it names are durable" an invariant of the file
+/// itself instead of a property of the lock the publisher happens to hold.
 pub(super) fn write_id_tracker(
     data: &DataFiles,
     start: u32,
@@ -273,6 +290,22 @@ pub(super) fn write_id_tracker(
         let live = inner.reverse.get(&id) == Some(slot);
         let deleted = tombstones.bit(slot as usize);
         let version = inner.versions.get_value(&id).unwrap_or(0);
+        // A tracker may only name state at or below its own frontier: `lsn`
+        // was captured before this segment's fsync, so a write that landed
+        // while the fsync ran is newer than any byte this file can vouch for.
+        // Such an id is published as *unknown* — free, with no water mark —
+        // so replay re-derives it from the log instead of trusting a mapping
+        // whose bytes may still be in the page cache.
+        if version > lsn {
+            entries.push(IdTrackerEntry {
+                id: id_text,
+                offset,
+                point_lsn: 0,
+                delete_lsn: 0,
+                free: true,
+            });
+            continue;
+        }
         entries.push(IdTrackerEntry {
             id: id_text,
             offset,

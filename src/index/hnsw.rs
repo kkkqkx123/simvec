@@ -428,17 +428,6 @@ impl HnswIndex {
         self.overwrites_since_build.load(Ordering::Relaxed)
     }
 
-    /// Add a pre-computed overwrite distance leg for an in-graph slot.
-    /// Slots that never entered the graph cannot go stale, so they are
-    /// skipped: fresh inserts are covered by the build baseline instead.
-    pub(crate) fn note_overwrite_delta(&self, slot: u32, delta_fixed: u64) {
-        if self.node(slot).is_none() {
-            return;
-        }
-        self.overwrites_distance_delta
-            .fetch_add(delta_fixed, Ordering::Relaxed);
-    }
-
     /// Reflect inbound edges after a forward adjacency replacement. The
     /// caller has already published `new` into the forward list; this keeps
     /// the reverse sets in sync and bumps the version only once both sides

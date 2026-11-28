@@ -327,6 +327,80 @@ fn filtered_count_scroll_round_trip() {
     }
 }
 
+/// `simvec_maintenance_status` reports the per-segment durability array, not
+/// just the health boolean: a binding that only forwards JSON would otherwise
+/// silently drop the segment water marks.
+#[test]
+fn maintenance_status_reports_segment_shape() {
+    unsafe {
+        let handle = open_engine();
+        let name = cstr("segments");
+        let config = cstr(r#"{"vector_size":4,"distance":"Cosine","index":"Flat"}"#);
+        assert_eq!(
+            collections::simvec_create_collection(handle, name.as_ptr(), config.as_ptr()),
+            OK
+        );
+        // Two segments with an explicit width, so the array has more than one
+        // entry and the starts are more than "0".
+        let ops: String = (1..=8u64)
+            .map(|id| {
+                format!(
+                    r#"{{"op":"upsert","collection":"segments","point":{{"id":"{id}","vector":[1.0,0.0,0.0,0.0]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            write::simvec_apply_txn(handle, cstr(&format!("[{ops}]")).as_ptr()),
+            OK
+        );
+
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            maintenance::simvec_maintenance_status(handle, name.as_ptr(), &mut out),
+            OK
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&take_string(out)).expect("maintenance status json");
+
+        assert_eq!(status.get("healthy").and_then(|h| h.as_bool()), Some(true));
+        assert!(
+            status.get("persisted_lsn").and_then(|v| v.as_u64()).is_some(),
+            "persisted_lsn must be a number: {status}"
+        );
+        assert!(
+            status
+                .get("wal_blob_bytes")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "wal_blob_bytes must be a number: {status}"
+        );
+        let segments = status
+            .get("segments")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("segments must be an array: {status}"));
+        assert_eq!(segments.len(), 1, "one partial segment is reported");
+        let mut last_start: Option<u64> = None;
+        for segment in segments {
+            for field in ["start", "applied_lsn", "persisted_lsn"] {
+                assert!(
+                    segment.get(field).and_then(|v| v.as_u64()).is_some(),
+                    "segment entry needs a numeric {field}: {segment}"
+                );
+            }
+            let start = segment["start"].as_u64().unwrap();
+            if let Some(previous) = last_start {
+                assert!(start > previous, "segment starts must increase");
+            }
+            last_start = Some(start);
+        }
+        assert!(
+            status.get("error").map(|v| v.is_null()).unwrap_or(true),
+            "a healthy collection carries no error: {status}"
+        );
+    }
+}
+
 #[test]
 fn advanced_paths_round_trip() {
     unsafe {

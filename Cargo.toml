@@ -97,3 +97,7 @@ harness = false
 [[bench]]
 name = "concurrent_write_bench"
 harness = false
+
+[[bench]]
+name = "compaction_io_vs_garbage"
+harness = false

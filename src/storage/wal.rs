@@ -906,6 +906,9 @@ impl Wal {
     /// up to `watermark` durable in the data files, so the covered records
     /// exist only to be re-read.
     pub fn truncate_through(&self, watermark: u64) -> Result<()> {
+        // Nothing has been removed yet: a crash here must leave a log that
+        // still carries every record the data files do not.
+        super::fault::fault_point("wal_before_truncate");
         let mut state = self.state.lock();
         // The caller has just made everything up to `watermark` durable in
         // the data files. Publish that watermark before unlinking anything:

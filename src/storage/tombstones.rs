@@ -83,6 +83,30 @@ impl TombstoneBits {
             .sum()
     }
 
+    /// First tombstoned slot in `[from, to)`, in slot order.
+    ///
+    /// The slot allocator uses this to reclaim a dead slot instead of growing
+    /// the slot address space. It is a pure function of the table, so live
+    /// application and WAL replay derive the same order without persisting a
+    /// free list.
+    pub(super) fn first_free_in(&self, from: usize, to: usize) -> Option<usize> {
+        let mut slot = from;
+        while slot < to {
+            let chunk = slot / TOMBSTONE_CHUNK_BITS;
+            let offset = slot % TOMBSTONE_CHUNK_BITS;
+            let bits = self.chunks.get(chunk)?;
+            let chunk_end = (chunk + 1) * TOMBSTONE_CHUNK_BITS;
+            let end = to.min(chunk_end);
+            if let Some(found) = bits.as_bitslice()[offset..(end - chunk * TOMBSTONE_CHUNK_BITS)]
+                .first_one()
+            {
+                return Some(slot + found);
+            }
+            slot = end;
+        }
+        None
+    }
+
     /// Copy-on-write single-bit update: only the affected chunk is cloned.
     pub(super) fn with_slot(&self, slot: usize, value: bool) -> Self {
         let (chunk, offset) = (slot / TOMBSTONE_CHUNK_BITS, slot % TOMBSTONE_CHUNK_BITS);

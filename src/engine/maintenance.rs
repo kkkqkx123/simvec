@@ -83,6 +83,7 @@ impl LocalVectorEngine {
                 healthy: true,
                 persisted_lsn: 0,
                 wal_blob_bytes: 0,
+                gate_wait_ms: 0,
                 error: None,
                 segments: Vec::new(),
             });

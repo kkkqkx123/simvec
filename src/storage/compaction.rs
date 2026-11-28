@@ -30,6 +30,7 @@ use std::time::Duration;
 use memmap2::Mmap;
 
 use super::directory::KEY_REC_SIZE;
+use super::fault;
 use super::generation::StagedGeneration;
 use super::keys::Keys;
 use super::segment_hnsw::{self, SegmentHnsw};
@@ -721,6 +722,9 @@ impl CollectionStore {
         drop(old_files_view);
         let old_generation = self.generation.read().clone();
         let next_generation = old_generation.clone().publish(staged, watermark)?;
+        // The manifest already names the new generation while this process
+        // still serves the old one: a crash here must reopen on the new.
+        fault::fault_point("compaction_after_publish");
         // From here on the disk manifest already names the new generation.
         // Any failure before the in-memory switch completes must stop writes
         // instead of letting this process keep mutating files the manifest
@@ -749,6 +753,9 @@ impl CollectionStore {
         // Rebuild the in-memory directory against the new slot numbering.
         // Tombstones are already all-clear in the staged table.
         inner.meta = meta;
+        // Compaction rewrote the slot layout, so the reclaim scan restarts
+        // from the tail base exactly as it does for a replayed store.
+        inner.free_cursor = 0;
         inner.reverse.clear();
         {
             let files = self.data_arc();

@@ -110,6 +110,25 @@ impl CollectionConfig {
         result
     }
 
+    /// Validate the element dtype of every declared dense space.
+    ///
+    /// Separate from [`Self::validate_kind`] because it is the subset the
+    /// storage layer itself must reject before it creates files: an encoding
+    /// with no distance mapping (`Turbo`) has no writer, so a collection
+    /// created with it would fail on its first upsert instead of at creation.
+    /// It deliberately skips the cross-field mirror checks, so a caller that
+    /// only tunes the convenience fields is unaffected.
+    pub fn validate_element_types(&self) -> Result<()> {
+        for (name, space) in &self.vectors {
+            if let VectorSpaceConfig::Dense { distance, dtype, .. } = space {
+                dtype.validate_metric(*distance).map_err(|e| {
+                    VectorSearchError::InvalidConfig(format!("space {name:?}: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validate every declared space. The single-space convenience fields
     /// are mirrors of the authoritative `vectors` map and are checked against
     /// it so a hand-written configuration cannot select two kinds at once.

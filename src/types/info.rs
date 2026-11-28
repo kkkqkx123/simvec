@@ -86,6 +86,13 @@ pub struct MaintenanceStatus {
     /// by the WAL segment truncation; it is reported so growth is visible.
     #[serde(default)]
     pub wal_blob_bytes: u64,
+    /// Milliseconds the last checkpoint held the queue gate.
+    ///
+    /// Reported so a regression that moves an fsync back inside the gated
+    /// publication section is visible without profiling. Zero for a
+    /// collection that has never checkpointed.
+    #[serde(default)]
+    pub gate_wait_ms: u64,
     /// Last flush failure, cleared by the next successful checkpoint.
     pub error: Option<String>,
     /// Per-segment applied/persisted water marks. Empty for non-dense stores.
